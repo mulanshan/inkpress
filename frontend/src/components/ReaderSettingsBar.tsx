@@ -1,4 +1,4 @@
-import { Minus, Plus, Type } from "lucide-react";
+import { AlignJustify, Minus, Plus, Type } from "lucide-react";
 import { useReaderAppearance } from "../lib/theme";
 import type { ReadingTheme } from "../lib/types";
 
@@ -9,9 +9,23 @@ const THEMES: { id: ReadingTheme; label: string; bg: string; fg: string }[] = [
   { id: "eink", label: "墨水屏", bg: "#FFFFFF", fg: "#000000" },
 ];
 
+const LINE_HEIGHTS: { value: number; label: string }[] = [
+  { value: 1.6, label: "1.6" },
+  { value: 1.85, label: "1.85" },
+  { value: 2.05, label: "2.05" },
+];
+
 export function ReaderSettingsBar({ compact = false }: { compact?: boolean }) {
-  const { theme, fontFamily, fontSize, setTheme, setFontFamily, setFontSize } =
-    useReaderAppearance();
+  const {
+    theme,
+    fontFamily,
+    fontSize,
+    lineHeight,
+    setTheme,
+    setFontFamily,
+    setFontSize,
+    setLineHeight,
+  } = useReaderAppearance();
 
   return (
     <div
@@ -21,7 +35,7 @@ export function ReaderSettingsBar({ compact = false }: { compact?: boolean }) {
         borderColor: "var(--border-hairline)",
       }}
     >
-      <div className="flex items-center gap-1.5">
+      <div className="flex flex-wrap items-center gap-1.5">
         {THEMES.map((t) => {
           const active = theme === t.id;
           return (
@@ -96,6 +110,29 @@ export function ReaderSettingsBar({ compact = false }: { compact?: boolean }) {
             >
               <Plus className="w-3.5 h-3.5" />
             </button>
+          </div>
+
+          <span className="h-4 w-px" style={{ backgroundColor: "var(--border-hairline)" }} />
+          <div className="flex items-center gap-1" title="行距">
+            <AlignJustify className="w-3.5 h-3.5 mr-0.5" style={{ color: "var(--fg-muted)" }} />
+            {LINE_HEIGHTS.map((opt) => {
+              const active = Math.abs(lineHeight - opt.value) < 0.08;
+              return (
+                <button
+                  key={opt.value}
+                  type="button"
+                  onClick={() => setLineHeight(opt.value)}
+                  className="rounded px-2 py-0.5 tabular-nums cursor-pointer"
+                  style={{
+                    backgroundColor: active ? "var(--bg-subtle)" : "transparent",
+                    color: active ? "var(--fg-primary)" : "var(--fg-muted)",
+                    fontWeight: active ? 600 : 400,
+                  }}
+                >
+                  {opt.label}
+                </button>
+              );
+            })}
           </div>
         </>
       )}

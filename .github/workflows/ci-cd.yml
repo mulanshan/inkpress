@@ -28,7 +28,7 @@ jobs:
       - name: Typecheck (mypy)
         run: mypy backend
       - name: Test (pytest)
-        run: pytest -v
+        run: pytest -v --cov=inkpress --cov-report=term-missing
 
   frontend-check:
     runs-on: ubuntu-latest

@@ -16,7 +16,6 @@ dependencies = [
   "beautifulsoup4>=4.12,<5",
   "croniter>=3.0,<7",
   "cryptography>=44.0,<47",
-  "ebooklib>=0.18,<1",
   "fastapi>=0.116,<1",
   "feedparser>=6.0,<7",
   "httpx[http2,socks]>=0.28,<1",

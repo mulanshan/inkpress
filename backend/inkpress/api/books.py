@@ -1,10 +1,13 @@
 from __future__ import annotations
 
-import mimetypes
+import asyncio
+import posixpath
+import re
 import uuid
 import zipfile
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 from fastapi import (
     APIRouter,
@@ -41,8 +44,29 @@ from inkpress.worker.tasks import (
 
 router = APIRouter(prefix="/api/v1/books", tags=["books"])
 
+UPLOAD_CHUNK_BYTES = 1024 * 1024  # 1 MB
+MAX_BOOK_UPLOAD_BYTES = 100 * 1024 * 1024  # 100 MB
+MAX_EPUB_ASSET_BYTES = 25 * 1024 * 1024  # 25 MB
+
+ALLOWED_ASSET_MIME_BY_EXT: dict[str, str] = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".avif": "image/avif",
+    ".woff2": "font/woff2",
+    ".woff": "font/woff",
+    ".ttf": "font/ttf",
+    ".otf": "font/otf",
+}
+
 
 def _book_dict(book: Book) -> dict[str, Any]:
+    meta = dict(book.metadata_json or {})
+    # Avoid shipping large chapter-index caches in every library list item
+    meta.pop("chapters_cache", None)
+    meta.pop("chapters_cache_sig", None)
     return {
         "id": book.id,
         "kind": book.kind,
@@ -55,7 +79,7 @@ def _book_dict(book: Book) -> dict[str, Any]:
         "file_size_bytes": book.file_size_bytes,
         "conversion_status": book.conversion_status,
         "conversion_error": book.conversion_error,
-        "metadata": book.metadata_json or {},
+        "metadata": meta,
         "has_cover": bool(book.cover_path and Path(book.cover_path).exists()),
         "can_read_online": bool(
             book.kindle_epub_path and book.kindle_epub_path.lower().endswith(".epub")
@@ -65,6 +89,23 @@ def _book_dict(book: Book) -> dict[str, Any]:
         "last_pushed_at": book.last_pushed_at.isoformat() if book.last_pushed_at else None,
         "created_at": book.created_at.isoformat(),
     }
+
+
+def _safe_filename_stem(filename: str) -> str:
+    raw_stem = Path(filename).stem
+    cleaned = re.sub(r"[^\w\u4e00-\u9fff.-]+", "_", raw_stem).strip("._")
+    return cleaned[:100] or "book"
+
+
+def _read_epub_zip_asset(epub_path: Path, normalized_asset: str) -> bytes:
+    with zipfile.ZipFile(epub_path, "r") as zf:
+        try:
+            info = zf.getinfo(normalized_asset)
+        except KeyError as exc:
+            raise FileNotFoundError(normalized_asset) from exc
+        if info.file_size > MAX_EPUB_ASSET_BYTES:
+            raise ValueError("EPUB asset exceeds 25 MB limit")
+        return zf.read(info)
 
 
 @router.get("")
@@ -91,7 +132,7 @@ async def upload_book(
     _user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    filename = file.filename or "untitled.epub"
+    filename = Path(file.filename or "untitled.epub").name
     ext = Path(filename).suffix.lower().lstrip(".")
     if ext not in SUPPORTED_BOOK_FORMATS:
         raise HTTPException(
@@ -102,21 +143,42 @@ async def upload_book(
     settings = get_settings()
     settings.ensure_storage_dirs()
     uid = uuid.uuid4().hex[:12]
-    safe_stem = Path(filename).stem[:100]
+    safe_stem = _safe_filename_stem(filename)
     original_path = settings.library_data_dir / "originals" / f"{safe_stem}_{uid}.{ext}"
-    data = await file.read()
-    if not data:
-        raise HTTPException(status_code=400, detail="上传文件为空")
-    original_path.write_bytes(data)
 
+    total_bytes = 0
+    try:
+        with original_path.open("wb") as out:
+            while True:
+                chunk = await file.read(UPLOAD_CHUNK_BYTES)
+                if not chunk:
+                    break
+                total_bytes += len(chunk)
+                if total_bytes > MAX_BOOK_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail="上传文件超过 100 MB 上限",
+                    )
+                out.write(chunk)
+    except Exception:
+        original_path.unlink(missing_ok=True)
+        raise
+
+    if total_bytes == 0:
+        original_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="上传文件为空")
+
+    custom_title = title.strip()
+    display_title = custom_title or Path(filename).stem[:100] or safe_stem
     book = Book(
         kind=kind if kind in ("uploaded_book", "magazine") else "uploaded_book",
-        title=title.strip() or safe_stem,
+        title=display_title,
         author=author.strip(),
         original_format=ext,
         original_path=str(original_path),
-        file_size_bytes=len(data),
+        file_size_bytes=total_bytes,
         conversion_status="converting",
+        metadata_json={"has_custom_title": bool(custom_title)},
     )
     session.add(book)
     await session.commit()
@@ -128,6 +190,38 @@ async def upload_book(
         background_tasks.add_task(run_convert_book_bg, book.id)
 
     return {"item": _book_dict(book)}
+
+
+@router.post("/{book_id}/reconvert")
+async def reconvert_book(
+    book_id: int,
+    background_tasks: BackgroundTasks,
+    _user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    book = await session.get(Book, book_id)
+    if book is None:
+        raise HTTPException(status_code=404, detail="Book not found")
+    if not book.original_path or not Path(book.original_path).exists():
+        raise HTTPException(status_code=400, detail="原始图书文件不存在，无法重新转码")
+
+    book.conversion_status = "converting"
+    book.conversion_error = None
+    meta = dict(book.metadata_json or {})
+    meta.pop("chapters_cache", None)
+    meta.pop("chapters_cache_sig", None)
+    book.metadata_json = meta
+    await session.commit()
+    await session.refresh(book)
+
+    try:
+        await convert_book_task.kiq(book.id)
+        queue_status = "queued"
+    except Exception:
+        background_tasks.add_task(run_convert_book_bg, book.id)
+        queue_status = "queued_local"
+
+    return {"status": queue_status, "item": _book_dict(book)}
 
 
 @router.get("/{book_id}/cover")
@@ -155,7 +249,7 @@ async def download_book(
     if not path.exists():
         raise HTTPException(status_code=404, detail="Book file missing on disk")
     ext = path.suffix or ".epub"
-    media_type = "application/epub+zip" if ext == ".epub" else "application/pdf"
+    media_type = "application/epub+zip" if ext.lower() == ".epub" else "application/pdf"
     return FileResponse(path, media_type=media_type, filename=f"{book.title}{ext}")
 
 
@@ -168,7 +262,30 @@ async def get_book_chapters(
     book = await session.get(Book, book_id)
     if book is None or not book.kindle_epub_path:
         raise HTTPException(status_code=404, detail="Book not found")
-    chapters = list_epub_chapters(Path(book.kindle_epub_path))
+    epub_path = Path(book.kindle_epub_path)
+    if not epub_path.exists():
+        raise HTTPException(status_code=404, detail="Book file missing on disk")
+    if epub_path.suffix.lower() != ".epub":
+        raise HTTPException(status_code=400, detail="非 EPUB 格式暂不支持在线分章阅读")
+
+    stat = epub_path.stat()
+    stat_sig = f"{epub_path}:{stat.st_mtime_ns}:{stat.st_size}"
+    meta = dict(book.metadata_json or {})
+    cached = meta.get("chapters_cache")
+    if isinstance(cached, list) and meta.get("chapters_cache_sig") == stat_sig:
+        chapters = cached
+    else:
+        try:
+            chapters = await asyncio.to_thread(list_epub_chapters, epub_path)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="Book file missing on disk") from exc
+        except (ValueError, zipfile.BadZipFile) as exc:
+            raise HTTPException(status_code=400, detail=f"无效的 EPUB 文件: {exc}") from exc
+        meta["chapters_cache"] = chapters
+        meta["chapters_cache_sig"] = stat_sig
+        book.metadata_json = meta
+        await session.commit()
+
     return {"book": _book_dict(book), "chapters": chapters}
 
 
@@ -182,10 +299,19 @@ async def get_book_chapter_content(
     book = await session.get(Book, book_id)
     if book is None or not book.kindle_epub_path:
         raise HTTPException(status_code=404, detail="Book not found")
+    epub_path = Path(book.kindle_epub_path)
+    if not epub_path.exists():
+        raise HTTPException(status_code=404, detail="Book file missing on disk")
+    if epub_path.suffix.lower() != ".epub":
+        raise HTTPException(status_code=400, detail="非 EPUB 格式暂不支持在线分章阅读")
     try:
-        return read_epub_chapter_html(Path(book.kindle_epub_path), chapter_index, book.id)
+        return await asyncio.to_thread(read_epub_chapter_html, epub_path, chapter_index, book.id)
     except IndexError as exc:
         raise HTTPException(status_code=404, detail="Chapter index out of range") from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Book file missing on disk") from exc
+    except (ValueError, zipfile.BadZipFile) as exc:
+        raise HTTPException(status_code=400, detail=f"无法读取 EPUB 章节: {exc}") from exc
 
 
 @router.get("/{book_id}/asset/{asset_path:path}")
@@ -201,13 +327,40 @@ async def get_book_epub_asset(
     epub_path = Path(book.kindle_epub_path)
     if not epub_path.exists():
         raise HTTPException(status_code=404, detail="Book file missing")
-    clean_asset = asset_path.lstrip("/")
-    with zipfile.ZipFile(epub_path, "r") as zf:
-        if clean_asset not in zf.namelist():
-            raise HTTPException(status_code=404, detail="Asset not found")
-        content = zf.read(clean_asset)
-    media_type, _ = mimetypes.guess_type(clean_asset)
-    return Response(content=content, media_type=media_type or "application/octet-stream")
+    if epub_path.suffix.lower() != ".epub":
+        raise HTTPException(status_code=400, detail="Book file is not an EPUB archive")
+
+    decoded = unquote(asset_path).replace("\\", "/")
+    normalized = posixpath.normpath(decoded).lstrip("/")
+    if not normalized or normalized == "." or normalized.startswith(".."):
+        raise HTTPException(status_code=400, detail="Invalid asset path")
+
+    ext = Path(normalized).suffix.lower()
+    media_type = ALLOWED_ASSET_MIME_BY_EXT.get(ext)
+    if media_type is None:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Disallowed EPUB asset type '{ext or 'unknown'}'",
+        )
+
+    try:
+        content = await asyncio.to_thread(_read_epub_zip_asset, epub_path, normalized)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Asset not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
+    except zipfile.BadZipFile as exc:
+        raise HTTPException(status_code=400, detail="Corrupt EPUB archive") from exc
+
+    return Response(
+        content=content,
+        media_type=media_type,
+        headers={
+            "X-Content-Type-Options": "nosniff",
+            "Content-Security-Policy": "default-src 'none'; sandbox",
+            "Cache-Control": "private, max-age=86400",
+        },
+    )
 
 
 @router.post("/{book_id}/deliver")

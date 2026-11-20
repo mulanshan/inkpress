@@ -45,7 +45,7 @@ class Source(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(160), nullable=False)
-    # kind: newsnow | rss | rsshub | webpage
+    # kind: newsnow | rss | rsshub | webpage | webpage_list
     kind: Mapped[str] = mapped_column(String(32), nullable=False)
     # identifier: NewsNow id (e.g. "zhihu"), RSS URL, or "rsshub://cw/today"
     identifier: Mapped[str] = mapped_column(String(1024), nullable=False)
@@ -65,7 +65,7 @@ class Source(Base):
     )
 
     articles: Mapped[list[Article]] = relationship(
-        back_populates="source", cascade="all, delete-orphan"
+        back_populates="source", passive_deletes=True
     )
     edition_links: Mapped[list[EditionSource]] = relationship(
         back_populates="source", cascade="all, delete-orphan"
@@ -124,6 +124,8 @@ class Edition(Base):
     max_mb_per_volume: Mapped[int] = mapped_column(Integer, default=18, nullable=False)
     grayscale_images: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     include_qr_links: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    strip_links: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    retention_days: Mapped[int] = mapped_column(Integer, default=30, nullable=False)
     ai_briefing_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     target_emails: Mapped[str] = mapped_column(String(512), default="", nullable=False)
     issue_counter: Mapped[int] = mapped_column(Integer, default=0, nullable=False)

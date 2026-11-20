@@ -26,7 +26,7 @@ export function ToastProvider({ children }: { children: React.ReactNode }) {
   return (
     <ToastContext.Provider value={{ notify }}>
       {children}
-      <div className="fixed bottom-5 right-5 z-50 flex flex-col gap-2 pointer-events-none">
+      <div className="fixed bottom-20 md:bottom-5 right-4 md:right-5 z-50 flex flex-col gap-2 pointer-events-none">
         {items.map((item) => (
           <div
             key={item.id}
@@ -34,17 +34,18 @@ export function ToastProvider({ children }: { children: React.ReactNode }) {
             style={{
               backgroundColor:
                 item.tone === "error"
-                  ? "#7f1d1d"
+                  ? "var(--bg-danger-soft)"
                   : item.tone === "success"
                     ? "var(--fg-primary)"
                     : "var(--bg-surface)",
               color:
                 item.tone === "error"
-                  ? "#ffffff"
+                  ? "var(--fg-danger)"
                   : item.tone === "success"
                     ? "var(--bg-canvas)"
                     : "var(--fg-primary)",
-              borderColor: "var(--border-hairline)",
+              borderColor:
+                item.tone === "error" ? "var(--border-danger)" : "var(--border-hairline)",
               boxShadow: "var(--shadow-paper)",
             }}
           >

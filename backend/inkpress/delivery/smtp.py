@@ -4,7 +4,7 @@ import asyncio
 import mimetypes
 import re
 from email.message import EmailMessage
-from email.utils import formatdate, make_msgid
+from email.utils import formatdate, make_msgid, parseaddr
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +14,7 @@ from inkpress.logging import get_logger
 
 logger = get_logger(__name__)
 
-MAX_ATTACHMENT_BYTES = 24 * 1024 * 1024  # Safely under Gmail 25 MB limit
+MAX_ATTACHMENT_BYTES = 18 * 1024 * 1024  # Safely under 25 MB limit after ~37% Base64 expansion
 
 
 def sanitize_filename(name: str) -> str:
@@ -50,8 +50,9 @@ async def send_ebook_via_smtp(
 
     total_bytes = sum(p.stat().st_size for p in attachments)
     if total_bytes > MAX_ATTACHMENT_BYTES:
+        limit_mb = MAX_ATTACHMENT_BYTES // (1024 * 1024)
         raise ValueError(
-            f"Total attachment size ({total_bytes / 1024 / 1024:.1f} MB) exceeds 24 MB email limit"
+            f"Total attachment size ({total_bytes / 1024 / 1024:.1f} MB) exceeds {limit_mb} MB email limit"
         )
 
     msg = EmailMessage()
@@ -59,7 +60,9 @@ async def send_ebook_via_smtp(
     msg["To"] = ", ".join(recipients)
     msg["Subject"] = subject
     msg["Date"] = formatdate(localtime=True)
-    msg["Message-ID"] = make_msgid(domain=from_email.split("@")[-1])
+    bare_from = parseaddr(from_email)[1] or from_email
+    msgid_domain = bare_from.split("@", 1)[1].strip() if "@" in bare_from else ""
+    msg["Message-ID"] = make_msgid(domain=msgid_domain or None)
     msg.set_content(body_text)
 
     for file_path in attachments:
@@ -80,6 +83,16 @@ async def send_ebook_via_smtp(
             filename=sanitize_filename(file_path.name),
         )
 
+    if use_ssl:
+        start_tls = False
+    elif smtp_config.get("start_tls") is not None:
+        start_tls = bool(smtp_config["start_tls"])
+    elif port == 25:
+        # Plain LAN SMTP relays on port 25 often do not support STARTTLS or use self-signed certs
+        start_tls = False
+    else:
+        start_tls = True
+
     last_exc: Exception | None = None
     for attempt in range(1, retries + 1):
         try:
@@ -90,7 +103,7 @@ async def send_ebook_via_smtp(
                 username=username or None,
                 password=password or None,
                 use_tls=use_ssl,
-                start_tls=not use_ssl,
+                start_tls=start_tls,
                 timeout=90,
             )
             logger.info(

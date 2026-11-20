@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import html
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Any
+from urllib.parse import urlparse
 
 import feedparser
 
@@ -28,6 +30,11 @@ def resolve_feed_url(identifier: str, rsshub_base_url: str) -> str:
         route = cleaned[len("rsshub://") :].lstrip("/")
         return f"{rsshub_base_url.rstrip('/')}/{route}"
     return cleaned
+
+
+def _is_valid_http_url(url: str) -> bool:
+    parsed = urlparse(url.strip())
+    return parsed.scheme.lower() in ("http", "https") and bool(parsed.netloc)
 
 
 def _parse_entry_date(entry: Any) -> datetime:
@@ -57,8 +64,8 @@ def _parse_entry_date(entry: Any) -> datetime:
     return datetime.now(UTC)
 
 
-def _strip_tags_len(html: str) -> int:
-    return len(re.sub(r"<[^>]+>", "", html).strip())
+def _strip_tags_len(raw_html: str) -> int:
+    return len(re.sub(r"<[^>]+>", "", raw_html).strip())
 
 
 async def fetch_rss_entries(
@@ -72,23 +79,30 @@ async def fetch_rss_entries(
 ) -> tuple[str, list[RssEntry]]:
     """Fetch and parse an RSS/Atom/JSON feed (including rsshub:// shortcuts)."""
     url = resolve_feed_url(identifier, rsshub_base_url)
-    # Internal RSSHub calls never need proxy or SSL verify
-    is_internal = url.startswith(rsshub_base_url.rstrip("/"))
+    # Internal RSSHub calls never need proxy or SSL verify, and bypass public-IP SSRF guard
+    rsshub_root = rsshub_base_url.rstrip("/")
+    is_internal = bool(rsshub_root) and url.startswith(rsshub_root)
+    rsshub_host = (urlparse(rsshub_base_url).hostname or "").strip().lower()
+    allow_internal = {rsshub_host} if (is_internal and rsshub_host) else None
+
     raw_xml, _ = await smart_fetch_text(
         url,
         use_proxy="direct" if is_internal else use_proxy,
         outbound_proxy="" if is_internal else outbound_proxy,
         byparr_base_url="" if is_internal else byparr_base_url,
         verify_ssl=not url.startswith("https://www.dapenti.com"),
+        allow_internal_hosts=allow_internal,
     )
     parsed = feedparser.parse(raw_xml)
     feed_title = str(parsed.feed.get("title") or "").strip()
 
     results: list[RssEntry] = []
-    for entry in parsed.entries[:max_items]:
-        title = str(entry.get("title") or "").strip()
-        link = str(entry.get("link") or "").strip()
-        if not title or not link:
+    for entry in parsed.entries:
+        if len(results) >= max_items:
+            break
+        title = html.unescape(str(entry.get("title") or "")).strip()
+        link = html.unescape(str(entry.get("link") or "")).strip()
+        if not title or not link or not _is_valid_http_url(link):
             continue
 
         content_html = ""

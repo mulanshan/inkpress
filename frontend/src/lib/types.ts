@@ -17,15 +17,29 @@ export interface User {
   created_at: string;
 }
 
+export type SourceKind = "newsnow" | "rss" | "rsshub" | "webpage" | "webpage_list";
+export type FetchStrategy = "fulltext_rss" | "extract_web" | "newsnow_digest" | "byparr_browser";
+export type ProxyMode = "auto" | "direct" | "proxy";
+
+export interface SourceAiOptions {
+  summarize?: boolean;
+  bilingual?: boolean;
+  title_include_regex?: string;
+  title_exclude_regex?: string;
+  link_selector?: string;
+  content_selector?: string;
+  remove_selectors?: string[];
+}
+
 export interface SourceItem {
   id: number;
   name: string;
-  kind: "newsnow" | "rss" | "rsshub" | "webpage";
+  kind: SourceKind;
   identifier: string;
   category: string;
-  fetch_strategy: "fulltext_rss" | "extract_web" | "newsnow_digest" | "byparr_browser";
-  use_proxy: "auto" | "direct" | "proxy";
-  ai_options: { summarize?: boolean; bilingual?: boolean };
+  fetch_strategy: FetchStrategy;
+  use_proxy: ProxyMode;
+  ai_options: SourceAiOptions;
   max_items: number;
   enabled: boolean;
   last_fetched_at: string | null;
@@ -48,11 +62,12 @@ export interface NewsNowCatalogItem {
 
 export interface RssPreset {
   name: string;
-  kind: "rss" | "rsshub";
+  kind: "rss" | "rsshub" | "webpage" | "webpage_list";
   identifier: string;
   category: string;
-  fetch_strategy: "fulltext_rss" | "extract_web";
-  use_proxy: "auto" | "direct" | "proxy";
+  fetch_strategy: "fulltext_rss" | "extract_web" | "byparr_browser";
+  use_proxy: ProxyMode;
+  ai_options?: SourceAiOptions;
   description: string;
 }
 
@@ -106,6 +121,8 @@ export interface EditionItem {
   max_mb_per_volume: number;
   grayscale_images: boolean;
   include_qr_links: boolean;
+  strip_links?: boolean;
+  retention_days?: number;
   ai_briefing_enabled: boolean;
   target_emails: string;
   issue_counter: number;
@@ -195,6 +212,8 @@ export interface DeepHealth {
   version: string;
   database: { ok: boolean; dialect?: string; error?: string };
   redis: { ok: boolean; error?: string };
+  worker?: { ok: boolean; queue_depth: number; last_seen: string | null };
+  storage?: { free_gb: number };
   newsnow: { ok: boolean; http_status?: number; error?: string };
   rsshub: { ok: boolean; http_status?: number; error?: string };
   byparr: { ok: boolean; http_status?: number; error?: string };

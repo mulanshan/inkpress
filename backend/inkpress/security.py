@@ -8,7 +8,7 @@ from typing import Any
 
 import jwt
 from argon2 import PasswordHasher
-from argon2.exceptions import VerifyMismatchError
+from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
 from cryptography.fernet import Fernet, InvalidToken
 
 from inkpress.config import get_settings
@@ -23,7 +23,7 @@ def hash_password(password: str) -> str:
 def verify_password(password: str, password_hash: str) -> bool:
     try:
         return _ph.verify(password_hash, password)
-    except VerifyMismatchError:
+    except (VerifyMismatchError, InvalidHashError, VerificationError):
         return False
 
 

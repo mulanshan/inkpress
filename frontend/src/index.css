@@ -12,6 +12,9 @@
   --accent: #b44b32;
   --accent-soft: #f6e7e2;
   --accent-fg: #ffffff;
+  --fg-danger: #a62626;
+  --bg-danger-soft: #fdf2f2;
+  --border-danger: #f3c6c6;
   --shadow-paper: 0 1px 2px rgba(28, 27, 24, 0.04), 0 8px 24px rgba(28, 27, 24, 0.05);
 }
 
@@ -26,6 +29,9 @@
   --accent: #9e442a;
   --accent-soft: #ead9c7;
   --accent-fg: #faf4e6;
+  --fg-danger: #9a2420;
+  --bg-danger-soft: #f5e2d8;
+  --border-danger: #dfb8ab;
   --shadow-paper: 0 1px 2px rgba(43, 35, 24, 0.05), 0 8px 24px rgba(43, 35, 24, 0.06);
 }
 
@@ -40,6 +46,9 @@
   --accent: #d97757;
   --accent-soft: #2e201b;
   --accent-fg: #141413;
+  --fg-danger: #f87171;
+  --bg-danger-soft: #2e1919;
+  --border-danger: #5c2828;
   --shadow-paper: 0 2px 12px rgba(0, 0, 0, 0.35);
 }
 
@@ -54,6 +63,9 @@
   --accent: #000000;
   --accent-soft: #eeeeee;
   --accent-fg: #ffffff;
+  --fg-danger: #000000;
+  --bg-danger-soft: #eeeeee;
+  --border-danger: #000000;
   --shadow-paper: none;
 }
 
@@ -67,19 +79,20 @@ html,
 body {
   background-color: var(--bg-canvas);
   color: var(--fg-primary);
-  font-family: "Inter", -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB",
-    "Microsoft YaHei", sans-serif;
+  font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB",
+    "Noto Sans CJK SC", "Microsoft YaHei", system-ui, sans-serif;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
 }
 
 .font-editorial {
-  font-family: "Newsreader", "Noto Serif SC", "Songti SC", "STSong", Georgia, serif;
+  font-family: "Songti SC", "Noto Serif SC", "Noto Serif CJK SC", "STSong",
+    "Source Han Serif SC", Georgia, "Times New Roman", serif;
 }
 
 .font-sans-clean {
-  font-family: "Inter", -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB",
-    sans-serif;
+  font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB",
+    "Noto Sans CJK SC", "Microsoft YaHei", system-ui, sans-serif;
 }
 
 /* Longform reading prose */
@@ -92,12 +105,24 @@ body {
 .editorial-prose h2,
 .editorial-prose h3,
 .editorial-prose h4 {
-  font-family: "Newsreader", "Noto Serif SC", "Songti SC", Georgia, serif;
+  font-family: "Songti SC", "Noto Serif SC", "Noto Serif CJK SC", "STSong",
+    "Source Han Serif SC", Georgia, "Times New Roman", serif;
   font-weight: 600;
   line-height: 1.35;
   margin-top: 1.75em;
   margin-bottom: 0.65em;
   color: var(--fg-primary);
+}
+
+.editorial-prose h1 {
+  font-size: 1.65em;
+}
+
+.editorial-prose h1.article-title {
+  font-size: 1.65em;
+  margin-top: 0.25em;
+  padding-bottom: 0.45em;
+  border-bottom: 1px solid var(--border-hairline);
 }
 
 .editorial-prose h2 {
@@ -108,6 +133,10 @@ body {
   font-size: 1.18em;
 }
 
+.editorial-prose h4 {
+  font-size: 1.05em;
+}
+
 .editorial-prose p {
   margin-bottom: 1.25em;
   text-align: justify;
@@ -115,7 +144,7 @@ body {
 
 .editorial-prose p.bilingual-tr {
   color: var(--fg-secondary);
-  font-style: italic;
+  font-style: normal;
   margin-top: -0.65em;
   margin-bottom: 1.4em;
   padding-left: 0.9em;
@@ -124,11 +153,15 @@ body {
 
 .editorial-prose blockquote {
   margin: 1.4em 0;
-  padding: 0.25em 1.15em;
+  padding: 0.35em 1.15em;
   border-left: 3px solid var(--accent);
   color: var(--fg-secondary);
   background: var(--bg-subtle);
   border-radius: 0 6px 6px 0;
+}
+
+.editorial-prose blockquote p:last-child {
+  margin-bottom: 0;
 }
 
 .editorial-prose img {
@@ -137,6 +170,17 @@ body {
   border-radius: 6px;
   margin: 1.4em auto;
   display: block;
+}
+
+.editorial-prose figure {
+  margin: 1.4em 0;
+  text-align: center;
+}
+
+.editorial-prose figcaption {
+  font-size: 0.82em;
+  color: var(--fg-muted);
+  margin-top: 0.45em;
 }
 
 .editorial-prose pre {
@@ -166,12 +210,46 @@ body {
   margin-bottom: 1.25em;
 }
 
+.editorial-prose ul {
+  list-style-type: disc;
+}
+
+.editorial-prose ol {
+  list-style-type: decimal;
+}
+
+.editorial-prose ul ul {
+  list-style-type: circle;
+  margin-top: 0.35em;
+  margin-bottom: 0.35em;
+}
+
+.editorial-prose ol ol {
+  list-style-type: lower-alpha;
+  margin-top: 0.35em;
+  margin-bottom: 0.35em;
+}
+
 .editorial-prose li {
   margin-bottom: 0.45em;
 }
 
+.editorial-prose li > p {
+  margin-bottom: 0.5em;
+}
+
+.editorial-prose hr {
+  border: 0;
+  border-top: 1px solid var(--border-hairline);
+  margin: 1.8em 0;
+}
+
 .editorial-prose table {
+  display: block;
   width: 100%;
+  max-width: 100%;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
   border-collapse: collapse;
   margin: 1.4em 0;
   font-size: 0.92em;
@@ -182,6 +260,87 @@ body {
   border: 1px solid var(--border-hairline);
   padding: 0.55em 0.75em;
   text-align: left;
+  min-width: 4.5rem;
+}
+
+.editorial-prose th {
+  background: var(--bg-subtle);
+  font-weight: 600;
+}
+
+/* EPUB & Edition built-in editorial blocks */
+.editorial-prose .article-meta {
+  font-size: 0.84em;
+  color: var(--fg-muted);
+  margin-bottom: 1.35em;
+  line-height: 1.55;
+  text-align: left;
+}
+
+.editorial-prose .ai-summary-box {
+  border-left: 3px solid var(--accent);
+  background: var(--bg-subtle);
+  color: var(--fg-secondary);
+  padding: 0.9em 1.15em;
+  margin: 1.1em 0 1.55em;
+  border-radius: 0 10px 10px 0;
+  font-size: 0.92em;
+  line-height: 1.7;
+}
+
+.editorial-prose .ai-summary-box p {
+  margin-bottom: 0.5em;
+  text-align: left;
+}
+
+.editorial-prose .ai-summary-box p:last-child {
+  margin-bottom: 0;
+}
+
+.editorial-prose .ai-summary-label {
+  display: block;
+  font-size: 0.8em;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin-bottom: 0.4em;
+}
+
+.editorial-prose .qr-footer {
+  margin-top: 1.8em;
+  padding-top: 1.2em;
+  border-top: 1px dashed var(--border-hairline);
+  text-align: center;
+  font-size: 0.82em;
+  color: var(--fg-muted);
+}
+
+.editorial-prose .qr-footer p {
+  text-align: center;
+  margin-bottom: 0.5em;
+}
+
+.editorial-prose .qr-footer img {
+  width: 128px;
+  height: 128px;
+  margin: 0.6em auto;
+  border-radius: 6px;
+  padding: 6px;
+  background: #ffffff;
+  border: 1px solid var(--border-hairline);
+}
+
+.editorial-prose .chapter-nav {
+  margin-top: 2em;
+  padding-top: 1em;
+  border-top: 1px solid var(--border-hairline);
+  font-size: 0.88em;
+  text-align: center;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 1.25em;
 }
 
 .editorial-prose .digest-item {

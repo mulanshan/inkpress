@@ -5,9 +5,10 @@ import re
 import uuid
 import zipfile
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
+from urllib.parse import urljoin
 
 import qrcode
 from bs4 import BeautifulSoup
@@ -17,6 +18,9 @@ from lxml import html as lxml_html
 from inkpress.publishing.cover_generator import generate_editorial_cover
 from inkpress.publishing.epub_validator import validate_epub
 from inkpress.publishing.image_pipeline import ProcessedImage, download_and_optimize_images
+
+MAX_IMAGES_PER_CHAPTER = 20
+MAX_IMAGES_TOTAL = 150
 
 KINDLE_PAPER_CSS = """@charset "utf-8";
 body {
@@ -66,8 +70,9 @@ p.no-indent, .article-meta p, .ai-summary-box p, blockquote p, li p {
 }
 p.bilingual-tr {
   color: #4a4a4a;
-  font-style: italic;
-  text-indent: 2em;
+  border-left: 2px solid #bbbbbb;
+  padding-left: 0.7em;
+  text-indent: 0;
   margin-top: -0.45em;
   margin-bottom: 1.1em;
 }
@@ -142,6 +147,10 @@ th, td {
 """
 
 
+def _safe_xml_parser() -> etree.XMLParser:
+    return etree.XMLParser(resolve_entities=False, no_network=True, huge_tree=False)
+
+
 @dataclass
 class EpubChapterInput:
     title: str
@@ -176,6 +185,49 @@ class _CompiledChapter:
     category: str
     xhtml_bytes: bytes
     images: list[ProcessedImage] = field(default_factory=list)
+
+
+@dataclass
+class _DraftChapter:
+    filename: str
+    item_id: str
+    anchor_id: str
+    title: str
+    category: str
+    language: str
+    body_without_nav: str
+    images: list[ProcessedImage] = field(default_factory=list)
+
+    def estimated_bytes(self) -> int:
+        return len(self.body_without_nav.encode("utf-8")) + 512 + sum(
+            len(img.data) for img in self.images
+        )
+
+
+def _process_body_links(soup: BeautifulSoup, *, strip_links: bool, base_url: str = "") -> None:
+    """Strip or normalize hyperlinks inside article content before building XHTML."""
+    for a_tag in soup.find_all("a"):
+        if strip_links:
+            a_tag.unwrap()
+            continue
+        href = str(a_tag.get("href") or "").strip()
+        if not href:
+            a_tag.unwrap()
+            continue
+        if href.startswith("#"):
+            continue
+        lower = href.lower()
+        if lower.startswith(("http://", "https://", "mailto:")):
+            continue
+        if base_url.startswith(("http://", "https://")) and not lower.startswith(
+            ("javascript:", "vbscript:", "data:")
+        ):
+            resolved = urljoin(base_url, href)
+            if resolved.startswith(("http://", "https://")):
+                a_tag["href"] = resolved
+                continue
+        # Unwrap unsafe schemes or unresolved relative links that would break EPUB validation
+        a_tag.unwrap()
 
 
 def _xml_safe_fragment(raw_html: str) -> str:
@@ -232,7 +284,7 @@ def _wrap_xhtml_document(
     )
     raw = doc.encode("utf-8")
     # Guarantee XML well-formedness before writing to EPUB
-    etree.fromstring(raw)
+    etree.fromstring(raw, parser=_safe_xml_parser())
     return raw
 
 
@@ -261,7 +313,11 @@ def _write_strict_epub_zip(
     safe_title = html_escape.escape(title)
     safe_author = html_escape.escape(author or "InkPress")
     safe_lang = html_escape.escape(language or "zh-CN")
-    iso_date = issue_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+    utc_date = (
+        issue_date.astimezone(UTC) if issue_date.tzinfo is not None else issue_date.replace(tzinfo=UTC)
+    )
+    iso_date = utc_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+    parser = _safe_xml_parser()
 
     # Deduplicate embedded images across chapters
     images_by_name: dict[str, ProcessedImage] = {}
@@ -304,7 +360,7 @@ def _write_strict_epub_zip(
         "</body>\n"
         "</html>\n"
     ).encode()
-    etree.fromstring(nav_xhtml)
+    etree.fromstring(nav_xhtml, parser=parser)
 
     # EPUB2 toc.ncx
     ncx_points = "\n".join(
@@ -329,7 +385,7 @@ def _write_strict_epub_zip(
         "  </navMap>\n"
         "</ncx>\n"
     ).encode()
-    etree.fromstring(toc_ncx)
+    etree.fromstring(toc_ncx, parser=parser)
 
     # content.opf
     manifest_lines = [
@@ -373,7 +429,7 @@ def _write_strict_epub_zip(
         "  </guide>\n"
         "</package>\n"
     ).encode("utf-8")
-    etree.fromstring(content_opf)
+    etree.fromstring(content_opf, parser=parser)
 
     container_xml = (
         b'<?xml version="1.0" encoding="utf-8"?>\n'
@@ -420,52 +476,80 @@ async def build_kindle_edition_epubs(
     include_qr_links: bool = False,
     outbound_proxy: str = "",
     download_images: bool = True,
+    strip_links: bool = True,
 ) -> list[BuiltEpubVolume]:
     """Compile articles into one or more Send-to-Kindle-validated EPUB3 volumes."""
     if not chapters_input and not briefing_html:
         raise ValueError("Cannot build EPUB with zero articles and no briefing")
 
-    # 1. Gather all image URLs across chapters
-    all_img_urls: list[str] = []
+    # 1. Gather per-chapter image URLs with canonical_url Referer and fair round-robin cap
+    per_chapter_img_items: list[list[tuple[str, str]]] = []
     if download_images:
         for ch in chapters_input:
             source_html = ch.bilingual_html or ch.body_html
             soup = BeautifulSoup(source_html, "lxml")
+            ch_urls: list[tuple[str, str]] = []
+            seen_in_ch: set[str] = set()
+            ref = ch.canonical_url if ch.canonical_url.startswith(("http://", "https://")) else ""
             for img in soup.find_all("img"):
                 src = str(img.get("src") or "").strip()
-                if src.startswith(("http://", "https://")):
-                    all_img_urls.append(src)
+                if src.startswith(("http://", "https://")) and src not in seen_in_ch:
+                    seen_in_ch.add(src)
+                    ch_urls.append((src, ref))
+                    if len(ch_urls) >= MAX_IMAGES_PER_CHAPTER:
+                        break
+            per_chapter_img_items.append(ch_urls)
+
+    img_items_to_fetch: list[tuple[str, str]] = []
+    seen_global: set[str] = set()
+    if per_chapter_img_items:
+        max_depth = max((len(lst) for lst in per_chapter_img_items), default=0)
+        for slot in range(max_depth):
+            for lst in per_chapter_img_items:
+                if slot < len(lst):
+                    img_url, ref = lst[slot]
+                    if img_url not in seen_global:
+                        seen_global.add(img_url)
+                        img_items_to_fetch.append((img_url, ref))
+                        if len(img_items_to_fetch) >= MAX_IMAGES_TOTAL:
+                            break
+            if len(img_items_to_fetch) >= MAX_IMAGES_TOTAL:
+                break
 
     downloaded = (
         await download_and_optimize_images(
-            all_img_urls,
+            img_items_to_fetch,
             outbound_proxy=outbound_proxy,
             grayscale=grayscale_images,
+            max_images=MAX_IMAGES_TOTAL,
         )
-        if all_img_urls
+        if img_items_to_fetch
         else {}
     )
 
-    # 2. Compile each chapter into strict XHTML5
-    compiled: list[_CompiledChapter] = []
+    # 2. Prepare draft chapters WITHOUT .chapter-nav so cross-volume links cannot break
+    drafts: list[_DraftChapter] = []
 
     if briefing_html.strip():
-        safe_brief = _xml_safe_fragment(briefing_html)
+        brief_soup = BeautifulSoup(briefing_html, "lxml")
+        _process_body_links(brief_soup, strip_links=strip_links)
+        brief_root = brief_soup.body if brief_soup.body else brief_soup
+        safe_brief = _xml_safe_fragment(brief_root.decode_contents())
         brief_body = (
             '<h1 id="ch-briefing" class="article-title">今日头版综述</h1>\n'
             f'<div class="article-meta">{html_escape.escape(edition_title)} · 第 {issue_number} 期 · '
             f"{issue_date.strftime('%Y-%m-%d')}</div>\n"
-            f"{safe_brief}\n"
-            '<div class="chapter-nav"><a href="nav.xhtml">返回目录</a></div>'
+            f"{safe_brief}"
         )
-        compiled.append(
-            _CompiledChapter(
+        drafts.append(
+            _DraftChapter(
                 filename="ch_000_briefing.xhtml",
                 item_id="ch-000",
                 anchor_id="ch-briefing",
                 title="今日头版综述",
                 category="导读",
-                xhtml_bytes=_wrap_xhtml_document(title="今日头版综述", body_inner=brief_body),
+                language="zh-CN",
+                body_without_nav=brief_body,
             )
         )
 
@@ -473,15 +557,19 @@ async def build_kindle_edition_epubs(
         source_html = ch.bilingual_html or ch.body_html
         soup = BeautifulSoup(source_html, "lxml")
         ch_images: list[ProcessedImage] = []
+        embedded_in_ch = 0
 
         for img in soup.find_all("img"):
             src = str(img.get("src") or "").strip()
-            if src in downloaded:
+            if src in downloaded and embedded_in_ch < MAX_IMAGES_PER_CHAPTER:
                 pimg = downloaded[src]
                 img["src"] = pimg.filename
                 ch_images.append(pimg)
+                embedded_in_ch += 1
             else:
                 img.decompose()
+
+        _process_body_links(soup, strip_links=strip_links, base_url=ch.canonical_url)
 
         body_root = soup.body if soup.body else soup
         safe_body = _xml_safe_fragment(body_root.decode_contents())
@@ -527,55 +615,79 @@ async def build_kindle_edition_epubs(
                 "</div>\n"
             )
 
-        next_link = (
-            f' · <a href="ch_{idx + 1:03d}.xhtml">下一篇 →</a>' if idx < len(chapters_input) else ""
-        )
-        inner_html = (
+        body_without_nav = (
             f'<h1 id="{anchor_id}" class="article-title">{html_escape.escape(ch.title)}</h1>\n'
             f'<div class="article-meta">{meta_line}</div>\n'
             f"{summary_block}"
             f"{safe_body}\n"
-            f"{qr_block}"
-            f'<div class="chapter-nav"><a href="nav.xhtml">返回目录</a>{next_link}</div>'
+            f"{qr_block}".rstrip("\n")
         )
-        compiled.append(
-            _CompiledChapter(
+        drafts.append(
+            _DraftChapter(
                 filename=f"ch_{idx:03d}.xhtml",
                 item_id=f"ch-{idx:03d}",
                 anchor_id=anchor_id,
                 title=ch.title,
                 category=ch.category,
-                xhtml_bytes=_wrap_xhtml_document(
-                    title=ch.title, body_inner=inner_html, language=ch.language
-                ),
+                language=ch.language,
+                body_without_nav=body_without_nav,
                 images=ch_images,
             )
         )
 
-    # 3. Partition into volumes under max_mb_per_volume (reserve ~400 KB for cover/metadata)
-    max_bytes = max(2, max_mb_per_volume) * 1024 * 1024 - 400 * 1024
-    volumes_chapters: list[list[_CompiledChapter]] = []
-    cur_bucket: list[_CompiledChapter] = []
+    # 3. Partition drafts into volumes under max_mb_per_volume (reserve ~400 KB for cover/metadata)
+    max_bytes = max(1, max_mb_per_volume) * 1024 * 1024 - 400 * 1024
+    volumes_drafts: list[list[_DraftChapter]] = []
+    cur_bucket: list[_DraftChapter] = []
     cur_bytes = 0
-    for item in compiled:
-        item_cost = len(item.xhtml_bytes) + sum(len(img.data) for img in item.images)
+    for item in drafts:
+        item_cost = item.estimated_bytes()
         if cur_bucket and cur_bytes + item_cost > max_bytes:
-            volumes_chapters.append(cur_bucket)
+            volumes_drafts.append(cur_bucket)
             cur_bucket = [item]
             cur_bytes = item_cost
         else:
             cur_bucket.append(item)
             cur_bytes += item_cost
     if cur_bucket:
-        volumes_chapters.append(cur_bucket)
+        volumes_drafts.append(cur_bucket)
 
-    # 4. Write & validate each volume
-    total_vols = len(volumes_chapters)
+    # 4. Finalize volume-local .chapter-nav links, write, and validate each volume
+    total_vols = len(volumes_drafts)
     date_slug = issue_date.strftime("%Y%m%d_%H%M")
-    safe_slug = re.sub(r"[^\w\u4e00-\u9fff-]+", "_", edition_title).strip("_") or "edition"
+    raw_slug = re.sub(r"[^\w\u4e00-\u9fff-]+", "_", edition_title).strip("_") or "edition"
+    safe_slug = raw_slug[:40].rstrip("_") or "edition"
+    build_uid = uuid.uuid4().hex[:6]
     built: list[BuiltEpubVolume] = []
 
-    for v_idx, bucket in enumerate(volumes_chapters, start=1):
+    for v_idx, draft_bucket in enumerate(volumes_drafts, start=1):
+        compiled_bucket: list[_CompiledChapter] = []
+        for pos, draft in enumerate(draft_bucket):
+            next_link = (
+                f' · <a href="{draft_bucket[pos + 1].filename}">下一篇 →</a>'
+                if pos + 1 < len(draft_bucket)
+                else ""
+            )
+            final_inner = (
+                f"{draft.body_without_nav}\n"
+                f'<div class="chapter-nav"><a href="nav.xhtml">返回目录</a>{next_link}</div>'
+            )
+            compiled_bucket.append(
+                _CompiledChapter(
+                    filename=draft.filename,
+                    item_id=draft.item_id,
+                    anchor_id=draft.anchor_id,
+                    title=draft.title,
+                    category=draft.category,
+                    xhtml_bytes=_wrap_xhtml_document(
+                        title=draft.title,
+                        body_inner=final_inner,
+                        language=draft.language,
+                    ),
+                    images=draft.images,
+                )
+            )
+
         vol_suffix = f" ({v_idx}/{total_vols})" if total_vols > 1 else ""
         vol_title = f"{edition_title} {issue_date.strftime('%m-%d')}{vol_suffix}"
         cover_bytes = generate_editorial_cover(
@@ -583,11 +695,11 @@ async def build_kindle_edition_epubs(
             subtitle=f"{subtitle}{vol_suffix}",
             issue_number=issue_number,
             issue_date=issue_date,
-            headlines=[c.title for c in bucket if c.item_id != "ch-000"][:4],
+            headlines=[c.title for c in compiled_bucket if c.item_id != "ch-000"][:4],
             style=cover_style,
         )
         file_suffix = f"_vol{v_idx}" if total_vols > 1 else ""
-        epub_path = output_dir / f"{safe_slug}_{date_slug}{file_suffix}.epub"
+        epub_path = output_dir / f"{safe_slug}_{date_slug}_{build_uid}{file_suffix}.epub"
         _write_strict_epub_zip(
             epub_path,
             book_id=f"urn:uuid:{uuid.uuid4()}",
@@ -596,7 +708,7 @@ async def build_kindle_edition_epubs(
             language="zh-CN",
             issue_date=issue_date,
             cover_bytes=cover_bytes,
-            chapters=bucket,
+            chapters=compiled_bucket,
         )
         validation = validate_epub(epub_path)
         if not validation.valid:
@@ -608,7 +720,7 @@ async def build_kindle_edition_epubs(
                 title=vol_title,
                 volume_index=v_idx,
                 total_volumes=total_vols,
-                article_count=sum(1 for c in bucket if c.item_id != "ch-000"),
+                article_count=sum(1 for c in compiled_bucket if c.item_id != "ch-000"),
                 size_bytes=epub_path.stat().st_size,
                 cover_bytes=cover_bytes,
             )

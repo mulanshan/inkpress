@@ -22,11 +22,14 @@ services:
       INIT_TABLE: "true"
       ENABLE_CACHE: "true"
       TZ: ${TZ:-Asia/Shanghai}
+      NODE_USE_ENV_PROXY: "1"
+      NODE_OPTIONS: "--import /app/proxy-preload.mjs"
       HTTP_PROXY: ${OUTBOUND_PROXY:-}
       HTTPS_PROXY: ${OUTBOUND_PROXY:-}
-      NO_PROXY: localhost,127.0.0.1,::1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,*.local
+      NO_PROXY: localhost,127.0.0.1,::1,.local,newsnow,rsshub,byparr,postgres,redis
     volumes:
       - ./data/newsnow:/usr/app/.data
+      - ./newsnow-proxy-preload.mjs:/app/proxy-preload.mjs:ro
     networks:
       - inkpress-net
     healthcheck:
@@ -49,8 +52,7 @@ services:
         max-size: "10m"
         max-file: "3"
     ports:
-      - "127.0.0.1:${APP_PORT:-8060}:8000"
-      - "${LAN_BIND_IP:-127.0.0.1}:${APP_PORT:-8060}:8000"
+      - "${APP_BIND_IP:-0.0.0.0}:${APP_PORT:-8060}:8000"
     env_file: .env
     volumes:
       - ${HOST_LIBRARY_DIR:-./data/library}:/data/library
@@ -90,7 +92,7 @@ services:
     command: ["python", "-m", "inkpress.worker.runner"]
 
   scheduler:
-    image: ghcr.io/mulanshan/inkpress-worker:latest
+    image: ghcr.io/mulanshan/inkpress-app:latest
     container_name: inkpress-scheduler
     restart: unless-stopped
     depends_on:

@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from collections.abc import Sequence
 from dataclasses import dataclass
 from io import BytesIO
 
+import httpx
 from PIL import Image
 
 from inkpress.ingestion.fetcher import smart_fetch_bytes
@@ -19,6 +21,15 @@ class ProcessedImage:
     filename: str
     media_type: str
     data: bytes
+
+
+def _is_forbidden_error(exc: Exception) -> bool:
+    cur: BaseException | None = exc
+    while cur is not None:
+        if isinstance(cur, httpx.HTTPStatusError) and cur.response.status_code in (401, 403):
+            return True
+        cur = cur.__cause__
+    return False
 
 
 def optimize_image_bytes(
@@ -60,31 +71,64 @@ def optimize_image_bytes(
 
 
 async def download_and_optimize_images(
-    urls: list[str],
+    urls: Sequence[str | tuple[str, str]],
     *,
     referer: str = "",
+    url_referers: dict[str, str] | None = None,
     outbound_proxy: str = "",
     grayscale: bool = False,
     max_width: int = 1000,
-    max_images: int = 60,
+    max_images: int = 150,
 ) -> dict[str, ProcessedImage]:
-    """Download unique image URLs concurrently and convert to Kindle-friendly JPEGs."""
-    unique_urls = list(dict.fromkeys(u for u in urls if u.startswith(("http://", "https://"))))[
-        :max_images
-    ]
+    """Download unique image URLs concurrently (with per-URL Referer & 401/403 retry) into JPEGs."""
+    dedup_items: dict[str, str] = {}
+    for entry in urls:
+        if isinstance(entry, tuple):
+            img_url, item_ref = entry
+        else:
+            img_url, item_ref = entry, ""
+        img_url = img_url.strip()
+        if not img_url.startswith(("http://", "https://")):
+            continue
+        effective_ref = (
+            item_ref.strip()
+            or (url_referers.get(img_url, "").strip() if url_referers else "")
+            or referer.strip()
+        )
+        if img_url not in dedup_items or (not dedup_items[img_url] and effective_ref):
+            dedup_items[img_url] = effective_ref
+
+    selected_items = list(dedup_items.items())[:max_images]
     sem = asyncio.Semaphore(6)
     results: dict[str, ProcessedImage] = {}
 
-    async def _fetch_one(url: str) -> None:
+    async def _fetch_one(url: str, item_referer: str) -> None:
         async with sem:
             try:
-                raw, _ = await smart_fetch_bytes(
-                    url,
-                    outbound_proxy=outbound_proxy,
-                    referer=referer,
-                    timeout=12.0,
+                try:
+                    raw, _ = await smart_fetch_bytes(
+                        url,
+                        outbound_proxy=outbound_proxy,
+                        referer=item_referer,
+                        timeout=12.0,
+                    )
+                except Exception as first_exc:
+                    if item_referer and _is_forbidden_error(first_exc):
+                        raw, _ = await smart_fetch_bytes(
+                            url,
+                            outbound_proxy=outbound_proxy,
+                            referer="",
+                            timeout=12.0,
+                        )
+                    else:
+                        raise
+
+                optimized = await asyncio.to_thread(
+                    optimize_image_bytes,
+                    raw,
+                    max_width=max_width,
+                    grayscale=grayscale,
                 )
-                optimized = optimize_image_bytes(raw, max_width=max_width, grayscale=grayscale)
                 if optimized is None:
                     return
                 digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
@@ -97,5 +141,5 @@ async def download_and_optimize_images(
             except Exception as exc:
                 logger.debug("image_download_skipped", url=url, err=str(exc))
 
-    await asyncio.gather(*[_fetch_one(u) for u in unique_urls])
+    await asyncio.gather(*[_fetch_one(u, ref) for u, ref in selected_items])
     return results

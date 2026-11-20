@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -21,7 +22,7 @@ NEWSNOW_CATALOG: tuple[NewsNowCatalogItem, ...] = (
         "Hacker News",
         "科技",
         "hottest",
-        "extract_web",
+        "newsnow_digest",
         "en",
         "全球极客与创业技术热议",
     ),
@@ -44,13 +45,13 @@ NEWSNOW_CATALOG: tuple[NewsNowCatalogItem, ...] = (
         "创意工作者技术社区分享",
     ),
     NewsNowCatalogItem(
-        "linuxdo",
-        "Linux.do 热门",
+        "aihot",
+        "AI 热点",
         "科技",
         "hottest",
         "newsnow_digest",
         "zh-CN",
-        "中文技术与 AI 社区热帖",
+        "人工智能与大模型热门动态",
     ),
     NewsNowCatalogItem(
         "sspai", "少数派", "科技", "hottest", "extract_web", "zh-CN", "数字生活与效率深度文章"
@@ -89,16 +90,13 @@ NEWSNOW_CATALOG: tuple[NewsNowCatalogItem, ...] = (
         "nowcoder", "牛客热榜", "科技", "hottest", "newsnow_digest", "zh-CN", "开发者求职与技术讨论"
     ),
     NewsNowCatalogItem(
-        "ghxi", "果核剥壳", "科技", "realtime", "extract_web", "zh-CN", "软件与系统资讯"
-    ),
-    NewsNowCatalogItem(
-        "pcbeta-windows11",
-        "远景论坛 Win11",
+        "chongbuluo-hot",
+        "虫部落热门",
         "科技",
-        "realtime",
+        "hottest",
         "newsnow_digest",
         "zh-CN",
-        "Windows 系统讨论",
+        "搜索技巧与效率工具社区热议",
     ),
     # 财经与商业
     NewsNowCatalogItem(
@@ -174,6 +172,15 @@ NEWSNOW_CATALOG: tuple[NewsNowCatalogItem, ...] = (
         "全球外汇与大宗商品快讯",
     ),
     NewsNowCatalogItem(
+        "fastbull-news",
+        "法布财经新闻",
+        "财经",
+        "realtime",
+        "extract_web",
+        "zh-CN",
+        "全球财经要闻与深度报道",
+    ),
+    NewsNowCatalogItem(
         "mktnews-flash",
         "MKTNews 快讯",
         "财经",
@@ -188,9 +195,6 @@ NEWSNOW_CATALOG: tuple[NewsNowCatalogItem, ...] = (
     ),
     NewsNowCatalogItem(
         "cankaoxiaoxi", "参考消息", "国际", "realtime", "extract_web", "zh-CN", "国际外媒编译资讯"
-    ),
-    NewsNowCatalogItem(
-        "kaopu", "靠谱新闻", "国际", "realtime", "newsnow_digest", "zh-CN", "国际新闻聚合精选"
     ),
     NewsNowCatalogItem(
         "sputniknewscn",
@@ -251,16 +255,25 @@ NEWSNOW_CATALOG: tuple[NewsNowCatalogItem, ...] = (
         "B站高播放热门内容",
     ),
     NewsNowCatalogItem(
+        "bilibili-ranking",
+        "B站排行榜",
+        "热点",
+        "hottest",
+        "newsnow_digest",
+        "zh-CN",
+        "B站全站高人气内容排行",
+    ),
+    NewsNowCatalogItem(
         "douban", "豆瓣热门", "文化", "hottest", "newsnow_digest", "zh-CN", "书影音与文化社区热榜"
     ),
     NewsNowCatalogItem(
         "hupu", "虎扑热帖", "社区", "hottest", "newsnow_digest", "zh-CN", "体育与步行街热议"
     ),
     NewsNowCatalogItem(
-        "dongqiudi", "懂球帝头条", "体育", "realtime", "extract_web", "zh-CN", "足球与体育新闻"
+        "tieba", "百度贴吧热议", "社区", "hottest", "newsnow_digest", "zh-CN", "贴吧全站实时热议话题"
     ),
     NewsNowCatalogItem(
-        "smzdm", "什么值得买", "生活", "hottest", "newsnow_digest", "zh-CN", "消费精选与评测"
+        "dongqiudi", "懂球帝头条", "体育", "realtime", "extract_web", "zh-CN", "足球与体育新闻"
     ),
     NewsNowCatalogItem(
         "steam", "Steam 热门", "游戏", "hottest", "newsnow_digest", "zh-CN", "PC 游戏在线趋势"
@@ -269,7 +282,7 @@ NEWSNOW_CATALOG: tuple[NewsNowCatalogItem, ...] = (
 
 NEWSNOW_BY_ID: dict[str, NewsNowCatalogItem] = {item.id: item for item in NEWSNOW_CATALOG}
 
-CURATED_RSS_PRESETS: tuple[dict[str, str], ...] = (
+CURATED_RSS_PRESETS: tuple[dict[str, Any], ...] = (
     {
         "name": "喷嚏图卦",
         "kind": "rss",
@@ -277,16 +290,18 @@ CURATED_RSS_PRESETS: tuple[dict[str, str], ...] = (
         "category": "综合",
         "fetch_strategy": "fulltext_rss",
         "use_proxy": "direct",
-        "description": "经典每日图文资讯聚合（全文 RSS）",
+        "ai_options": {"title_include_regex": "喷嚏图卦"},
+        "description": "经典每日图文资讯聚合（全文 RSS，默认过滤仅保留喷嚏图卦）",
     },
     {
         "name": "今日最新－天下雜誌",
-        "kind": "rsshub",
-        "identifier": "rsshub://cw/today",
+        "kind": "webpage_list",
+        "identifier": "https://www.cw.com.tw/today",
         "category": "财经",
-        "fetch_strategy": "extract_web",
+        "fetch_strategy": "byparr_browser",
         "use_proxy": "proxy",
-        "description": "通过本地 RSSHub 抓取天下杂志每日精选",
+        "ai_options": {"link_selector": "a[href*='/article/']"},
+        "description": "通过 Byparr 列表页抓取天下杂志每日精选",
     },
     {
         "name": "少数派 Matrix",

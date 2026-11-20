@@ -83,7 +83,10 @@ export function AuthPage({ initialized, onSuccess }: AuthPageProps) {
           }}
         >
           <div>
-            <label className="block text-xs font-medium mb-1.5" style={{ color: "var(--fg-secondary)" }}>
+            <label
+              className="block text-xs font-medium mb-1.5"
+              style={{ color: "var(--fg-secondary)" }}
+            >
               用户名
             </label>
             <input
@@ -100,7 +103,10 @@ export function AuthPage({ initialized, onSuccess }: AuthPageProps) {
           </div>
 
           <div>
-            <label className="block text-xs font-medium mb-1.5" style={{ color: "var(--fg-secondary)" }}>
+            <label
+              className="block text-xs font-medium mb-1.5"
+              style={{ color: "var(--fg-secondary)" }}
+            >
               密码 {!initialized && <span style={{ color: "var(--fg-muted)" }}>（至少 8 位）</span>}
             </label>
             <input
@@ -120,7 +126,10 @@ export function AuthPage({ initialized, onSuccess }: AuthPageProps) {
           {!initialized && (
             <>
               <div>
-                <label className="block text-xs font-medium mb-1.5" style={{ color: "var(--fg-secondary)" }}>
+                <label
+                  className="block text-xs font-medium mb-1.5"
+                  style={{ color: "var(--fg-secondary)" }}
+                >
                   阅读昵称
                 </label>
                 <input
@@ -135,11 +144,15 @@ export function AuthPage({ initialized, onSuccess }: AuthPageProps) {
                 />
               </div>
               <div>
-                <label className="block text-xs font-medium mb-1.5" style={{ color: "var(--fg-secondary)" }}>
-                  Kindle 收件邮箱 <span style={{ color: "var(--fg-muted)" }}>（可选，稍后亦可修改）</span>
+                <label
+                  className="block text-xs font-medium mb-1.5"
+                  style={{ color: "var(--fg-secondary)" }}
+                >
+                  Kindle 收件邮箱{" "}
+                  <span style={{ color: "var(--fg-muted)" }}>（可选，支持逗号分隔多设备）</span>
                 </label>
                 <input
-                  type="email"
+                  type="text"
                   placeholder="your_device@kindle.com"
                   value={kindleEmail}
                   onChange={(e) => setKindleEmail(e.target.value)}
@@ -154,7 +167,14 @@ export function AuthPage({ initialized, onSuccess }: AuthPageProps) {
           )}
 
           {error && (
-            <div className="text-xs rounded-lg px-3 py-2 bg-red-900/10 text-red-700 border border-red-300">
+            <div
+              className="text-xs rounded-lg px-3 py-2 border"
+              style={{
+                backgroundColor: "var(--bg-danger-soft)",
+                color: "var(--fg-danger)",
+                borderColor: "var(--border-danger)",
+              }}
+            >
               {error}
             </div>
           )}

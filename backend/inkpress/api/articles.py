@@ -27,7 +27,7 @@ from inkpress.ingestion.extractor import (
     extract_from_webpage,
     sanitize_article_html,
 )
-from inkpress.ingestion.fetcher import smart_fetch_text
+from inkpress.ingestion.fetcher import assert_safe_public_url, smart_fetch_text
 from inkpress.publishing.epub_builder import EpubChapterInput, build_kindle_edition_epubs
 from inkpress.settings_store import get_ai_config, get_network_config, get_smtp_config
 
@@ -103,11 +103,13 @@ async def _push_single_article_to_kindle(
                 language=article.language,
             )
         ],
+        strip_links=True,
         outbound_proxy=net_cfg["outbound_proxy"],
     )
-    vol = vols[0]
-    cover_file = settings.library_data_dir / "covers" / f"{vol.path.stem}.jpg"
-    cover_file.write_bytes(vol.cover_bytes)
+    primary_vol = vols[0]
+    total_size = sum(v.size_bytes for v in vols)
+    cover_file = settings.library_data_dir / "covers" / f"{primary_vol.path.stem}.jpg"
+    cover_file.write_bytes(primary_vol.cover_bytes)
 
     book = Book(
         kind="web_clip",
@@ -116,11 +118,12 @@ async def _push_single_article_to_kindle(
         description=article.canonical_url,
         language=article.language,
         original_format="epub",
-        original_path=str(vol.path),
-        kindle_epub_path=str(vol.path),
+        original_path=str(primary_vol.path),
+        kindle_epub_path=str(primary_vol.path),
         cover_path=str(cover_file),
-        file_size_bytes=vol.size_bytes,
+        file_size_bytes=total_size,
         conversion_status="ready",
+        metadata_json={"volume_count": len(vols)},
     )
     session.add(book)
     await session.flush()
@@ -132,20 +135,22 @@ async def _push_single_article_to_kindle(
         target_email=", ".join(recipients),
         status="running",
         article_count=1,
-        volume_count=1,
-        file_size_bytes=vol.size_bytes,
+        volume_count=len(vols),
+        file_size_bytes=total_size,
     )
     session.add(delivery)
     await session.commit()
 
     try:
-        await send_ebook_via_smtp(
-            smtp_config=smtp_cfg,
-            recipients=recipients,
-            subject=f"InkPress · {book.title}",
-            body_text=f"Clipped and sent by InkPress: {article.canonical_url}",
-            attachments=[vol.path],
-        )
+        for vol in vols:
+            subject = f"InkPress · {vol.title}" if len(vols) > 1 else f"InkPress · {book.title}"
+            await send_ebook_via_smtp(
+                smtp_config=smtp_cfg,
+                recipients=recipients,
+                subject=subject,
+                body_text=f"Clipped and sent by InkPress: {article.canonical_url}",
+                attachments=[vol.path],
+            )
         book.pushed_count = 1
         book.last_pushed_at = utcnow()
         delivery.status = "sent"
@@ -158,7 +163,12 @@ async def _push_single_article_to_kindle(
         await session.commit()
         raise HTTPException(status_code=502, detail=f"SMTP 发送失败: {exc}") from exc
 
-    return {"status": "sent", "delivery_id": delivery.id, "book_id": book.id}
+    return {
+        "status": "sent",
+        "delivery_id": delivery.id,
+        "book_id": book.id,
+        "volume_count": len(vols),
+    }
 
 
 @router.get("")
@@ -167,17 +177,19 @@ async def list_articles(
     category: str | None = None,
     source_id: int | None = None,
     starred: bool = False,
+    unread_only: bool = False,
     limit: int = 40,
     offset: int = 0,
     _user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    articles = await search_articles_fulltext(
+    articles, total = await search_articles_fulltext(
         session,
         q,
         category=category or None,
         source_id=source_id,
         starred_only=starred,
+        unread_only=unread_only,
         limit=min(limit, 100),
         offset=max(offset, 0),
     )
@@ -191,6 +203,7 @@ async def list_articles(
     return {
         "items": [_article_summary_dict(a) for a in articles],
         "categories": [{"name": c, "count": int(cnt)} for c, cnt in cat_rows],
+        "total": total,
     }
 
 
@@ -246,16 +259,35 @@ async def ai_enrich_article(
         model=str(ai_cfg["model"]),
         outbound_proxy=net_cfg["outbound_proxy"],
         use_proxy=bool(ai_cfg.get("use_proxy", False)),
+        max_concurrency=int(ai_cfg.get("max_concurrency", 3)),
+        timeout_seconds=int(ai_cfg.get("timeout_seconds", 60)),
     )
     try:
         if mode == "bilingual":
-            tr_title, bi_html = await translate_article_bilingual(ai, art)
+            try:
+                tr_title, bi_html = await translate_article_bilingual(ai, art)
+            except Exception as exc:
+                raise HTTPException(status_code=502, detail=f"AI 翻译调用失败: {exc}") from exc
+            if not tr_title and not bi_html:
+                raise HTTPException(
+                    status_code=422,
+                    detail="AI 未生成有效双语译文（文章可能已是中文或正文内容不足）",
+                )
             if tr_title:
                 art.translated_title = tr_title[:500]
             if bi_html:
                 art.bilingual_html = bi_html
         else:
-            art.ai_summary = await summarize_article(ai, art)
+            try:
+                summary = await summarize_article(ai, art)
+            except Exception as exc:
+                raise HTTPException(status_code=502, detail=f"AI 摘要调用失败: {exc}") from exc
+            if not summary or not summary.strip():
+                raise HTTPException(
+                    status_code=422,
+                    detail="AI 未生成有效摘要（文章内容可能过短）",
+                )
+            art.ai_summary = summary.strip()
         await session.commit()
         await session.refresh(art)
     finally:
@@ -282,10 +314,16 @@ async def clip_url(
     _user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
+    target_url = payload.url.strip()
+    try:
+        await assert_safe_public_url(target_url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"不允许抓取该地址: {exc}") from exc
+
     net = await get_network_config(session)
     try:
         raw_html, final_url = await smart_fetch_text(
-            payload.url.strip(),
+            target_url,
             use_proxy=payload.use_proxy,
             outbound_proxy=net["outbound_proxy"],
             byparr_base_url=net["byparr_base_url"],

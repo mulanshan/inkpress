@@ -1,14 +1,100 @@
 from __future__ import annotations
 
+import asyncio
 import zipfile
+from io import BytesIO
 from pathlib import Path
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import docx
+import pymupdf
+import pytest
 from inkpress.publishing.book_converter import (
+    SUPPORTED_BOOK_FORMATS,
+    _run_calibre_convert,
     convert_book_to_kindle_epub,
     list_epub_chapters,
+    normalize_epub_for_kindle,
     read_epub_chapter_html,
 )
-from inkpress.publishing.epub_validator import validate_epub
+from inkpress.publishing.epub_validator import MISSING_NCX_ERROR, validate_epub
+from PIL import Image
+
+
+def _make_png_bytes(color: tuple[int, int, int], size: tuple[int, int] = (80, 80)) -> bytes:
+    img = Image.new("RGB", size, color)
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _create_epub3_without_ncx(path: Path) -> None:
+    """Simulate Calibre 8.5.0 / Pandoc EPUB3 output: valid EPUB3 except missing toc.ncx."""
+    container_xml = (
+        b'<?xml version="1.0" encoding="utf-8"?>\n'
+        b'<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">\n'
+        b"  <rootfiles>\n"
+        b'    <rootfile full-path="EPUB/content.opf" media-type="application/oebps-package+xml"/>\n'
+        b"  </rootfiles>\n"
+        b"</container>\n"
+    )
+    content_opf = (
+        b'<?xml version="1.0" encoding="utf-8"?>\n'
+        b'<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid">\n'
+        b'  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">\n'
+        b'    <dc:identifier id="uid">urn:uuid:calibre-epub3-demo</dc:identifier>\n'
+        b"    <dc:title>Calibre EPUB3 Book</dc:title>\n"
+        b"    <dc:creator>Author A</dc:creator>\n"
+        b"    <dc:language>zh-CN</dc:language>\n"
+        b"  </metadata>\n"
+        b"  <manifest>\n"
+        b'    <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>\n'
+        b'    <item id="css" href="styles/custom.css" media-type="text/css"/>\n'
+        b'    <item id="ch1" href="Text/discovery.xhtml" media-type="application/xhtml+xml"/>\n'
+        b'    <item id="ch2" href="Text/chapter_two.xhtml" media-type="application/xhtml+xml"/>\n'
+        b"  </manifest>\n"
+        b"  <spine>\n"
+        b'    <itemref idref="ch1"/>\n'
+        b'    <itemref idref="ch2"/>\n'
+        b"  </spine>\n"
+        b"</package>\n"
+    )
+    nav_xhtml = (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<!DOCTYPE html>\n'
+        '<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">\n'
+        '<head><meta charset="utf-8"/><title>目录</title></head>\n'
+        '<body><nav epub:type="toc"><ol>\n'
+        '  <li><a href="Text/discovery.xhtml#top">发现之旅</a></li>\n'
+        '  <li><a href="Text/chapter_two.xhtml">第二章 深入原理</a></li>\n'
+        "</ol></nav></body></html>\n"
+    ).encode()
+    # Intentionally set Pandoc-like <title>ch001.xhtml</title> while <body> has <h1>发现之旅</h1>
+    ch1_xhtml = (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<!DOCTYPE html>\n'
+        '<html xmlns="http://www.w3.org/1999/xhtml">\n'
+        '<head><meta charset="utf-8"/><title>ch001.xhtml</title>'
+        '<link rel="stylesheet" href="../styles/custom.css"/></head>\n'
+        '<body><h1 id="top">发现之旅</h1><p>保留原始 CSS 与章节结构。</p></body></html>\n'
+    ).encode()
+    ch2_xhtml = (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<!DOCTYPE html>\n'
+        '<html xmlns="http://www.w3.org/1999/xhtml">\n'
+        '<head><meta charset="utf-8"/><title>ch002.xhtml</title></head>\n'
+        "<body><h2>第二章 深入原理</h2><p>次节内容。</p></body></html>\n"
+    ).encode()
+
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("mimetype", b"application/epub+zip", compress_type=zipfile.ZIP_STORED)
+        zf.writestr("META-INF/container.xml", container_xml, compress_type=zipfile.ZIP_DEFLATED)
+        zf.writestr("EPUB/content.opf", content_opf, compress_type=zipfile.ZIP_DEFLATED)
+        zf.writestr("EPUB/nav.xhtml", nav_xhtml, compress_type=zipfile.ZIP_DEFLATED)
+        zf.writestr("EPUB/styles/custom.css", b"body { color: #222; }", compress_type=zipfile.ZIP_DEFLATED)
+        zf.writestr("EPUB/Text/discovery.xhtml", ch1_xhtml, compress_type=zipfile.ZIP_DEFLATED)
+        zf.writestr("EPUB/Text/chapter_two.xhtml", ch2_xhtml, compress_type=zipfile.ZIP_DEFLATED)
 
 
 async def test_convert_txt_with_chinese_chapters(tmp_path: Path) -> None:
@@ -37,10 +123,14 @@ async def test_convert_txt_with_chinese_chapters(tmp_path: Path) -> None:
     assert "第一章" in str(ch0["html"])
 
 
-async def test_convert_markdown_to_kindle_epub(tmp_path: Path) -> None:
+async def test_convert_markdown_multi_chapter_splitting(tmp_path: Path) -> None:
     src = tmp_path / "essay.md"
     src.write_text(
-        "# 技术随笔\n\n这是一篇 **Markdown** 文章。\n\n- 要点 A\n- 要点 B\n", encoding="utf-8"
+        "# 技术随笔\n\n导语段落。\n\n"
+        "## 第一节 架构\n\n这是一篇 **Markdown** 文章。\n\n"
+        "```python\n# not a heading inside code fence\nprint('ok')\n```\n\n"
+        "## 第二节 实践\n\n- 要点 A\n- 要点 B\n",
+        encoding="utf-8",
     )
     res = await convert_book_to_kindle_epub(
         src,
@@ -49,6 +139,9 @@ async def test_convert_markdown_to_kindle_epub(tmp_path: Path) -> None:
     )
     val = validate_epub(res.kindle_epub_path)
     assert val.valid, f"Converted MD EPUB invalid: {val.errors}"
+    assert res.chapter_count == 3
+    chapters = list_epub_chapters(res.kindle_epub_path)
+    assert [c["title"] for c in chapters] == ["技术随笔", "第一节 架构", "第二节 实践"]
 
 
 async def test_repair_malformed_epub(tmp_path: Path) -> None:
@@ -74,3 +167,397 @@ async def test_repair_malformed_epub(tmp_path: Path) -> None:
     post = validate_epub(repaired.kindle_epub_path)
     assert post.valid, f"Repaired EPUB still invalid: {post.errors}"
     assert "Repaired EPUB" in repaired.notes
+
+
+async def test_inplace_toc_ncx_injection_preserves_epub3_structure(tmp_path: Path) -> None:
+    src = tmp_path / "calibre_out.epub"
+    _create_epub3_without_ncx(src)
+
+    pre = validate_epub(src)
+    assert pre.errors == [MISSING_NCX_ERROR]
+
+    res = await convert_book_to_kindle_epub(
+        src,
+        output_dir=tmp_path / "epubs",
+        cover_dir=tmp_path / "covers",
+    )
+    assert "in-place" in res.notes.lower()
+    assert res.title == "Calibre EPUB3 Book"
+    assert res.author == "Author A"
+    assert res.chapter_count == 2
+
+    post = validate_epub(res.kindle_epub_path)
+    assert post.valid, f"Patched EPUB failed validation: {post.errors}"
+
+    with zipfile.ZipFile(res.kindle_epub_path, "r") as zf:
+        names = set(zf.namelist())
+        # Original custom CSS and original chapter path MUST be preserved untouched!
+        assert "EPUB/styles/custom.css" in names
+        assert "EPUB/Text/discovery.xhtml" in names
+        assert "EPUB/toc.ncx" in names
+        ncx_text = zf.read("EPUB/toc.ncx").decode("utf-8")
+        assert "发现之旅" in ncx_text
+        assert 'src="Text/discovery.xhtml#top"' in ncx_text
+
+    # list_epub_chapters must NOT drop discovery.xhtml and must prefer <h1> over <title>ch001.xhtml
+    chapters = list_epub_chapters(res.kindle_epub_path)
+    assert len(chapters) == 2
+    assert chapters[0]["filename"] == "EPUB/Text/discovery.xhtml"
+    assert chapters[0]["title"] == "发现之旅"
+    assert chapters[1]["title"] == "第二章 深入原理"
+
+
+async def test_read_epub_chapter_html_xss_stripping_links_and_non_epub(tmp_path: Path) -> None:
+    epub_path = tmp_path / "xss_reader.epub"
+    img_bytes = _make_png_bytes((20, 120, 200))
+
+    container_xml = (
+        b'<?xml version="1.0" encoding="utf-8"?>\n'
+        b'<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">\n'
+        b'  <rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>\n'
+        b"</container>\n"
+    )
+    opf = (
+        b'<?xml version="1.0" encoding="utf-8"?>\n'
+        b'<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid">\n'
+        b'  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">\n'
+        b'    <dc:identifier id="uid">urn:uuid:xss-test</dc:identifier>\n'
+        b"    <dc:title>XSS Reader Test</dc:title><dc:language>zh-CN</dc:language>\n"
+        b"  </metadata>\n"
+        b"  <manifest>\n"
+        b'    <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>\n'
+        b'    <item id="c1" href="Text/ch_001.xhtml" media-type="application/xhtml+xml"/>\n'
+        b'    <item id="c2" href="Text/ch_002.xhtml" media-type="application/xhtml+xml"/>\n'
+        b'    <item id="p1" href="images/my%20pic.png" media-type="image/png"/>\n'
+        b"  </manifest>\n"
+        b'  <spine><itemref idref="c1"/><itemref idref="c2"/></spine>\n'
+        b"</package>\n"
+    )
+    ch1 = (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<html xmlns="http://www.w3.org/1999/xhtml"><head><meta charset="utf-8"/></head><body>'
+        "<h1>安全测试章节</h1>"
+        '<script>alert("stored-xss")</script>'
+        '<img src="../images/my%20pic.png" alt="配图" onerror="alert(1)"/>'
+        '<a href="javascript:alert(2)">恶意链接</a>'
+        '<a href="ch_002.xhtml">跳转到第二章</a>'
+        '<div class="chapter-nav"><a href="../nav.xhtml">返回目录</a></div>'
+        "</body></html>"
+    ).encode()
+    ch2 = (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<html xmlns="http://www.w3.org/1999/xhtml"><head><meta charset="utf-8"/></head>'
+        "<body><h1>第二章</h1><p>OK</p></body></html>"
+    ).encode()
+
+    with zipfile.ZipFile(epub_path, "w") as zf:
+        zf.writestr("mimetype", b"application/epub+zip", compress_type=zipfile.ZIP_STORED)
+        zf.writestr("META-INF/container.xml", container_xml)
+        zf.writestr("OEBPS/content.opf", opf)
+        zf.writestr("OEBPS/nav.xhtml", b"<html/>")
+        zf.writestr("OEBPS/Text/ch_001.xhtml", ch1)
+        zf.writestr("OEBPS/Text/ch_002.xhtml", ch2)
+        zf.writestr("OEBPS/images/my pic.png", img_bytes)
+
+    res = read_epub_chapter_html(epub_path, 0, book_id=42)
+    html_out = str(res["html"])
+    assert "<script" not in html_out.lower()
+    assert "stored-xss" not in html_out
+    assert "onerror" not in html_out.lower()
+    assert "javascript:" not in html_out.lower()
+    assert "chapter-nav" not in html_out
+    assert "/api/v1/books/42/asset/OEBPS/images/my%20pic.png" in html_out
+    assert 'data-chapter-index="1"' in html_out
+
+    # Non-existent, non-EPUB (.pdf), and corrupted files must raise ValueError cleanly
+    with pytest.raises(ValueError):
+        read_epub_chapter_html(tmp_path / "missing.epub", 0, book_id=1)
+    fake_pdf = tmp_path / "doc.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4")
+    with pytest.raises(ValueError):
+        read_epub_chapter_html(fake_pdf, 0, book_id=1)
+    corrupt_epub = tmp_path / "corrupt.epub"
+    corrupt_epub.write_bytes(b"not a zip")
+    with pytest.raises(ValueError):
+        read_epub_chapter_html(corrupt_epub, 0, book_id=1)
+
+
+def test_rebuild_prevents_data_src_hijack_duplicate_h1_collision_and_epub2_cover(
+    tmp_path: Path,
+) -> None:
+    src = tmp_path / "malformed_complex.epub"
+    red_png = _make_png_bytes((220, 20, 20), (80, 80))
+    blue_png = _make_png_bytes((20, 40, 220), (80, 80))
+    cover_png = _make_png_bytes((50, 180, 90), (200, 300))
+
+    # Intentionally omit mimetype-first and toc.ncx so normalize_epub_for_kindle runs rebuild
+    container_xml = (
+        b'<?xml version="1.0" encoding="utf-8"?>\n'
+        b'<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">\n'
+        b'  <rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>\n'
+        b"</container>\n"
+    )
+    opf = (
+        b'<?xml version="1.0" encoding="utf-8"?>\n'
+        b'<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="uid">\n'
+        b'  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">\n'
+        b'    <dc:identifier id="uid">urn:uuid:epub2-rebuild</dc:identifier>\n'
+        b"    <dc:title>EPUB2 Rebuild Test</dc:title><dc:language>zh-CN</dc:language>\n"
+        b'    <meta name="cover" content="cov-img"/>\n'
+        b"  </metadata>\n"
+        b"  <manifest>\n"
+        b'    <item id="cov-img" href="images/front.png" media-type="image/png"/>\n'
+        b'    <item id="ch1" href="ch1/discovery.html" media-type="application/xhtml+xml"/>\n'
+        b'    <item id="ch2" href="ch2/gbk_page.html" media-type="application/xhtml+xml"/>\n'
+        b'    <item id="img1" href="ch1/fig.png" media-type="image/png"/>\n'
+        b'    <item id="img2" href="ch2/fig.png" media-type="image/png"/>\n'
+        b"  </manifest>\n"
+        b"  <spine>\n"
+        b'    <itemref idref="ch1"/>\n'
+        b'    <itemref idref="ch2"/>\n'
+        b"  </spine>\n"
+        b"</package>\n"
+    )
+    # Chapter 1: already starts with <h1> + has image with external data-src hijack attempt
+    ch1_html = (
+        "<html><head><title>ch001.html</title></head><body>"
+        "<h1>已有主标题</h1>"
+        '<p>正文段落 <img src="fig.png" data-src="https://evil.example/hijack.jpg" '
+        'data-original="https://evil.example/orig.jpg" alt="red"/></p>'
+        "</body></html>"
+    ).encode()
+    # Chapter 2: GB18030 encoded + same basename fig.png (blue) in ch2/
+    ch2_html = (
+        '<html><head><meta charset="gb18030"/></head><body>'
+        "<h1>简体中文编码测试</h1>"
+        '<p>这是 GB18030 编码章节正文。<img src="fig.png" alt="blue"/></p>'
+        "</body></html>"
+    ).encode("gb18030")
+
+    with zipfile.ZipFile(src, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("META-INF/container.xml", container_xml)
+        zf.writestr("OEBPS/content.opf", opf)
+        zf.writestr("OEBPS/images/front.png", cover_png)
+        zf.writestr("OEBPS/ch1/discovery.html", ch1_html)
+        zf.writestr("OEBPS/ch2/gbk_page.html", ch2_html)
+        zf.writestr("OEBPS/ch1/fig.png", red_png)
+        zf.writestr("OEBPS/ch2/fig.png", blue_png)
+
+    dst = tmp_path / "rebuilt.epub"
+    cover_out = tmp_path / "cover.jpg"
+    res = normalize_epub_for_kindle(src, dst, cover_out)
+
+    val = validate_epub(dst)
+    assert val.valid, f"Rebuilt EPUB failed validation: {val.errors}"
+    assert res.chapter_count == 2
+    assert res.cover_path == cover_out and cover_out.exists()
+
+    # Check EPUB2 cover was actually extracted (green image ~50,180,90)
+    with Image.open(cover_out) as cov_img:
+        r, g, b = cov_img.convert("RGB").getpixel((cov_img.width // 2, cov_img.height // 2))
+        assert g > r and g > b
+
+    with zipfile.ZipFile(dst, "r") as zf:
+        ch1_out = zf.read("OEBPS/ch_0001.xhtml").decode("utf-8")
+        ch2_out = zf.read("OEBPS/ch_0002.xhtml").decode("utf-8")
+        # 1. No data-src hijack! Local rebuilt image preserved!
+        assert "evil.example" not in ch1_out
+        assert 'src="images/rebuilt_001_01.jpg"' in ch1_out
+        # 2. No duplicate <h1>!
+        assert ch1_out.lower().count("<h1") == 1
+        assert ch2_out.lower().count("<h1") == 1
+        # 3. GB18030 decoded cleanly!
+        assert "简体中文编码测试" in ch2_out
+        assert "这是 GB18030 编码章节正文" in ch2_out
+        # 4. Same-basename fig.png images did NOT collide (red in ch1, blue in ch2)
+        img1 = Image.open(BytesIO(zf.read("OEBPS/images/rebuilt_001_01.jpg"))).convert("RGB")
+        img2 = Image.open(BytesIO(zf.read("OEBPS/images/rebuilt_002_01.jpg"))).convert("RGB")
+        r1, _g1, b1 = img1.getpixel((10, 10))
+        r2, _g2, b2 = img2.getpixel((10, 10))
+        assert r1 > 180 and b1 < 80
+        assert b2 > 180 and r2 < 80
+
+
+async def test_pdf_encrypted_rejected_and_reflow_with_toc_image_and_cover(tmp_path: Path) -> None:
+    # 1. Encrypted PDF must raise ValueError with friendly message
+    enc_pdf = tmp_path / "locked.pdf"
+    doc = pymupdf.open()
+    p = doc.new_page()
+    p.insert_text((72, 100), "Secret content")
+    doc.save(
+        str(enc_pdf),
+        encryption=pymupdf.PDF_ENCRYPT_AES_256,
+        user_pw="secret",
+        owner_pw="owner",
+    )
+    doc.close()
+
+    with pytest.raises(ValueError, match="密码"):
+        await convert_book_to_kindle_epub(
+            enc_pdf,
+            output_dir=tmp_path / "epubs",
+            cover_dir=tmp_path / "covers",
+        )
+
+    # 2. Multi-page text PDF with repeating headers/footers, wrapped lines, embedded image, & TOC
+    text_pdf = tmp_path / "journal.pdf"
+    img_bytes = _make_png_bytes((240, 160, 20), (100, 100))
+    doc = pymupdf.open()
+    doc.set_metadata({"title": "Reflow Journal", "author": "Dr. Test"})
+
+    for page_num in range(1, 4):
+        page = doc.new_page(width=595, height=842)
+        if page_num == 1:
+            # Paint a solid dark-blue banner on page 1 so we verify page-1 thumbnail cover is preserved
+            page.draw_rect(pymupdf.Rect(0, 0, 595, 180), color=(0.1, 0.2, 0.7), fill=(0.1, 0.2, 0.7))
+        # Repeating header in top 10% band (y <= 84)
+        page.insert_text((72, 40), "InkPress Technical Journal Header", fontsize=10)
+        # Wrapped multi-line paragraph in body
+        body_rect = pymupdf.Rect(72, 200, 520, 420)
+        page.insert_textbox(
+            body_rect,
+            (
+                f"Page {page_num} discusses modern digital publishing pipelines and how e-ink "
+                "devices reflow long technical paragraphs smoothly across screens without breaking "
+                "individual visual lines into separate paragraph elements."
+            ),
+            fontsize=12,
+        )
+        if page_num == 2:
+            page.insert_image(pymupdf.Rect(72, 440, 220, 588), stream=img_bytes)
+        # Repeating footer in bottom 10% band (y >= 758)
+        page.insert_text((260, 810), f"Page {page_num}", fontsize=10)
+
+    doc.set_toc([[1, "Part One: Foundations", 1], [1, "Part Two: Practice", 2]])
+    doc.save(str(text_pdf))
+    doc.close()
+
+    res = await convert_book_to_kindle_epub(
+        text_pdf,
+        output_dir=tmp_path / "epubs",
+        cover_dir=tmp_path / "covers",
+    )
+    assert res.kindle_epub_path.suffix == ".epub"
+    assert res.title == "Reflow Journal"
+    assert res.author == "Dr. Test"
+    assert res.chapter_count == 2
+    assert res.cover_path is not None and res.cover_path.exists()
+
+    val = validate_epub(res.kindle_epub_path)
+    assert val.valid, f"Reflowed PDF EPUB invalid: {val.errors}"
+    assert val.image_count >= 2  # cover + embedded image from page 2
+
+    # Verify page-1 rendered cover thumbnail was preserved (top pixel is blue, NOT cream editorial bg)
+    with Image.open(res.cover_path) as cov:
+        cr, cg, cb = cov.convert("RGB").getpixel((cov.width // 2, 20))
+        assert cb > cr + 40 and cb > cg + 20
+
+    with zipfile.ZipFile(res.kindle_epub_path, "r") as zf:
+        ch1 = zf.read("OEBPS/ch_0001.xhtml").decode("utf-8")
+        ch2 = zf.read("OEBPS/ch_0002.xhtml").decode("utf-8")
+        # Repeating headers/footers stripped
+        assert "InkPress Technical Journal Header" not in ch1
+        assert "InkPress Technical Journal Header" not in ch2
+        # Wrapped lines merged into a real paragraph containing full sentence
+        assert "modern digital publishing pipelines and how e-ink" in ch1
+        assert "without breaking individual visual lines" in ch1
+        # Embedded image referenced in chapter 2
+        assert "images/pdf_img_" in ch2
+
+    # 3. Scanned / sparse PDF (3 pages with tiny text) must preserve native PDF
+    scanned_pdf = tmp_path / "scanned.pdf"
+    sdoc = pymupdf.open()
+    for _ in range(3):
+        sp = sdoc.new_page()
+        sp.insert_text((72, 100), "Hi")
+    sdoc.save(str(scanned_pdf))
+    sdoc.close()
+
+    scan_res = await convert_book_to_kindle_epub(
+        scanned_pdf,
+        output_dir=tmp_path / "epubs",
+        cover_dir=tmp_path / "covers",
+    )
+    assert scan_res.kindle_epub_path.suffix == ".pdf"
+
+
+async def test_cbr_rejected_calibre_args_timeout_and_docx_conversion(tmp_path: Path) -> None:
+    assert "cbr" not in SUPPORTED_BOOK_FORMATS
+    cbr_file = tmp_path / "comic.cbr"
+    cbr_file.write_bytes(b"Rar!")
+    with pytest.raises(ValueError, match="Unsupported book format"):
+        await convert_book_to_kindle_epub(
+            cbr_file,
+            output_dir=tmp_path / "epubs",
+            cover_dir=tmp_path / "covers",
+        )
+
+    # Verify _run_calibre_convert omits --embed-all-fonts=false and kills process on timeout
+    recorded_cmds: list[tuple[Any, ...]] = []
+    fake_proc = MagicMock()
+    fake_proc.returncode = 0
+    fake_proc.kill = MagicMock()
+    fake_proc.wait = AsyncMock(return_value=-9)
+
+    async def fake_exec(*cmd: Any, **kwargs: Any) -> Any:
+        recorded_cmds.append(cmd)
+        # Create dummy dst file when not timing out
+        Path(cmd[2]).write_bytes(b"ok")
+        return fake_proc
+
+    fake_proc.communicate = AsyncMock(return_value=(b"", b""))
+    with patch("asyncio.create_subprocess_exec", side_effect=fake_exec):
+        await _run_calibre_convert(tmp_path / "in.mobi", tmp_path / "out.epub")
+    assert "--embed-all-fonts=false" not in recorded_cmds[0]
+    assert "--epub-version=3" in recorded_cmds[0]
+
+    # Timeout path must kill and reap child process
+    async def hang_comm() -> tuple[bytes, bytes]:
+        await asyncio.sleep(5)
+        return b"", b""
+
+    async def fake_wait_for(coro: Any, timeout: float) -> Any:
+        coro.close()
+        raise TimeoutError
+
+    fake_proc.communicate = hang_comm
+    with (
+        patch("asyncio.create_subprocess_exec", return_value=fake_proc),
+        patch("asyncio.wait_for", side_effect=fake_wait_for),
+        pytest.raises(RuntimeError, match="timed out"),
+    ):
+        await _run_calibre_convert(tmp_path / "in.mobi", tmp_path / "out2.epub")
+    fake_proc.kill.assert_called_once()
+    fake_proc.wait.assert_awaited_once()
+
+    # DOCX conversion fallback (python-docx) produces valid EPUB3
+    docx_file = tmp_path / "notes.docx"
+    d = docx.Document()
+    d.add_heading("第一章 概要", level=1)
+    d.add_paragraph("这是 DOCX 文档正文内容。")
+    d.save(str(docx_file))
+
+    with patch("inkpress.publishing.book_converter._has_binary", return_value=False):
+        docx_res = await convert_book_to_kindle_epub(
+            docx_file,
+            output_dir=tmp_path / "epubs",
+            cover_dir=tmp_path / "covers",
+        )
+    assert validate_epub(docx_res.kindle_epub_path).valid
+
+    # DOCX via Pandoc path uses pandoc -> normalize_epub_for_kindle (in-place NCX)
+    async def fake_pandoc(src_p: Path, dst_p: Path, title: str, author: str = "") -> None:
+        _create_epub3_without_ncx(dst_p)
+
+    with (
+        patch("inkpress.publishing.book_converter._has_binary", return_value=True),
+        patch("inkpress.publishing.book_converter._run_pandoc_docx_to_epub", side_effect=fake_pandoc),
+    ):
+        pandoc_res = await convert_book_to_kindle_epub(
+            docx_file,
+            output_dir=tmp_path / "epubs",
+            cover_dir=tmp_path / "covers",
+        )
+    assert "Pandoc" in pandoc_res.notes
+    assert "in-place" in pandoc_res.notes.lower()
+    assert validate_epub(pandoc_res.kindle_epub_path).valid

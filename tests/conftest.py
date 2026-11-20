@@ -5,6 +5,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from inkpress.api.auth import reset_login_rate_limit
 from inkpress.config import get_settings
 from inkpress.db.base import Base, get_engine, reset_db_globals
 from inkpress.main import create_app
@@ -22,6 +23,7 @@ async def test_client(
     monkeypatch.setenv("REDIS_URL", "redis://127.0.0.1:6399/15")
     monkeypatch.setenv("LOG_FORMAT", "console")
 
+    reset_login_rate_limit()
     get_settings.cache_clear()
     reset_db_globals()
 
@@ -37,3 +39,4 @@ async def test_client(
     await engine.dispose()
     reset_db_globals()
     get_settings.cache_clear()
+    reset_login_rate_limit()

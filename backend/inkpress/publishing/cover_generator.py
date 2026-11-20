@@ -39,6 +39,17 @@ def _load_font(
     return ImageFont.load_default()
 
 
+def _measure_width(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+) -> float:
+    if not text:
+        return 0.0
+    bbox = draw.textbbox((0, 0), text, font=font)
+    return float(bbox[2] - bbox[0])
+
+
 def _wrap_text(
     draw: ImageDraw.ImageDraw,
     text: str,
@@ -46,23 +57,48 @@ def _wrap_text(
     max_width: int,
     max_lines: int = 2,
 ) -> list[str]:
+    cleaned = text.replace("\r\n", " ").replace("\n", " ").replace("\r", " ").strip()
+    if not cleaned or max_lines <= 0:
+        return []
+
     lines: list[str] = []
     current = ""
-    for ch in text.strip():
+    truncated = False
+
+    for idx, ch in enumerate(cleaned):
         candidate = current + ch
-        bbox = draw.textbbox((0, 0), candidate, font=font)
-        if bbox[2] - bbox[0] <= max_width:
+        if _measure_width(draw, candidate, font) <= max_width:
             current = candidate
+            continue
+
+        if len(lines) >= max_lines - 1:
+            # We are already filling the last allowed line and `ch` overflows
+            truncated = True
+            break
+
+        if current:
+            lines.append(current.rstrip())
+            current = "" if ch.isspace() else ch
         else:
-            if current:
-                lines.append(current)
-            current = ch
-            if len(lines) >= max_lines - 1:
+            # Single glyph exceeds max_width; force progress to avoid infinite loss
+            lines.append(ch)
+            current = ""
+            if len(lines) >= max_lines and idx < len(cleaned) - 1:
+                truncated = True
                 break
+
     if current and len(lines) < max_lines:
-        lines.append(current)
-    if len(lines) == max_lines and len("".join(lines)) < len(text.strip()):
-        lines[-1] = lines[-1][:-1] + "…"
+        lines.append(current.rstrip())
+
+    if truncated:
+        if len(lines) == max_lines:
+            last = lines[-1].rstrip()
+            while last and _measure_width(draw, last + "…", font) > max_width:
+                last = last[:-1].rstrip()
+            lines[-1] = (last + "…") if last else "…"
+        elif len(lines) < max_lines:
+            lines.append("…")
+
     return lines
 
 

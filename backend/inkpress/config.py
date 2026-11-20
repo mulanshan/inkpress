@@ -6,6 +6,8 @@ from pathlib import Path
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+DEFAULT_INSECURE_SECRET_KEY = "dev-insecure-secret-key-change-in-production-32chars"
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -23,7 +25,7 @@ class Settings(BaseSettings):
 
     # Security
     app_secret_key: str = Field(
-        default="dev-insecure-secret-key-change-in-production-32chars",
+        default=DEFAULT_INSECURE_SECRET_KEY,
         alias="APP_SECRET_KEY",
     )
     jwt_expire_hours: int = Field(default=168, alias="JWT_EXPIRE_HOURS")

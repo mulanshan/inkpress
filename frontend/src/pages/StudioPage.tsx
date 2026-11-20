@@ -6,16 +6,22 @@ import {
   Calendar,
   CheckCircle2,
   Copy,
+  Globe,
   KeyRound,
+  Lock,
   Mail,
+  Pencil,
   Play,
   Plus,
+  Power,
+  RefreshCw,
   RotateCw,
   Settings2,
   Trash2,
+  X,
   XCircle,
 } from "lucide-react";
-import { apiRequest, formatBytes, formatRelativeTime } from "../lib/api";
+import { apiRequest, copyToClipboard, formatBytes, formatRelativeTime } from "../lib/api";
 import type {
   DeepHealth,
   DeliveryItem,
@@ -27,6 +33,7 @@ import type {
 import { useToast } from "../components/Toast";
 
 type StudioTab = "editions" | "deliveries" | "settings";
+type CoverStyle = "editorial" | "dark" | "minimal";
 
 export function StudioPage() {
   const qc = useQueryClient();
@@ -38,10 +45,29 @@ export function StudioPage() {
   const [edName, setEdName] = useState("每日晨报");
   const [edSubtitle, setEdSubtitle] = useState("每日精选热点与深度长文");
   const [edCron, setEdCron] = useState("0 6 * * *");
-  const [edCoverStyle, setEdCoverStyle] = useState<"editorial" | "dark" | "minimal">("editorial");
+  const [edCoverStyle, setEdCoverStyle] = useState<CoverStyle>("editorial");
   const [edLookback, setEdLookback] = useState(24);
+  const [edRetentionDays, setEdRetentionDays] = useState(30);
+  const [edStripLinks, setEdStripLinks] = useState(true);
   const [edAiBrief, setEdAiBrief] = useState(true);
   const [selectedSourceIds, setSelectedSourceIds] = useState<number[]>([]);
+
+  // Edit edition modal state
+  const [editingEdition, setEditingEdition] = useState<EditionItem | null>(null);
+  const [editEdName, setEditEdName] = useState("");
+  const [editEdSubtitle, setEditEdSubtitle] = useState("");
+  const [editEdCron, setEditEdCron] = useState("0 6 * * *");
+  const [editEdCoverStyle, setEditEdCoverStyle] = useState<CoverStyle>("editorial");
+  const [editEdLookback, setEditEdLookback] = useState(24);
+  const [editEdDedupDays, setEditEdDedupDays] = useState(14);
+  const [editEdMaxArticles, setEditEdMaxArticles] = useState(40);
+  const [editEdRetentionDays, setEditEdRetentionDays] = useState(30);
+  const [editEdStripLinks, setEditEdStripLinks] = useState(true);
+  const [editEdAiBrief, setEditEdAiBrief] = useState(true);
+  const [editEdEnabled, setEditEdEnabled] = useState(true);
+  const [editEdTargets, setEditEdTargets] = useState("");
+  const [editEdSourceIds, setEditEdSourceIds] = useState<number[]>([]);
+  const [editEdSaving, setEditEdSaving] = useState(false);
 
   // Settings local drafts
   const [smtpHost, setSmtpHost] = useState("");
@@ -59,6 +85,15 @@ export function StudioPage() {
   const [aiProxy, setAiProxy] = useState(false);
 
   const [netProxy, setNetProxy] = useState("");
+  const [netNewsnowUrl, setNetNewsnowUrl] = useState("");
+  const [netRsshubUrl, setNetRsshubUrl] = useState("");
+  const [netByparrUrl, setNetByparrUrl] = useState("");
+
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [passwordSaving, setPasswordSaving] = useState(false);
+
   const [mcpName, setMcpName] = useState("ai-ops");
   const [mcpReadonly, setMcpReadonly] = useState(true);
   const [createdToken, setCreatedToken] = useState<string | null>(null);
@@ -108,6 +143,9 @@ export function StudioPage() {
     setAiModel(s.ai.model);
     setAiProxy(s.ai.use_proxy);
     setNetProxy(s.network.outbound_proxy);
+    setNetNewsnowUrl(s.network.newsnow_base_url);
+    setNetRsshubUrl(s.network.rsshub_base_url);
+    setNetByparrUrl(s.network.byparr_base_url);
   }, [settingsQuery.data]);
 
   // Live SSE progress listener
@@ -134,6 +172,78 @@ export function StudioPage() {
     return () => es.close();
   }, [qc]);
 
+  const openEditEdition = (ed: EditionItem) => {
+    setEditingEdition(ed);
+    setEditEdName(ed.name);
+    setEditEdSubtitle(ed.subtitle);
+    setEditEdCron(ed.cron_expr);
+    setEditEdCoverStyle(ed.cover_style);
+    setEditEdLookback(ed.lookback_hours);
+    setEditEdDedupDays(ed.dedup_window_days);
+    setEditEdMaxArticles(ed.max_articles);
+    setEditEdRetentionDays(ed.retention_days ?? 30);
+    setEditEdStripLinks(ed.strip_links ?? true);
+    setEditEdAiBrief(ed.ai_briefing_enabled);
+    setEditEdEnabled(ed.enabled);
+    setEditEdTargets(ed.target_emails);
+    setEditEdSourceIds(ed.sources.map((s) => s.source_id));
+  };
+
+  const toggleEditionEnabled = async (ed: EditionItem) => {
+    try {
+      await apiRequest(`/api/v1/editions/${ed.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ enabled: !ed.enabled }),
+      });
+      await qc.invalidateQueries({ queryKey: ["editions"] });
+      notify(
+        !ed.enabled
+          ? `已开启《${ed.name}》定时推送`
+          : `已暂停《${ed.name}》定时推送`,
+        "success",
+      );
+    } catch (err) {
+      notify(err instanceof Error ? err.message : "切换失败", "error");
+    }
+  };
+
+  const saveEditedEdition = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editingEdition) return;
+    if (editEdSourceIds.length === 0) {
+      notify("请至少保留 1 个订阅源", "error");
+      return;
+    }
+    setEditEdSaving(true);
+    try {
+      await apiRequest(`/api/v1/editions/${editingEdition.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          name: editEdName.trim(),
+          subtitle: editEdSubtitle.trim(),
+          cron_expr: editEdCron.trim(),
+          cover_style: editEdCoverStyle,
+          lookback_hours: editEdLookback,
+          dedup_window_days: editEdDedupDays,
+          max_articles: editEdMaxArticles,
+          retention_days: editEdRetentionDays,
+          strip_links: editEdStripLinks,
+          ai_briefing_enabled: editEdAiBrief,
+          enabled: editEdEnabled,
+          target_emails: editEdTargets.trim(),
+          sources: editEdSourceIds.map((id, idx) => ({ source_id: id, sort_order: idx })),
+        }),
+      });
+      setEditingEdition(null);
+      await qc.invalidateQueries({ queryKey: ["editions"] });
+      notify("刊物配置已更新", "success");
+    } catch (err) {
+      notify(err instanceof Error ? err.message : "保存失败", "error");
+    } finally {
+      setEditEdSaving(false);
+    }
+  };
+
   const createEdition = async (e: React.FormEvent) => {
     e.preventDefault();
     if (selectedSourceIds.length === 0) {
@@ -149,6 +259,8 @@ export function StudioPage() {
           cover_style: edCoverStyle,
           cron_expr: edCron.trim(),
           lookback_hours: edLookback,
+          retention_days: edRetentionDays,
+          strip_links: edStripLinks,
           ai_briefing_enabled: edAiBrief,
           sources: selectedSourceIds.map((id, idx) => ({ source_id: id, sort_order: idx })),
         }),
@@ -179,9 +291,13 @@ export function StudioPage() {
 
   const deleteEdition = async (ed: EditionItem) => {
     if (!window.confirm(`确认删除刊物《${ed.name}》？`)) return;
-    await apiRequest(`/api/v1/editions/${ed.id}`, { method: "DELETE" });
-    await qc.invalidateQueries({ queryKey: ["editions"] });
-    notify("已删除刊物", "success");
+    try {
+      await apiRequest(`/api/v1/editions/${ed.id}`, { method: "DELETE" });
+      await qc.invalidateQueries({ queryKey: ["editions"] });
+      notify("已删除刊物", "success");
+    } catch (err) {
+      notify(err instanceof Error ? err.message : "删除失败", "error");
+    }
   };
 
   const saveSmtp = async (e: React.FormEvent) => {
@@ -190,17 +306,18 @@ export function StudioPage() {
       await apiRequest("/api/v1/settings/smtp", {
         method: "PUT",
         body: JSON.stringify({
-          host: smtpHost,
+          host: smtpHost.trim(),
           port: smtpPort,
           use_ssl: smtpSsl,
-          username: smtpUser,
+          username: smtpUser.trim(),
           password: smtpPass || undefined,
-          from_email: smtpFrom,
-          default_kindle_email: kindleEmail,
+          from_email: smtpFrom.trim(),
+          default_kindle_email: kindleEmail.trim(),
         }),
       });
       setSmtpPass("");
       await qc.invalidateQueries({ queryKey: ["settings"] });
+      await qc.invalidateQueries({ queryKey: ["health"] });
       notify("SMTP 与 Kindle 邮箱配置已加密保存", "success");
     } catch (err) {
       notify(err instanceof Error ? err.message : "保存失败", "error");
@@ -211,7 +328,7 @@ export function StudioPage() {
     try {
       await apiRequest("/api/v1/settings/smtp/test", {
         method: "POST",
-        body: JSON.stringify({ target_email: smtpFrom || smtpUser }),
+        body: JSON.stringify({ target_email: smtpFrom.trim() || smtpUser.trim() }),
       });
       notify("测试邮件已发送成功，请检查收件箱", "success");
     } catch (err) {
@@ -226,14 +343,15 @@ export function StudioPage() {
         method: "PUT",
         body: JSON.stringify({
           enabled: aiEnabled,
-          base_url: aiBaseUrl,
+          base_url: aiBaseUrl.trim(),
           api_key: aiKey || undefined,
-          model: aiModel,
+          model: aiModel.trim(),
           use_proxy: aiProxy,
         }),
       });
       setAiKey("");
       await qc.invalidateQueries({ queryKey: ["settings"] });
+      await qc.invalidateQueries({ queryKey: ["health"] });
       notify("AI 接口配置已加密保存", "success");
     } catch (err) {
       notify(err instanceof Error ? err.message : "保存失败", "error");
@@ -248,6 +366,56 @@ export function StudioPage() {
       notify(`AI 连通成功 (${res.model})：${res.reply}`, "success");
     } catch (err) {
       notify(err instanceof Error ? err.message : "AI 连通测试失败", "error");
+    }
+  };
+
+  const saveNetwork = async (e: React.FormEvent) => {
+    e.preventDefault();
+    try {
+      await apiRequest("/api/v1/settings/network", {
+        method: "PUT",
+        body: JSON.stringify({
+          outbound_proxy: netProxy.trim(),
+          newsnow_base_url: netNewsnowUrl.trim(),
+          rsshub_base_url: netRsshubUrl.trim(),
+          byparr_base_url: netByparrUrl.trim(),
+        }),
+      });
+      await qc.invalidateQueries({ queryKey: ["settings"] });
+      await qc.invalidateQueries({ queryKey: ["health"] });
+      notify("网络与代理配置已保存", "success");
+    } catch (err) {
+      notify(err instanceof Error ? err.message : "保存网络配置失败", "error");
+    }
+  };
+
+  const handleChangePassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (newPassword.length < 8) {
+      notify("新密码至少需要 8 位字符", "error");
+      return;
+    }
+    if (newPassword !== confirmPassword) {
+      notify("两次输入的新密码不一致", "error");
+      return;
+    }
+    setPasswordSaving(true);
+    try {
+      await apiRequest("/api/v1/auth/change-password", {
+        method: "POST",
+        body: JSON.stringify({
+          current_password: currentPassword,
+          new_password: newPassword,
+        }),
+      });
+      setCurrentPassword("");
+      setNewPassword("");
+      setConfirmPassword("");
+      notify("登录密码已更新", "success");
+    } catch (err) {
+      notify(err instanceof Error ? err.message : "修改密码失败", "error");
+    } finally {
+      setPasswordSaving(false);
     }
   };
 
@@ -266,10 +434,61 @@ export function StudioPage() {
     }
   };
 
+  const handleCopyToken = async (token: string) => {
+    const ok = await copyToClipboard(token);
+    if (ok) {
+      notify("已复制 Token", "success");
+    } else {
+      notify("自动复制受限，请手动选中上方令牌复制", "error");
+    }
+  };
+
   const editions = editionsQuery.data?.items ?? [];
   const sources = sourcesQuery.data?.items ?? [];
   const deliveries = deliveriesQuery.data?.items ?? [];
   const summary = deliveriesQuery.data?.summary;
+  const health = healthQuery.data;
+
+  const healthCards: { label: string; sub?: string; ok: boolean }[] = health
+    ? [
+        {
+          label: `PostgreSQL (${health.database.dialect ?? "-"})`,
+          ok: health.database.ok,
+        },
+        { label: "Redis 队列/SSE", ok: health.redis.ok },
+        {
+          label: "Worker 后台进程",
+          sub: health.worker
+            ? `队列 ${health.worker.queue_depth} · ${health.worker.last_seen ? formatRelativeTime(health.worker.last_seen) : "无心跳"}`
+            : undefined,
+          ok: health.worker ? health.worker.ok : false,
+        },
+        {
+          label: "Calibre 转码引擎",
+          sub: health.tools.calibre_ebook_convert ? "ebook-convert 就绪" : "不可用",
+          ok: health.tools.calibre_ebook_convert,
+        },
+        {
+          label: "Pandoc 排版引擎",
+          sub: health.tools.pandoc ? "DOCX/MD 就绪" : "不可用",
+          ok: health.tools.pandoc,
+        },
+        {
+          label: "存储空间余量",
+          sub:
+            typeof health.storage?.free_gb === "number"
+              ? `${health.storage.free_gb.toFixed(1)} GB 可用`
+              : "未上报",
+          ok: typeof health.storage?.free_gb === "number" ? health.storage.free_gb >= 2 : false,
+        },
+        { label: "NewsNow Sidecar", ok: health.newsnow.ok },
+        { label: "RSSHub 内网", ok: health.rsshub.ok },
+        { label: "Byparr 反爬浏览器", ok: health.byparr.ok },
+        { label: "SMTP 发件凭据", ok: health.smtp_configured },
+        { label: "Kindle 收件邮箱", ok: health.kindle_email_configured },
+        { label: `AI (${health.ai_model ?? "未启用"})`, ok: health.ai_enabled },
+      ]
+    : [];
 
   return (
     <div className="max-w-5xl mx-auto pb-16">
@@ -293,7 +512,7 @@ export function StudioPage() {
           {[
             { id: "editions" as const, label: `定时刊物 (${editions.length})`, icon: Calendar },
             { id: "deliveries" as const, label: "投递遥测与日志", icon: Activity },
-            { id: "settings" as const, label: "SMTP / AI / MCP 运维设置", icon: Settings2 },
+            { id: "settings" as const, label: "SMTP / AI / 网络 / 安全设置", icon: Settings2 },
           ].map((item) => {
             const Icon = item.icon;
             const active = tab === item.id;
@@ -332,18 +551,34 @@ export function StudioPage() {
               >
                 <div>
                   <div className="flex items-start justify-between gap-2">
-                    <div>
-                      <h3 className="font-editorial text-2xl font-semibold">{ed.name}</h3>
+                    <div className="min-w-0">
+                      <h3 className="font-editorial text-2xl font-semibold truncate">{ed.name}</h3>
                       <p className="text-xs mt-0.5" style={{ color: "var(--fg-secondary)" }}>
                         {ed.subtitle} · 第 {ed.issue_counter} 期
                       </p>
                     </div>
-                    <span
-                      className="text-[11px] font-mono px-2.5 py-1 rounded-full"
-                      style={{ backgroundColor: "var(--bg-subtle)", color: "var(--fg-secondary)" }}
-                    >
-                      {ed.cron_expr}
-                    </span>
+                    <div className="flex flex-col items-end gap-1.5 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => toggleEditionEnabled(ed)}
+                        className="inline-flex items-center gap-1 text-[11px] font-medium px-2.5 py-1 rounded-full border cursor-pointer"
+                        style={{
+                          backgroundColor: ed.enabled ? "var(--accent-soft)" : "var(--bg-subtle)",
+                          color: ed.enabled ? "var(--accent)" : "var(--fg-muted)",
+                          borderColor: ed.enabled ? "var(--accent)" : "var(--border-hairline)",
+                        }}
+                        title={ed.enabled ? "点击暂停定时推送" : "点击开启定时推送"}
+                      >
+                        <Power className="w-3 h-3" />
+                        <span>{ed.enabled ? "定时已开启" : "定时已暂停"}</span>
+                      </button>
+                      <span
+                        className="text-[11px] font-mono px-2 py-0.5 rounded-full"
+                        style={{ backgroundColor: "var(--bg-subtle)", color: "var(--fg-secondary)" }}
+                      >
+                        {ed.cron_expr}
+                      </span>
+                    </div>
                   </div>
 
                   <div className="flex flex-wrap gap-1.5 mt-3">
@@ -363,10 +598,15 @@ export function StudioPage() {
 
                   <div className="text-xs mt-3 space-y-0.5" style={{ color: "var(--fg-muted)" }}>
                     <div>
-                      窗口：{ed.lookback_hours}h · 去重：{ed.dedup_window_days}天 · 单卷上限：
-                      {ed.max_mb_per_volume}MB · {ed.ai_briefing_enabled ? "含 AI 头版综述" : "无 AI 综述"}
+                      窗口：{ed.lookback_hours}h · 去重：{ed.dedup_window_days}天 · 上限：
+                      {ed.max_articles}篇 / {ed.max_mb_per_volume}MB · 留存：
+                      {ed.retention_days ?? 30}天
                     </div>
-                    {ed.next_run_at && (
+                    <div>
+                      {ed.ai_briefing_enabled ? "含 AI 头版综述" : "无 AI 综述"} ·{" "}
+                      {ed.strip_links !== false ? "剥离正文超链接（防误触）" : "保留正文超链接"}
+                    </div>
+                    {ed.enabled && ed.next_run_at && (
                       <div>下次发行：{new Date(ed.next_run_at).toLocaleString("zh-CN")}</div>
                     )}
                   </div>
@@ -395,14 +635,29 @@ export function StudioPage() {
                       仅生成 EPUB
                     </button>
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => deleteEdition(ed)}
-                    className="p-1.5 rounded-lg cursor-pointer"
-                    style={{ color: "var(--fg-muted)" }}
-                  >
-                    <Trash2 className="w-4 h-4" />
-                  </button>
+                  <div className="flex items-center gap-1">
+                    <button
+                      type="button"
+                      onClick={() => openEditEdition(ed)}
+                      className="p-1.5 rounded-lg border cursor-pointer"
+                      style={{
+                        borderColor: "var(--border-hairline)",
+                        color: "var(--fg-secondary)",
+                      }}
+                      title="编辑刊物"
+                    >
+                      <Pencil className="w-3.5 h-3.5" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => deleteEdition(ed)}
+                      className="p-1.5 rounded-lg cursor-pointer"
+                      style={{ color: "var(--fg-muted)" }}
+                      title="删除刊物"
+                    >
+                      <Trash2 className="w-4 h-4" />
+                    </button>
+                  </div>
                 </div>
               </div>
             ))}
@@ -449,7 +704,7 @@ export function StudioPage() {
                 <span>封面风格：</span>
                 <select
                   value={edCoverStyle}
-                  onChange={(e) => setEdCoverStyle(e.target.value as "editorial" | "dark" | "minimal")}
+                  onChange={(e) => setEdCoverStyle(e.target.value as CoverStyle)}
                   className="rounded border px-2 py-1"
                   style={{ backgroundColor: "var(--bg-canvas)", borderColor: "var(--border-hairline)" }}
                 >
@@ -469,6 +724,26 @@ export function StudioPage() {
                   className="w-16 rounded border px-2 py-1"
                   style={{ backgroundColor: "var(--bg-canvas)", borderColor: "var(--border-hairline)" }}
                 />
+              </label>
+              <label className="flex items-center gap-1.5">
+                <span>留存(天)：</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={365}
+                  value={edRetentionDays}
+                  onChange={(e) => setEdRetentionDays(Number(e.target.value))}
+                  className="w-16 rounded border px-2 py-1"
+                  style={{ backgroundColor: "var(--bg-canvas)", borderColor: "var(--border-hairline)" }}
+                />
+              </label>
+              <label className="flex items-center gap-1.5 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={edStripLinks}
+                  onChange={(e) => setEdStripLinks(e.target.checked)}
+                />
+                <span>剥离正文超链接（防 Kindle 误触）</span>
               </label>
               <label className="flex items-center gap-1.5 cursor-pointer">
                 <input
@@ -555,22 +830,26 @@ export function StudioPage() {
                 className="rounded-xl border p-4 flex flex-wrap items-center justify-between gap-3"
                 style={{ backgroundColor: "var(--bg-surface)", borderColor: "var(--border-hairline)" }}
               >
-                <div>
-                  <div className="flex items-center gap-2">
+                <div className="min-w-0 flex-1">
+                  <div className="flex flex-wrap items-center gap-2">
                     <span className="font-medium text-sm">{d.title}</span>
                     <span
-                      className="text-[11px] px-2 py-0.5 rounded-full font-medium"
+                      className="text-[11px] px-2 py-0.5 rounded-full font-medium border"
                       style={{
                         backgroundColor:
                           d.status === "sent"
                             ? "var(--fg-primary)"
                             : d.status === "failed"
-                              ? "#991b1b"
+                              ? "var(--bg-danger-soft)"
                               : "var(--bg-subtle)",
                         color:
-                          d.status === "sent" || d.status === "failed"
-                            ? "#ffffff"
-                            : "var(--fg-secondary)",
+                          d.status === "sent"
+                            ? "var(--bg-canvas)"
+                            : d.status === "failed"
+                              ? "var(--fg-danger)"
+                              : "var(--fg-secondary)",
+                        borderColor:
+                          d.status === "failed" ? "var(--border-danger)" : "transparent",
                       }}
                     >
                       {d.status}
@@ -584,7 +863,9 @@ export function StudioPage() {
                     {formatBytes(d.file_size_bytes)} · 耗时 {(d.duration_ms / 1000).toFixed(1)}s
                   </div>
                   {d.error_message && (
-                    <div className="text-xs text-red-700 mt-1">{d.error_message}</div>
+                    <div className="text-xs mt-1" style={{ color: "var(--fg-danger)" }}>
+                      {d.error_message}
+                    </div>
                   )}
                 </div>
 
@@ -592,8 +873,12 @@ export function StudioPage() {
                   <button
                     type="button"
                     onClick={async () => {
-                      await apiRequest(`/api/v1/deliveries/${d.id}/retry`, { method: "POST" });
-                      notify("已重新加入投递队列", "success");
+                      try {
+                        await apiRequest(`/api/v1/deliveries/${d.id}/retry`, { method: "POST" });
+                        notify("已重新加入投递队列", "success");
+                      } catch (err) {
+                        notify(err instanceof Error ? err.message : "重试失败", "error");
+                      }
                     }}
                     className="inline-flex items-center gap-1 text-xs px-3 py-1.5 rounded-lg border cursor-pointer"
                     style={{ borderColor: "var(--border-hairline)" }}
@@ -611,37 +896,49 @@ export function StudioPage() {
       {tab === "settings" && (
         <div className="space-y-6">
           {/* Deep infrastructure health */}
-          {healthQuery.data && (
+          {health && (
             <div
               className="rounded-2xl border p-5"
               style={{ backgroundColor: "var(--bg-surface)", borderColor: "var(--border-hairline)" }}
             >
-              <h2 className="font-editorial text-xl font-semibold mb-3">基础设施与 AI-Ops 健康状态</h2>
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
-                {[
-                  { label: `PostgreSQL (${healthQuery.data.database.dialect ?? "-"})`, ok: healthQuery.data.database.ok },
-                  { label: "Redis 队列/SSE", ok: healthQuery.data.redis.ok },
-                  { label: "NewsNow Sidecar", ok: healthQuery.data.newsnow.ok },
-                  { label: "RSSHub 内网", ok: healthQuery.data.rsshub.ok },
-                  { label: "Byparr 反爬浏览器", ok: healthQuery.data.byparr.ok },
-                  { label: "SMTP 发件凭据", ok: healthQuery.data.smtp_configured },
-                  { label: "Kindle 收件邮箱", ok: healthQuery.data.kindle_email_configured },
-                  { label: `AI (${healthQuery.data.ai_model ?? "未启用"})`, ok: healthQuery.data.ai_enabled },
-                ].map((item) => (
+              <div className="flex items-center justify-between gap-2 mb-3">
+                <h2 className="font-editorial text-xl font-semibold">基础设施与 AI-Ops 健康状态</h2>
+                <button
+                  type="button"
+                  onClick={() => healthQuery.refetch()}
+                  className="inline-flex items-center gap-1 text-xs px-2.5 py-1 rounded-lg border cursor-pointer"
+                  style={{ borderColor: "var(--border-hairline)", color: "var(--fg-secondary)" }}
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${healthQuery.isFetching ? "animate-spin" : ""}`} />
+                  <span>刷新探针</span>
+                </button>
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 text-xs">
+                {healthCards.map((item) => (
                   <div
                     key={item.label}
-                    className="rounded-lg border px-3 py-2 flex items-center gap-2"
+                    className="rounded-lg border px-3 py-2.5 flex items-start gap-2"
                     style={{
                       backgroundColor: "var(--bg-canvas)",
                       borderColor: "var(--border-hairline)",
                     }}
                   >
                     {item.ok ? (
-                      <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                      <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
                     ) : (
-                      <XCircle className="w-4 h-4 text-amber-600 shrink-0" />
+                      <XCircle
+                        className="w-4 h-4 shrink-0 mt-0.5"
+                        style={{ color: "var(--fg-danger)" }}
+                      />
                     )}
-                    <span className="truncate">{item.label}</span>
+                    <div className="min-w-0">
+                      <div className="truncate font-medium">{item.label}</div>
+                      {item.sub && (
+                        <div className="text-[11px] truncate mt-0.5" style={{ color: "var(--fg-muted)" }}>
+                          {item.sub}
+                        </div>
+                      )}
+                    </div>
                   </div>
                 ))}
               </div>
@@ -659,58 +956,98 @@ export function StudioPage() {
               <h2 className="font-editorial text-xl font-semibold">SMTP 发件与 Kindle 邮箱</h2>
             </div>
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-sm">
-              <input
-                type="text"
-                value={smtpHost}
-                onChange={(e) => setSmtpHost(e.target.value)}
-                placeholder="smtp.gmail.com"
-                className="rounded-lg border px-3 py-2"
-                style={{ backgroundColor: "var(--bg-canvas)", borderColor: "var(--border-hairline)" }}
-              />
-              <input
-                type="number"
-                value={smtpPort}
-                onChange={(e) => setSmtpPort(Number(e.target.value))}
-                placeholder="465"
-                className="rounded-lg border px-3 py-2"
-                style={{ backgroundColor: "var(--bg-canvas)", borderColor: "var(--border-hairline)" }}
-              />
-              <label className="flex items-center gap-2 text-xs px-2">
+              <div>
+                <label className="block text-xs mb-1" style={{ color: "var(--fg-secondary)" }}>
+                  SMTP 服务器
+                </label>
                 <input
-                  type="checkbox"
-                  checked={smtpSsl}
-                  onChange={(e) => setSmtpSsl(e.target.checked)}
+                  type="text"
+                  value={smtpHost}
+                  onChange={(e) => setSmtpHost(e.target.value)}
+                  placeholder="smtp.gmail.com"
+                  className="w-full rounded-lg border px-3 py-2"
+                  style={{ backgroundColor: "var(--bg-canvas)", borderColor: "var(--border-hairline)" }}
                 />
-                <span>使用 SSL/TLS（465 端口勾选）</span>
-              </label>
-              <input
-                type="email"
-                value={smtpUser}
-                onChange={(e) => setSmtpUser(e.target.value)}
-                placeholder="发件账号（如 Gmail）"
-                className="rounded-lg border px-3 py-2"
-                style={{ backgroundColor: "var(--bg-canvas)", borderColor: "var(--border-hairline)" }}
-              />
-              <input
-                type="password"
-                value={smtpPass}
-                onChange={(e) => setSmtpPass(e.target.value)}
-                placeholder={
-                  settingsQuery.data?.smtp.password_set
-                    ? "已设置（留空保持不变）"
-                    : "应用专用密码 / SMTP 授权码"
-                }
-                className="rounded-lg border px-3 py-2"
-                style={{ backgroundColor: "var(--bg-canvas)", borderColor: "var(--border-hairline)" }}
-              />
-              <input
-                type="email"
-                value={kindleEmail}
-                onChange={(e) => setKindleEmail(e.target.value)}
-                placeholder="默认 Kindle 邮箱（xxx@kindle.com）"
-                className="rounded-lg border px-3 py-2"
-                style={{ backgroundColor: "var(--bg-canvas)", borderColor: "var(--border-hairline)" }}
-              />
+              </div>
+              <div>
+                <label className="block text-xs mb-1" style={{ color: "var(--fg-secondary)" }}>
+                  端口
+                </label>
+                <input
+                  type="number"
+                  value={smtpPort}
+                  onChange={(e) => setSmtpPort(Number(e.target.value))}
+                  placeholder="465"
+                  className="w-full rounded-lg border px-3 py-2"
+                  style={{ backgroundColor: "var(--bg-canvas)", borderColor: "var(--border-hairline)" }}
+                />
+              </div>
+              <div className="flex items-end pb-2">
+                <label className="flex items-center gap-2 text-xs cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={smtpSsl}
+                    onChange={(e) => setSmtpSsl(e.target.checked)}
+                  />
+                  <span>使用 SSL/TLS（465 端口勾选）</span>
+                </label>
+              </div>
+              <div>
+                <label className="block text-xs mb-1" style={{ color: "var(--fg-secondary)" }}>
+                  SMTP 认证账号
+                </label>
+                <input
+                  type="text"
+                  value={smtpUser}
+                  onChange={(e) => setSmtpUser(e.target.value)}
+                  placeholder="发件认证用户名或邮箱"
+                  className="w-full rounded-lg border px-3 py-2"
+                  style={{ backgroundColor: "var(--bg-canvas)", borderColor: "var(--border-hairline)" }}
+                />
+              </div>
+              <div>
+                <label className="block text-xs mb-1" style={{ color: "var(--fg-secondary)" }}>
+                  SMTP 密码 / 授权码
+                </label>
+                <input
+                  type="password"
+                  value={smtpPass}
+                  onChange={(e) => setSmtpPass(e.target.value)}
+                  placeholder={
+                    settingsQuery.data?.smtp.password_set
+                      ? "已设置（留空保持不变）"
+                      : "应用专用密码 / SMTP 授权码"
+                  }
+                  className="w-full rounded-lg border px-3 py-2"
+                  style={{ backgroundColor: "var(--bg-canvas)", borderColor: "var(--border-hairline)" }}
+                />
+              </div>
+              <div>
+                <label className="block text-xs mb-1" style={{ color: "var(--fg-secondary)" }}>
+                  发件人邮箱（From）
+                </label>
+                <input
+                  type="text"
+                  value={smtpFrom}
+                  onChange={(e) => setSmtpFrom(e.target.value)}
+                  placeholder="sender@example.com（留空默认同账号）"
+                  className="w-full rounded-lg border px-3 py-2"
+                  style={{ backgroundColor: "var(--bg-canvas)", borderColor: "var(--border-hairline)" }}
+                />
+              </div>
+              <div className="sm:col-span-3">
+                <label className="block text-xs mb-1" style={{ color: "var(--fg-secondary)" }}>
+                  默认 Kindle 收件邮箱（支持英文逗号分隔多台 Kindle 设备）
+                </label>
+                <input
+                  type="text"
+                  value={kindleEmail}
+                  onChange={(e) => setKindleEmail(e.target.value)}
+                  placeholder="your_device@kindle.com, second_device@kindle.com"
+                  className="w-full rounded-lg border px-3 py-2"
+                  style={{ backgroundColor: "var(--bg-canvas)", borderColor: "var(--border-hairline)" }}
+                />
+              </div>
             </div>
             <div className="flex items-center gap-2">
               <button
@@ -737,7 +1074,7 @@ export function StudioPage() {
             className="rounded-2xl border p-6 space-y-4"
             style={{ backgroundColor: "var(--bg-surface)", borderColor: "var(--border-hairline)" }}
           >
-            <div className="flex items-center justify-between">
+            <div className="flex flex-wrap items-center justify-between gap-2">
               <div className="flex items-center gap-2">
                 <Bot className="w-5 h-5" style={{ color: "var(--accent)" }} />
                 <h2 className="font-editorial text-xl font-semibold">
@@ -808,6 +1145,149 @@ export function StudioPage() {
             </div>
           </form>
 
+          {/* Network & Proxy Settings */}
+          <form
+            onSubmit={saveNetwork}
+            className="rounded-2xl border p-6 space-y-4"
+            style={{ backgroundColor: "var(--bg-surface)", borderColor: "var(--border-hairline)" }}
+          >
+            <div className="flex items-center gap-2">
+              <Globe className="w-5 h-5" style={{ color: "var(--accent)" }} />
+              <h2 className="font-editorial text-xl font-semibold">网络与代理设置</h2>
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm">
+              <div>
+                <label className="block text-xs mb-1" style={{ color: "var(--fg-secondary)" }}>
+                  外网代理地址（Outbound Proxy）
+                </label>
+                <input
+                  type="text"
+                  value={netProxy}
+                  onChange={(e) => setNetProxy(e.target.value)}
+                  placeholder="http://127.0.0.1:7890"
+                  className="w-full rounded-lg border px-3 py-2 font-mono text-xs"
+                  style={{ backgroundColor: "var(--bg-canvas)", borderColor: "var(--border-hairline)" }}
+                />
+              </div>
+              <div>
+                <label className="block text-xs mb-1" style={{ color: "var(--fg-secondary)" }}>
+                  NewsNow Sidecar 地址
+                </label>
+                <input
+                  type="text"
+                  value={netNewsnowUrl}
+                  onChange={(e) => setNetNewsnowUrl(e.target.value)}
+                  placeholder="http://newsnow:4444"
+                  className="w-full rounded-lg border px-3 py-2 font-mono text-xs"
+                  style={{ backgroundColor: "var(--bg-canvas)", borderColor: "var(--border-hairline)" }}
+                />
+              </div>
+              <div>
+                <label className="block text-xs mb-1" style={{ color: "var(--fg-secondary)" }}>
+                  RSSHub 内网地址
+                </label>
+                <input
+                  type="text"
+                  value={netRsshubUrl}
+                  onChange={(e) => setNetRsshubUrl(e.target.value)}
+                  placeholder="http://rsshub:1200"
+                  className="w-full rounded-lg border px-3 py-2 font-mono text-xs"
+                  style={{ backgroundColor: "var(--bg-canvas)", borderColor: "var(--border-hairline)" }}
+                />
+              </div>
+              <div>
+                <label className="block text-xs mb-1" style={{ color: "var(--fg-secondary)" }}>
+                  Byparr 反爬浏览器地址
+                </label>
+                <input
+                  type="text"
+                  value={netByparrUrl}
+                  onChange={(e) => setNetByparrUrl(e.target.value)}
+                  placeholder="http://byparr:8191"
+                  className="w-full rounded-lg border px-3 py-2 font-mono text-xs"
+                  style={{ backgroundColor: "var(--bg-canvas)", borderColor: "var(--border-hairline)" }}
+                />
+              </div>
+            </div>
+            <div>
+              <button
+                type="submit"
+                className="px-4 py-2 rounded-lg text-xs font-medium cursor-pointer"
+                style={{ backgroundColor: "var(--accent)", color: "var(--accent-fg)" }}
+              >
+                保存网络设置
+              </button>
+            </div>
+          </form>
+
+          {/* Change Login Password */}
+          <form
+            onSubmit={handleChangePassword}
+            className="rounded-2xl border p-6 space-y-4"
+            style={{ backgroundColor: "var(--bg-surface)", borderColor: "var(--border-hairline)" }}
+          >
+            <div className="flex items-center gap-2">
+              <Lock className="w-5 h-5" style={{ color: "var(--accent)" }} />
+              <h2 className="font-editorial text-xl font-semibold">修改登录密码</h2>
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-sm">
+              <div>
+                <label className="block text-xs mb-1" style={{ color: "var(--fg-secondary)" }}>
+                  当前密码
+                </label>
+                <input
+                  type="password"
+                  required
+                  value={currentPassword}
+                  onChange={(e) => setCurrentPassword(e.target.value)}
+                  placeholder="输入当前密码"
+                  className="w-full rounded-lg border px-3 py-2"
+                  style={{ backgroundColor: "var(--bg-canvas)", borderColor: "var(--border-hairline)" }}
+                />
+              </div>
+              <div>
+                <label className="block text-xs mb-1" style={{ color: "var(--fg-secondary)" }}>
+                  新密码（至少 8 位）
+                </label>
+                <input
+                  type="password"
+                  required
+                  minLength={8}
+                  value={newPassword}
+                  onChange={(e) => setNewPassword(e.target.value)}
+                  placeholder="至少 8 位字符"
+                  className="w-full rounded-lg border px-3 py-2"
+                  style={{ backgroundColor: "var(--bg-canvas)", borderColor: "var(--border-hairline)" }}
+                />
+              </div>
+              <div>
+                <label className="block text-xs mb-1" style={{ color: "var(--fg-secondary)" }}>
+                  确认新密码
+                </label>
+                <input
+                  type="password"
+                  required
+                  minLength={8}
+                  value={confirmPassword}
+                  onChange={(e) => setConfirmPassword(e.target.value)}
+                  placeholder="再次输入新密码"
+                  className="w-full rounded-lg border px-3 py-2"
+                  style={{ backgroundColor: "var(--bg-canvas)", borderColor: "var(--border-hairline)" }}
+                />
+              </div>
+            </div>
+            <div>
+              <button
+                type="submit"
+                disabled={passwordSaving}
+                className="px-4 py-2 rounded-lg text-xs font-medium cursor-pointer disabled:opacity-50"
+                style={{ backgroundColor: "var(--fg-primary)", color: "var(--bg-canvas)" }}
+              >
+                {passwordSaving ? "提交中…" : "更新登录密码"}
+              </button>
+            </div>
+          </form>
+
           {/* MCP Server AI-Ops Tokens */}
           <div
             className="rounded-2xl border p-6 space-y-4"
@@ -818,7 +1298,8 @@ export function StudioPage() {
               <h2 className="font-editorial text-xl font-semibold">原生 MCP Server（AI 运维入口）</h2>
             </div>
             <p className="text-xs" style={{ color: "var(--fg-secondary)" }}>
-              端点：<code className="px-1.5 py-0.5 rounded" style={{ backgroundColor: "var(--bg-subtle)" }}>
+              端点：
+              <code className="px-1.5 py-0.5 rounded" style={{ backgroundColor: "var(--bg-subtle)" }}>
                 POST {window.location.origin}/api/v1/mcp
               </code>
               （Streamable HTTP JSON-RPC 2.0，Bearer Token 鉴权）
@@ -861,12 +1342,10 @@ export function StudioPage() {
                   <span>{createdToken}</span>
                   <button
                     type="button"
-                    onClick={() => {
-                      navigator.clipboard.writeText(createdToken);
-                      notify("已复制 Token", "success");
-                    }}
+                    onClick={() => handleCopyToken(createdToken)}
                     className="p-1.5 rounded border cursor-pointer shrink-0"
                     style={{ borderColor: "var(--border-hairline)" }}
+                    title="复制 Token"
                   >
                     <Copy className="w-3.5 h-3.5" />
                   </button>
@@ -886,18 +1365,26 @@ export function StudioPage() {
                     <span className="font-mono" style={{ color: "var(--fg-muted)" }}>
                       {t.token_prefix}…
                     </span>
-                    <span className="ml-2 px-1.5 py-0.5 rounded" style={{ backgroundColor: "var(--bg-subtle)" }}>
+                    <span
+                      className="ml-2 px-1.5 py-0.5 rounded"
+                      style={{ backgroundColor: "var(--bg-subtle)" }}
+                    >
                       {t.readonly ? "只读" : "读写"}
                     </span>
                   </div>
                   <button
                     type="button"
                     onClick={async () => {
-                      await apiRequest(`/api/v1/settings/mcp-tokens/${t.id}`, { method: "DELETE" });
-                      await qc.invalidateQueries({ queryKey: ["mcp-tokens"] });
-                      notify("已吊销令牌", "success");
+                      try {
+                        await apiRequest(`/api/v1/settings/mcp-tokens/${t.id}`, { method: "DELETE" });
+                        await qc.invalidateQueries({ queryKey: ["mcp-tokens"] });
+                        notify("已吊销令牌", "success");
+                      } catch (err) {
+                        notify(err instanceof Error ? err.message : "吊销失败", "error");
+                      }
                     }}
-                    className="text-red-700 cursor-pointer"
+                    className="cursor-pointer font-medium hover:underline"
+                    style={{ color: "var(--fg-danger)" }}
                   >
                     吊销
                   </button>
@@ -905,6 +1392,275 @@ export function StudioPage() {
               ))}
             </div>
           </div>
+        </div>
+      )}
+
+      {/* Edit Edition Modal */}
+      {editingEdition && (
+        <div className="fixed inset-0 z-40 bg-black/40 flex items-center justify-center p-4">
+          <form
+            onSubmit={saveEditedEdition}
+            className="max-w-2xl w-full max-h-[88vh] flex flex-col rounded-2xl border overflow-hidden"
+            style={{ backgroundColor: "var(--bg-surface)", borderColor: "var(--border-hairline)" }}
+          >
+            <div
+              className="px-6 py-4 border-b flex items-center justify-between"
+              style={{ borderColor: "var(--border-hairline)" }}
+            >
+              <h3 className="font-editorial text-xl font-semibold">
+                编辑刊物 · {editingEdition.name}
+              </h3>
+              <button
+                type="button"
+                onClick={() => setEditingEdition(null)}
+                className="p-1 cursor-pointer"
+                style={{ color: "var(--fg-muted)" }}
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="p-6 overflow-y-auto space-y-4 text-xs">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block mb-1" style={{ color: "var(--fg-secondary)" }}>
+                    刊物名称
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    value={editEdName}
+                    onChange={(e) => setEditEdName(e.target.value)}
+                    className="w-full rounded-lg border px-3 py-2 text-sm"
+                    style={{
+                      backgroundColor: "var(--bg-canvas)",
+                      borderColor: "var(--border-hairline)",
+                    }}
+                  />
+                </div>
+                <div>
+                  <label className="block mb-1" style={{ color: "var(--fg-secondary)" }}>
+                    副标题
+                  </label>
+                  <input
+                    type="text"
+                    value={editEdSubtitle}
+                    onChange={(e) => setEditEdSubtitle(e.target.value)}
+                    className="w-full rounded-lg border px-3 py-2 text-sm"
+                    style={{
+                      backgroundColor: "var(--bg-canvas)",
+                      borderColor: "var(--border-hairline)",
+                    }}
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                <div>
+                  <label className="block mb-1" style={{ color: "var(--fg-secondary)" }}>
+                    Cron 定时表达式
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    value={editEdCron}
+                    onChange={(e) => setEditEdCron(e.target.value)}
+                    className="w-full rounded-lg border px-3 py-2 font-mono text-sm"
+                    style={{
+                      backgroundColor: "var(--bg-canvas)",
+                      borderColor: "var(--border-hairline)",
+                    }}
+                  />
+                </div>
+                <div>
+                  <label className="block mb-1" style={{ color: "var(--fg-secondary)" }}>
+                    封面风格
+                  </label>
+                  <select
+                    value={editEdCoverStyle}
+                    onChange={(e) => setEditEdCoverStyle(e.target.value as CoverStyle)}
+                    className="w-full rounded-lg border px-2.5 py-2 text-sm"
+                    style={{
+                      backgroundColor: "var(--bg-canvas)",
+                      borderColor: "var(--border-hairline)",
+                    }}
+                  >
+                    <option value="editorial">纸墨经典</option>
+                    <option value="dark">暗夜黑金</option>
+                    <option value="minimal">极简白底</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block mb-1" style={{ color: "var(--fg-secondary)" }}>
+                    抓取窗口（小时）
+                  </label>
+                  <input
+                    type="number"
+                    min={1}
+                    max={168}
+                    value={editEdLookback}
+                    onChange={(e) => setEditEdLookback(Number(e.target.value))}
+                    className="w-full rounded-lg border px-3 py-2 text-sm"
+                    style={{
+                      backgroundColor: "var(--bg-canvas)",
+                      borderColor: "var(--border-hairline)",
+                    }}
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                <div>
+                  <label className="block mb-1" style={{ color: "var(--fg-secondary)" }}>
+                    去重窗口（天）
+                  </label>
+                  <input
+                    type="number"
+                    min={1}
+                    max={90}
+                    value={editEdDedupDays}
+                    onChange={(e) => setEditEdDedupDays(Number(e.target.value))}
+                    className="w-full rounded-lg border px-3 py-2 text-sm"
+                    style={{
+                      backgroundColor: "var(--bg-canvas)",
+                      borderColor: "var(--border-hairline)",
+                    }}
+                  />
+                </div>
+                <div>
+                  <label className="block mb-1" style={{ color: "var(--fg-secondary)" }}>
+                    单期最大篇数
+                  </label>
+                  <input
+                    type="number"
+                    min={1}
+                    max={120}
+                    value={editEdMaxArticles}
+                    onChange={(e) => setEditEdMaxArticles(Number(e.target.value))}
+                    className="w-full rounded-lg border px-3 py-2 text-sm"
+                    style={{
+                      backgroundColor: "var(--bg-canvas)",
+                      borderColor: "var(--border-hairline)",
+                    }}
+                  />
+                </div>
+                <div>
+                  <label className="block mb-1" style={{ color: "var(--fg-secondary)" }}>
+                    归档留存（天）
+                  </label>
+                  <input
+                    type="number"
+                    min={1}
+                    max={365}
+                    value={editEdRetentionDays}
+                    onChange={(e) => setEditEdRetentionDays(Number(e.target.value))}
+                    className="w-full rounded-lg border px-3 py-2 text-sm"
+                    style={{
+                      backgroundColor: "var(--bg-canvas)",
+                      borderColor: "var(--border-hairline)",
+                    }}
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="block mb-1" style={{ color: "var(--fg-secondary)" }}>
+                  专属收件邮箱（留空则使用默认 Kindle 邮箱，多设备用逗号分隔）
+                </label>
+                <input
+                  type="text"
+                  value={editEdTargets}
+                  onChange={(e) => setEditEdTargets(e.target.value)}
+                  placeholder="your_device@kindle.com"
+                  className="w-full rounded-lg border px-3 py-2 text-sm"
+                  style={{
+                    backgroundColor: "var(--bg-canvas)",
+                    borderColor: "var(--border-hairline)",
+                  }}
+                />
+              </div>
+
+              <div className="flex flex-wrap gap-4 pt-1">
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={editEdEnabled}
+                    onChange={(e) => setEditEdEnabled(e.target.checked)}
+                  />
+                  <span>启用定时自动推送</span>
+                </label>
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={editEdStripLinks}
+                    onChange={(e) => setEditEdStripLinks(e.target.checked)}
+                  />
+                  <span>剥离正文超链接（防 Kindle 误触）</span>
+                </label>
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={editEdAiBrief}
+                    onChange={(e) => setEditEdAiBrief(e.target.checked)}
+                  />
+                  <span>生成 AI 今日头版综述</span>
+                </label>
+              </div>
+
+              <div>
+                <div className="font-medium mb-2" style={{ color: "var(--fg-secondary)" }}>
+                  绑定订阅源（已选 {editEdSourceIds.length} 个）：
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  {sources.map((src) => {
+                    const checked = editEdSourceIds.includes(src.id);
+                    return (
+                      <button
+                        key={src.id}
+                        type="button"
+                        onClick={() =>
+                          setEditEdSourceIds((prev) =>
+                            checked ? prev.filter((id) => id !== src.id) : [...prev, src.id],
+                          )
+                        }
+                        className="text-xs px-3 py-1.5 rounded-full border cursor-pointer"
+                        style={{
+                          backgroundColor: checked ? "var(--accent)" : "var(--bg-canvas)",
+                          color: checked ? "var(--accent-fg)" : "var(--fg-secondary)",
+                          borderColor: "var(--border-hairline)",
+                        }}
+                      >
+                        {checked ? "✓ " : "+ "}
+                        {src.name}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+
+            <div
+              className="px-6 py-4 border-t flex justify-end gap-2"
+              style={{ borderColor: "var(--border-hairline)" }}
+            >
+              <button
+                type="button"
+                onClick={() => setEditingEdition(null)}
+                className="px-4 py-2 rounded-lg text-xs border cursor-pointer"
+                style={{ borderColor: "var(--border-hairline)" }}
+              >
+                取消
+              </button>
+              <button
+                type="submit"
+                disabled={editEdSaving}
+                className="px-4 py-2 rounded-lg text-xs font-medium cursor-pointer disabled:opacity-50"
+                style={{ backgroundColor: "var(--accent)", color: "var(--accent-fg)" }}
+              >
+                {editEdSaving ? "保存中…" : "保存刊物配置"}
+              </button>
+            </div>
+          </form>
         </div>
       )}
     </div>

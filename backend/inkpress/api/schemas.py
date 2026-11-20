@@ -18,6 +18,11 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class ChangePasswordRequest(BaseModel):
+    current_password: str = Field(min_length=1, max_length=128)
+    new_password: str = Field(min_length=8, max_length=128)
+
+
 class PreferencesUpdate(BaseModel):
     display_name: str | None = None
     kindle_email: str | None = None
@@ -26,7 +31,7 @@ class PreferencesUpdate(BaseModel):
 
 class SourceCreate(BaseModel):
     name: str = Field(min_length=1, max_length=160)
-    kind: str = Field(pattern="^(newsnow|rss|rsshub|webpage)$")
+    kind: str = Field(pattern="^(newsnow|rss|rsshub|webpage|webpage_list)$")
     identifier: str = Field(min_length=1, max_length=1024)
     category: str = Field(default="综合", max_length=64)
     fetch_strategy: str = Field(
@@ -41,6 +46,10 @@ class SourceCreate(BaseModel):
 
 class SourceUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=160)
+    kind: str | None = Field(
+        default=None, pattern="^(newsnow|rss|rsshub|webpage|webpage_list)$"
+    )
+    identifier: str | None = Field(default=None, min_length=1, max_length=1024)
     category: str | None = Field(default=None, max_length=64)
     fetch_strategy: str | None = Field(
         default=None,
@@ -92,6 +101,8 @@ class EditionCreate(BaseModel):
     max_mb_per_volume: int = Field(default=18, ge=4, le=23)
     grayscale_images: bool = False
     include_qr_links: bool = False
+    strip_links: bool = True
+    retention_days: int = Field(default=30, ge=1, le=365)
     ai_briefing_enabled: bool = True
     target_emails: str = ""
     enabled: bool = True
@@ -110,6 +121,8 @@ class EditionUpdate(BaseModel):
     max_mb_per_volume: int | None = Field(default=None, ge=4, le=23)
     grayscale_images: bool | None = None
     include_qr_links: bool | None = None
+    strip_links: bool | None = None
+    retention_days: int | None = Field(default=None, ge=1, le=365)
     ai_briefing_enabled: bool | None = None
     target_emails: str | None = None
     enabled: bool | None = None
