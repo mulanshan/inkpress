@@ -1,0 +1,196 @@
+@import "tailwindcss";
+
+:root,
+[data-theme="paper"] {
+  --bg-canvas: #faf8f5;
+  --bg-surface: #ffffff;
+  --bg-subtle: #f2eee6;
+  --fg-primary: #1c1b18;
+  --fg-secondary: #5c574f;
+  --fg-muted: #8a8377;
+  --border-hairline: #e6e0d4;
+  --accent: #b44b32;
+  --accent-soft: #f6e7e2;
+  --accent-fg: #ffffff;
+  --shadow-paper: 0 1px 2px rgba(28, 27, 24, 0.04), 0 8px 24px rgba(28, 27, 24, 0.05);
+}
+
+[data-theme="sepia"] {
+  --bg-canvas: #f4ecd8;
+  --bg-surface: #faf4e6;
+  --bg-subtle: #ebe1c9;
+  --fg-primary: #2b2318;
+  --fg-secondary: #5e503c;
+  --fg-muted: #85755e;
+  --border-hairline: #dfd3b8;
+  --accent: #9e442a;
+  --accent-soft: #ead9c7;
+  --accent-fg: #faf4e6;
+  --shadow-paper: 0 1px 2px rgba(43, 35, 24, 0.05), 0 8px 24px rgba(43, 35, 24, 0.06);
+}
+
+[data-theme="charcoal"] {
+  --bg-canvas: #141413;
+  --bg-surface: #1c1b19;
+  --bg-subtle: #252420;
+  --fg-primary: #e8e3d9;
+  --fg-secondary: #aba498;
+  --fg-muted: #787268;
+  --border-hairline: #2d2b26;
+  --accent: #d97757;
+  --accent-soft: #2e201b;
+  --accent-fg: #141413;
+  --shadow-paper: 0 2px 12px rgba(0, 0, 0, 0.35);
+}
+
+[data-theme="eink"] {
+  --bg-canvas: #ffffff;
+  --bg-surface: #ffffff;
+  --bg-subtle: #f4f4f4;
+  --fg-primary: #000000;
+  --fg-secondary: #222222;
+  --fg-muted: #444444;
+  --border-hairline: #000000;
+  --accent: #000000;
+  --accent-soft: #eeeeee;
+  --accent-fg: #ffffff;
+  --shadow-paper: none;
+}
+
+[data-theme="eink"] * {
+  transition: none !important;
+  animation: none !important;
+  box-shadow: none !important;
+}
+
+html,
+body {
+  background-color: var(--bg-canvas);
+  color: var(--fg-primary);
+  font-family: "Inter", -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB",
+    "Microsoft YaHei", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+.font-editorial {
+  font-family: "Newsreader", "Noto Serif SC", "Songti SC", "STSong", Georgia, serif;
+}
+
+.font-sans-clean {
+  font-family: "Inter", -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB",
+    sans-serif;
+}
+
+/* Longform reading prose */
+.editorial-prose {
+  color: var(--fg-primary);
+  word-break: break-word;
+}
+
+.editorial-prose h1,
+.editorial-prose h2,
+.editorial-prose h3,
+.editorial-prose h4 {
+  font-family: "Newsreader", "Noto Serif SC", "Songti SC", Georgia, serif;
+  font-weight: 600;
+  line-height: 1.35;
+  margin-top: 1.75em;
+  margin-bottom: 0.65em;
+  color: var(--fg-primary);
+}
+
+.editorial-prose h2 {
+  font-size: 1.38em;
+}
+
+.editorial-prose h3 {
+  font-size: 1.18em;
+}
+
+.editorial-prose p {
+  margin-bottom: 1.25em;
+  text-align: justify;
+}
+
+.editorial-prose p.bilingual-tr {
+  color: var(--fg-secondary);
+  font-style: italic;
+  margin-top: -0.65em;
+  margin-bottom: 1.4em;
+  padding-left: 0.9em;
+  border-left: 2px solid var(--border-hairline);
+}
+
+.editorial-prose blockquote {
+  margin: 1.4em 0;
+  padding: 0.25em 1.15em;
+  border-left: 3px solid var(--accent);
+  color: var(--fg-secondary);
+  background: var(--bg-subtle);
+  border-radius: 0 6px 6px 0;
+}
+
+.editorial-prose img {
+  max-width: 100%;
+  height: auto;
+  border-radius: 6px;
+  margin: 1.4em auto;
+  display: block;
+}
+
+.editorial-prose pre {
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-hairline);
+  border-radius: 8px;
+  padding: 1em 1.2em;
+  overflow-x: auto;
+  font-size: 0.88em;
+  margin: 1.3em 0;
+}
+
+.editorial-prose code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.9em;
+}
+
+.editorial-prose a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.editorial-prose ul,
+.editorial-prose ol {
+  padding-left: 1.5em;
+  margin-bottom: 1.25em;
+}
+
+.editorial-prose li {
+  margin-bottom: 0.45em;
+}
+
+.editorial-prose table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1.4em 0;
+  font-size: 0.92em;
+}
+
+.editorial-prose th,
+.editorial-prose td {
+  border: 1px solid var(--border-hairline);
+  padding: 0.55em 0.75em;
+  text-align: left;
+}
+
+.editorial-prose .digest-item {
+  padding: 0.9em 0;
+  border-bottom: 1px solid var(--border-hairline);
+}
+
+.editorial-prose .meta-tag {
+  font-size: 0.78em;
+  color: var(--fg-muted);
+  font-weight: 400;
+}

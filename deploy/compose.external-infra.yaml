@@ -1,0 +1,114 @@
+# Compose template for environments that already provide shared external
+# PostgreSQL (ParadeDB), Redis, RSSHub, and Byparr networks.
+name: inkpress
+
+services:
+  newsnow:
+    image: ghcr.io/ourongxing/newsnow:latest
+    container_name: inkpress-newsnow
+    restart: unless-stopped
+    mem_limit: 512m
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "4444"
+      NODE_ENV: production
+      INIT_TABLE: "true"
+      ENABLE_CACHE: "true"
+      TZ: ${TZ:-Asia/Shanghai}
+      HTTP_PROXY: ${OUTBOUND_PROXY:-}
+      HTTPS_PROXY: ${OUTBOUND_PROXY:-}
+      NO_PROXY: localhost,127.0.0.1,::1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,*.local
+    volumes:
+      - ./data/newsnow:/usr/app/.data
+    networks:
+      - inkpress-net
+    healthcheck:
+      test: ["CMD", "curl", "--noproxy", "*", "-fsS", "http://127.0.0.1:4444/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  app:
+    image: ghcr.io/mulanshan/inkpress-app:latest
+    container_name: inkpress-app
+    restart: unless-stopped
+    mem_limit: 768m
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    ports:
+      - "127.0.0.1:${APP_PORT:-8060}:8000"
+      - "${LAN_BIND_IP:-127.0.0.1}:${APP_PORT:-8060}:8000"
+    env_file: .env
+    volumes:
+      - ${HOST_LIBRARY_DIR:-./data/library}:/data/library
+    networks:
+      - inkpress-net
+      - data-net
+      - scraper-net
+    healthcheck:
+      test: ["CMD", "curl", "--noproxy", "*", "-fsS", "http://127.0.0.1:8000/api/v1/health/live"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 25s
+
+  worker:
+    image: ghcr.io/mulanshan/inkpress-worker:latest
+    container_name: inkpress-worker
+    restart: unless-stopped
+    mem_limit: 2g
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    env_file: .env
+    volumes:
+      - ${HOST_LIBRARY_DIR:-./data/library}:/data/library
+    networks:
+      - inkpress-net
+      - data-net
+      - scraper-net
+    command: ["python", "-m", "inkpress.worker.runner"]
+
+  scheduler:
+    image: ghcr.io/mulanshan/inkpress-worker:latest
+    container_name: inkpress-scheduler
+    restart: unless-stopped
+    mem_limit: 256m
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    env_file: .env
+    volumes:
+      - ${HOST_LIBRARY_DIR:-./data/library}:/data/library
+    networks:
+      - inkpress-net
+      - data-net
+    command: ["python", "-m", "inkpress.worker.scheduler"]
+
+networks:
+  inkpress-net:
+  data-net:
+    external: true
+  scraper-net:
+    external: true

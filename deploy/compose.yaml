@@ -1,0 +1,116 @@
+name: inkpress
+
+services:
+  postgres:
+    image: paradedb/paradedb:latest-pg18
+    container_name: inkpress-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: inkpress
+      POSTGRES_USER: inkpress
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-inkpress-dev-password}
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      - ./data/postgres:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U inkpress -d inkpress"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:8-alpine
+    container_name: inkpress-redis
+    restart: unless-stopped
+    volumes:
+      - ./data/redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  newsnow:
+    image: ghcr.io/ourongxing/newsnow:latest
+    container_name: inkpress-newsnow
+    restart: unless-stopped
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "4444"
+      NODE_ENV: production
+      INIT_TABLE: "true"
+      ENABLE_CACHE: "true"
+      HTTP_PROXY: ${OUTBOUND_PROXY:-}
+      HTTPS_PROXY: ${OUTBOUND_PROXY:-}
+      NO_PROXY: localhost,127.0.0.1,*.local
+    volumes:
+      - ./data/newsnow:/usr/app/.data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:4444/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  app:
+    image: ghcr.io/mulanshan/inkpress-app:latest
+    container_name: inkpress-app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "${APP_PORT:-8060}:8000"
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://inkpress:${POSTGRES_PASSWORD:-inkpress-dev-password}@postgres:5432/inkpress
+      REDIS_URL: redis://redis:6379/5
+      NEWSNOW_BASE_URL: http://newsnow:4444
+      LIBRARY_DATA_DIR: /data/library
+    volumes:
+      - ${HOST_LIBRARY_DIR:-./data/library}:/data/library
+    healthcheck:
+      test: ["CMD", "curl", "--noproxy", "*", "-fsS", "http://127.0.0.1:8000/api/v1/health/live"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  worker:
+    image: ghcr.io/mulanshan/inkpress-worker:latest
+    container_name: inkpress-worker
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://inkpress:${POSTGRES_PASSWORD:-inkpress-dev-password}@postgres:5432/inkpress
+      REDIS_URL: redis://redis:6379/5
+      NEWSNOW_BASE_URL: http://newsnow:4444
+      LIBRARY_DATA_DIR: /data/library
+    volumes:
+      - ${HOST_LIBRARY_DIR:-./data/library}:/data/library
+    command: ["python", "-m", "inkpress.worker.runner"]
+
+  scheduler:
+    image: ghcr.io/mulanshan/inkpress-worker:latest
+    container_name: inkpress-scheduler
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://inkpress:${POSTGRES_PASSWORD:-inkpress-dev-password}@postgres:5432/inkpress
+      REDIS_URL: redis://redis:6379/5
+      NEWSNOW_BASE_URL: http://newsnow:4444
+      LIBRARY_DATA_DIR: /data/library
+    volumes:
+      - ${HOST_LIBRARY_DIR:-./data/library}:/data/library
+    command: ["python", "-m", "inkpress.worker.scheduler"]

@@ -1,0 +1,32 @@
+# Full-featured InkPress Worker & Scheduler image
+# Includes Noto CJK fonts (cover rendering), Pandoc, and Calibre CLI (ebook-convert)
+# for lossless MOBI / AZW3 / FB2 / CBZ / EPUB round-trip conversion.
+FROM python:3.13-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    QTWEBENGINE_DISABLE_SANDBOX=1 \
+    CALIBRE_CONFIG_DIRECTORY=/tmp/calibre-config
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      curl \
+      ca-certificates \
+      fonts-noto-cjk \
+      pandoc \
+      calibre \
+      libxml2 \
+      libxslt1.1 \
+      libjpeg62-turbo \
+      libwebp7 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY pyproject.toml README.md ./
+COPY backend ./backend
+RUN pip install --upgrade pip && pip install .
+
+RUN mkdir -p /data/library /tmp/calibre-config
+
+CMD ["python", "-m", "inkpress.worker.runner"]
