@@ -69,6 +69,9 @@ services:
     image: ghcr.io/mulanshan/inkpress-worker:latest
     container_name: inkpress-worker
     restart: unless-stopped
+    depends_on:
+      app:
+        condition: service_healthy
     mem_limit: 2g
     labels:
       com.centurylinklabs.watchtower.enable: "true"
@@ -90,6 +93,9 @@ services:
     image: ghcr.io/mulanshan/inkpress-worker:latest
     container_name: inkpress-scheduler
     restart: unless-stopped
+    depends_on:
+      app:
+        condition: service_healthy
     mem_limit: 256m
     labels:
       com.centurylinklabs.watchtower.enable: "true"

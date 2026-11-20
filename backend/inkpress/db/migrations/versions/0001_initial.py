@@ -254,7 +254,7 @@ def upgrade() -> None:
             """
             DO $$
             BEGIN
-                CREATE EXTENSION IF NOT EXISTS pg_search;
+                CREATE EXTENSION IF NOT EXISTS pg_search CASCADE;
                 CREATE INDEX IF NOT EXISTS ix_articles_bm25 ON articles
                 USING bm25 (id, title, plain_text, ai_summary)
                 WITH (key_field='id');
