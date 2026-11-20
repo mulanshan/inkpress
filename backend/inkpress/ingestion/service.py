@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import html as html_escape
-from datetime import UTC, datetime
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from inkpress.config import get_settings
 from inkpress.db.models import Article, Source, utcnow
 from inkpress.ingestion.extractor import (
     canonicalize_url,
@@ -102,7 +104,11 @@ async def sync_source(session: AsyncSession, source: Source) -> dict[str, int]:
             if source.fetch_strategy == "newsnow_digest":
                 # Aggregate real-time ticker / hotlist into a clean, readable digest article
                 if entries:
-                    now_local = datetime.now(UTC)
+                    try:
+                        tz = ZoneInfo(get_settings().tz)
+                    except Exception:
+                        tz = ZoneInfo("Asia/Shanghai")
+                    now_local = datetime.now(tz)
                     date_slot = now_local.strftime("%Y-%m-%d-%H")
                     digest_url = f"https://inkpress.local/newsnow/{source.identifier}/{date_slot}"
                     blocks: list[str] = []

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-import html as html_escape
 
+import markdown as md_lib
 from bs4 import BeautifulSoup
 
 from inkpress.ai.client import AIClient
 from inkpress.db.models import Article
+from inkpress.ingestion.extractor import sanitize_article_html
 from inkpress.logging import get_logger
 
 logger = get_logger(__name__)
@@ -61,20 +62,9 @@ async def generate_frontpage_briefing(
     )
     if not raw:
         return ""
-    paragraphs: list[str] = []
-    for block in raw.splitlines():
-        line = block.strip()
-        if not line:
-            continue
-        if line.startswith(("#", "##", "###")):
-            heading = html_escape.escape(line.lstrip("# ").strip())
-            paragraphs.append(f"<h2>{heading}</h2>")
-        elif line.startswith(("- ", "• ", "* ")):
-            item = html_escape.escape(line[2:].strip())
-            paragraphs.append(f'<p class="brief-bullet">• {item}</p>')
-        else:
-            paragraphs.append(f"<p>{html_escape.escape(line)}</p>")
-    return "\n".join(paragraphs)
+    rendered = md_lib.markdown(raw, extensions=["nl2br"])
+    clean_html, _, _ = sanitize_article_html(rendered)
+    return clean_html
 
 
 async def translate_article_bilingual(
