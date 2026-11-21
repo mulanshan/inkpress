@@ -5,6 +5,7 @@ import ipaddress
 import re
 import socket
 from urllib.parse import urljoin, urlparse
+from weakref import WeakKeyDictionary
 
 import httpx
 
@@ -268,6 +269,20 @@ async def _read_response_limited(resp: httpx.Response, max_bytes: int, url: str)
     return bytes(buf)
 
 
+_BYPARR_SEMAPHORES: WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore] = (
+    WeakKeyDictionary()
+)
+
+
+def _get_byparr_semaphore() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    sem = _BYPARR_SEMAPHORES.get(loop)
+    if sem is None:
+        sem = asyncio.Semaphore(1)
+        _BYPARR_SEMAPHORES[loop] = sem
+    return sem
+
+
 async def fetch_via_byparr(
     url: str,
     byparr_base_url: str,
@@ -279,7 +294,10 @@ async def fetch_via_byparr(
     await assert_safe_public_url(url, allow_internal_hosts=allow_internal_hosts)
     endpoint = f"{byparr_base_url.rstrip('/')}/v1"
     payload = {"cmd": "request.get", "url": url, "maxTimeout": int(timeout * 1000)}
-    async with httpx.AsyncClient(timeout=timeout + 10.0, trust_env=False) as client:
+    async with (
+        _get_byparr_semaphore(),
+        httpx.AsyncClient(timeout=timeout + 10.0, trust_env=False) as client,
+    ):
         resp = await client.post(endpoint, json=payload)
         resp.raise_for_status()
         data = resp.json()

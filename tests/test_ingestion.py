@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import socket
 from datetime import UTC, datetime
 from pathlib import Path
@@ -20,6 +21,7 @@ from inkpress.ingestion.extractor import (
 from inkpress.ingestion.fetcher import (
     assert_safe_public_url,
     decode_response_bytes,
+    fetch_via_byparr,
     is_safe_public_url,
     should_use_proxy,
     smart_fetch_bytes,
@@ -646,3 +648,97 @@ async def test_sync_source_rolls_back_session_on_flush_error(
     assert refreshed.consecutive_failures == 1
     assert refreshed.last_error is not None
     assert "simulated db flush failure" in refreshed.last_error
+
+
+async def test_fetch_via_byparr_serializes_concurrent_calls(
+    db_session: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "inkpress.ingestion.fetcher.socket.getaddrinfo",
+        lambda host, port: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))],
+    )
+
+    in_flight = 0
+    max_in_flight = 0
+
+    async def slow_byparr_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal in_flight, max_in_flight
+        in_flight += 1
+        max_in_flight = max(max_in_flight, in_flight)
+        try:
+            await asyncio.sleep(0.03)
+            return httpx.Response(
+                200,
+                json={
+                    "solution": {
+                        "url": "https://www.cw.com.tw/article/5143806",
+                        "response": "<html><body><p>Sequential Byparr OK</p></body></html>",
+                    }
+                },
+            )
+        finally:
+            in_flight -= 1
+
+    real_async_client = httpx.AsyncClient
+    transport = httpx.MockTransport(slow_byparr_handler)
+    monkeypatch.setattr(
+        "inkpress.ingestion.fetcher.httpx.AsyncClient",
+        lambda **kwargs: real_async_client(transport=transport),
+    )
+
+    results = await asyncio.gather(
+        *[
+            fetch_via_byparr(f"https://www.cw.com.tw/article/{i}", "http://byparr:8191")
+            for i in range(4)
+        ]
+    )
+    assert len(results) == 4
+    assert all("Sequential Byparr OK" in html for html, _ in results)
+    assert max_in_flight == 1
+
+    # Also verify service.py webpage_list with byparr_browser serializes article fetches
+    svc_in_flight = 0
+    svc_max_in_flight = 0
+
+    wl_src = Source(
+        name="天下杂志串行验证",
+        kind="webpage_list",
+        identifier="https://www.cw.com.tw/today-serial",
+        category="财经",
+        fetch_strategy="byparr_browser",
+        ai_options={"link_selector": "a[href*='/article/']"},
+        max_items=5,
+    )
+    db_session.add(wl_src)
+    await db_session.commit()
+
+    list_html = (
+        "<html><body>"
+        '<a href="/article/1">文章一</a>'
+        '<a href="/article/2">文章二</a>'
+        '<a href="/article/3">文章三</a>'
+        "</body></html>"
+    )
+    art_html = (
+        "<html><head><title>天下深度文章</title></head><body><article>"
+        + "<p>这是足够长的正文内容用于验证串行抓取稳定性与无并发内存飙升。</p>" * 5
+        + "</article></body></html>"
+    )
+
+    async def fake_smart_fetch(url: str, **kwargs: Any) -> tuple[str, str]:
+        nonlocal svc_in_flight, svc_max_in_flight
+        if url.endswith("/today-serial"):
+            return list_html, url
+        svc_in_flight += 1
+        svc_max_in_flight = max(svc_max_in_flight, svc_in_flight)
+        try:
+            await asyncio.sleep(0.02)
+            return art_html.replace("天下深度文章", f"天下深度文章-{url[-1]}"), url
+        finally:
+            svc_in_flight -= 1
+
+    monkeypatch.setattr("inkpress.ingestion.service.smart_fetch_text", fake_smart_fetch)
+    stats = await sync_source(db_session, wl_src)
+    assert stats["new"] == 3
+    assert svc_max_in_flight == 1

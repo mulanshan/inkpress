@@ -280,7 +280,7 @@ async def sync_source(session: AsyncSession, source: Source) -> dict[str, int]:
                     else:
                         skipped_count += 1
             else:
-                sem = asyncio.Semaphore(4)
+                sem = asyncio.Semaphore(1 if source.fetch_strategy == "byparr_browser" else 4)
 
                 async def _extract_one(
                     url: str, title: str, hint: str, pub_dt: datetime, info_tag: str
@@ -549,7 +549,7 @@ async def sync_source(session: AsyncSession, source: Source) -> dict[str, int]:
             ]
             skipped_count += len(candidate_links) - len(to_fetch_links)
 
-            sem = asyncio.Semaphore(4)
+            sem = asyncio.Semaphore(1 if source.fetch_strategy == "byparr_browser" else 4)
 
             async def _fetch_list_item(
                 item_url: str, item_text: str
