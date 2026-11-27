@@ -127,6 +127,9 @@ def _host_matches_domain(host: str, domain: str) -> bool:
     return host == domain or host.endswith("." + domain)
 
 
+_GFW_FORGED_TEREDO_AAAA_NET = ipaddress.IPv6Network("2001::/96")
+
+
 def _is_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
         ip = ip.ipv4_mapped
@@ -182,16 +185,29 @@ async def assert_safe_public_url(
     if not addr_infos:
         raise ValueError(f"DNS returned no addresses for {host!r}")
 
+    resolved_ips: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
     for info in addr_infos:
         sockaddr = info[4]
         if not sockaddr:
             continue
         raw_ip = str(sockaddr[0]).split("%", 1)[0]
         try:
-            resolved_ip = ipaddress.ip_address(raw_ip)
+            resolved_ips.append(ipaddress.ip_address(raw_ip))
         except ValueError as exc:
             raise ValueError(f"Invalid resolved IP {raw_ip!r} for {host!r}") from exc
+
+    has_public_ip = any(not _is_blocked_ip(ip) for ip in resolved_ips)
+    for resolved_ip in resolved_ips:
         if _is_blocked_ip(resolved_ip):
+            # Upstream ISP DNS in mainland China frequently injects forged 2001::/96 Teredo AAAA
+            # records alongside valid public A records on domains like cw.com.tw / v2ex.com.
+            if (
+                has_public_ip
+                and isinstance(resolved_ip, ipaddress.IPv6Address)
+                and resolved_ip.ipv4_mapped is None
+                and resolved_ip in _GFW_FORGED_TEREDO_AAAA_NET
+            ):
+                continue
             raise ValueError(f"Blocked hostname {host!r} resolving to non-public IP {resolved_ip}")
 
 

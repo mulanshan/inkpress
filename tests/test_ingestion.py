@@ -940,3 +940,26 @@ async def test_timezone_direct_newsnow_handlers_author_cleaning_v2ex_and_dup_has
     monkeypatch.setattr("inkpress.ingestion.service.smart_fetch_text", fake_dup_page)
     dup_stats = await sync_source(db_session, dup_src)
     assert dup_stats["new"] == 0 and dup_stats["skipped"] == 1
+
+    # 5. Forged 2001::/96 Teredo AAAA alongside valid public IPv4 is tolerated, while ::1 / literal Teredo stay blocked
+    import socket
+
+    from inkpress.ingestion.fetcher import assert_safe_public_url
+
+    def fake_getaddrinfo(host: str, port: int) -> list[Any]:
+        if host == "www.cw.com.tw":
+            return [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("64.13.192.74", port)),
+                (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2001::1f0d:5f21", port, 0, 0)),
+            ]
+        return [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("64.13.192.74", port)),
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("::1", port, 0, 0)),
+        ]
+
+    monkeypatch.setattr("inkpress.ingestion.fetcher.socket.getaddrinfo", fake_getaddrinfo)
+    await assert_safe_public_url("https://www.cw.com.tw/today")
+    with pytest.raises(ValueError, match="Blocked non-public IP"):
+        await assert_safe_public_url("http://[2001::1f0d:5f21]/")
+    with pytest.raises(ValueError, match="Blocked hostname"):
+        await assert_safe_public_url("https://rebind-evil.example.com/")
