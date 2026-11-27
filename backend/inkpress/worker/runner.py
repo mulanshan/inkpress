@@ -23,9 +23,11 @@ from inkpress.worker.broker import (
     publish_worker_heartbeat,
 )
 from inkpress.worker.tasks import (
+    make_export_key,
     run_build_and_deliver_edition,
     run_convert_book,
     run_deliver_book,
+    run_export_book,
     run_retry_delivery,
     run_sync_source,
 )
@@ -63,6 +65,14 @@ async def dispatch_job(job: dict[str, Any]) -> Any:
             int(kwargs["book_id"]),
             target_email=str(kwargs.get("target_email") or ""),
             trigger=str(kwargs.get("trigger") or "manual"),
+        )
+    if job_type == "export_book":
+        raw_mb = kwargs.get("max_mb")
+        return await run_export_book(
+            int(kwargs["book_id"]),
+            target_format=str(kwargs["target_format"]),
+            max_mb=float(raw_mb) if raw_mb is not None else None,
+            set_as_default=bool(kwargs.get("set_as_default", False)),
         )
     if job_type == "retry_delivery":
         return await run_retry_delivery(
@@ -142,7 +152,8 @@ async def _mark_evicted_job_failed_in_db(raw_payload: str, times: int) -> None:
 
     deliv_id = kw.get("delivery_id")
     book_id = kw.get("book_id") if job_type == "convert_book" else None
-    if deliv_id is None and book_id is None:
+    export_book_id = kw.get("book_id") if job_type == "export_book" else None
+    if deliv_id is None and book_id is None and export_book_id is None:
         return
 
     try:
@@ -167,6 +178,27 @@ async def _mark_evicted_job_failed_in_db(raw_payload: str, times: int) -> None:
                         f"转码连续异常中断 {times} 次，已移入死信队列 (DLQ)"
                     )
                     dirty = True
+            if export_book_id is not None:
+                exp_book = await session.get(Book, int(export_book_id))
+                if exp_book is not None:
+                    t_fmt = str(kw.get("target_format") or "epub")
+                    raw_mb = kw.get("max_mb")
+                    exp_key = make_export_key(
+                        t_fmt, float(raw_mb) if raw_mb is not None else None
+                    )
+                    bmeta = dict(exp_book.metadata_json or {})
+                    exps = dict(bmeta.get("exports") or {})
+                    cur_exp = exps.get(exp_key)
+                    if isinstance(cur_exp, dict) and cur_exp.get("status") == "converting":
+                        exps[exp_key] = {
+                            **cur_exp,
+                            "status": "failed",
+                            "error": f"格式转换连续异常中断 {times} 次，已移入死信队列 (DLQ)",
+                            "updated_at": now.isoformat(),
+                        }
+                        bmeta["exports"] = exps
+                        exp_book.metadata_json = bmeta
+                        dirty = True
             if dirty:
                 await session.commit()
     except Exception as exc:

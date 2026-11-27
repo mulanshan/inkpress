@@ -185,6 +185,16 @@ body {
   text-align: center;
 }
 
+.editorial-prose figure.pdf-page {
+  margin: 0.75em 0;
+}
+
+.editorial-prose figure.pdf-page img {
+  margin: 0 auto;
+  background: #ffffff;
+  border: 1px solid var(--border-hairline);
+}
+
 .editorial-prose figcaption {
   font-size: 0.82em;
   color: var(--fg-muted);

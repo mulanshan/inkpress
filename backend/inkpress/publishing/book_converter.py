@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import html as html_escape
+import io
+import os
 import posixpath
 import re
 import shutil
@@ -21,6 +24,7 @@ import nh3
 import pymupdf
 from bs4 import BeautifulSoup, Tag
 from lxml import etree
+from PIL import Image, ImageFilter, ImageOps
 
 from inkpress.ingestion.extractor import detect_language, sanitize_article_html
 from inkpress.logging import get_logger
@@ -153,6 +157,9 @@ READER_ALLOWED_ATTRIBUTES: dict[str, set[str]] = {
 }
 
 
+EXPORTABLE_BOOK_FORMATS = ("epub", "pdf", "mobi", "txt")
+
+
 @dataclass
 class ConvertedBookResult:
     title: str
@@ -163,6 +170,16 @@ class ConvertedBookResult:
     file_size_bytes: int
     chapter_count: int
     notes: str = ""
+
+
+@dataclass
+class ExportedBookArtifact:
+    path: Path
+    target_format: str
+    file_size_bytes: int
+    notes: str = ""
+    cover_path: Path | None = None
+    chapter_count: int = 0
 
 
 @dataclass
@@ -1025,6 +1042,10 @@ def _extract_pdf_page_elements(
     repeating_headers: set[str],
     repeating_footers: set[str],
     seen_xrefs: dict[int, ProcessedImage],
+    max_image_width: int = 1000,
+    image_quality: int = 78,
+    image_grayscale: bool = False,
+    max_images: int = _MAX_PDF_IMAGES,
 ) -> tuple[list[tuple[str, str]], list[ProcessedImage]]:
     """Extract ordered (kind, payload) elements ('h2' | 'p' | 'img') and images from one PDF page."""
     page = pdf_doc[page_idx]
@@ -1112,7 +1133,7 @@ def _extract_pdf_page_elements(
 
         pimg = seen_xrefs.get(xref)
         if pimg is None:
-            if len(seen_xrefs) >= _MAX_PDF_IMAGES:
+            if len(seen_xrefs) >= max_images:
                 continue
             try:
                 extracted = pdf_doc.extract_image(xref)
@@ -1121,7 +1142,12 @@ def _extract_pdf_page_elements(
                 h = int(extracted.get("height") or 0)
                 if not raw_img or w < 40 or h < 40:
                     continue
-                opt = optimize_image_bytes(raw_img, max_width=1000)
+                opt = optimize_image_bytes(
+                    raw_img,
+                    max_width=max_image_width,
+                    grayscale=image_grayscale,
+                    quality=image_quality,
+                )
                 if opt is None:
                     continue
                 pimg = ProcessedImage(
@@ -1372,11 +1398,8 @@ async def convert_book_to_kindle_epub(
     if ext == "pdf":
 
         def _convert_pdf() -> ConvertedBookResult:
-            pdf_doc = pymupdf.open(str(src))
+            pdf_doc = _open_pdf_checked(src)
             try:
-                if pdf_doc.needs_pass:
-                    raise ValueError("该 PDF 已加密受密码保护，请先解除密码后再上传")
-
                 meta = pdf_doc.metadata or {}
                 pdf_title = title_override.strip() or (meta.get("title") or "").strip() or title
                 pdf_author = author_override.strip() or (meta.get("author") or "").strip() or author
@@ -1390,23 +1413,8 @@ async def convert_book_to_kindle_epub(
                         cover_out.parent.mkdir(parents=True, exist_ok=True)
                         cover_out.write_bytes(opt)
 
-                # Classify scanned vs text PDF by per-page character density
-                non_ws_counts: list[int] = []
-                sample_texts: list[str] = []
-                for page_idx in range(page_count):
-                    txt = str(pdf_doc[page_idx].get_text("text")).strip()
-                    non_ws = len(re.sub(r"\s+", "", txt))
-                    non_ws_counts.append(non_ws)
-                    if txt and len(sample_texts) < 10:
-                        sample_texts.append(txt)
-
-                median_chars = statistics.median(non_ws_counts) if non_ws_counts else 0
-                sparse_ratio = (
-                    sum(1 for c in non_ws_counts if c < 40) / len(non_ws_counts)
-                    if non_ws_counts
-                    else 1.0
-                )
-                if median_chars < 80 or sparse_ratio > 0.60:
+                is_scanned, sample_texts, _total_chars = _classify_pdf_document(pdf_doc)
+                if is_scanned:
                     # Scanned / image-heavy magazine PDF: preserve original PDF for native Kindle push
                     pdf_dst = output_dir / f"{src.stem}_{uid}.pdf"
                     pdf_dst.parent.mkdir(parents=True, exist_ok=True)
@@ -1422,217 +1430,13 @@ async def convert_book_to_kindle_epub(
                         notes="Scanned/layout PDF preserved directly (Amazon Send to Kindle supports native PDF)",
                     )
 
-                # First pass: estimate body font size and detect repeating top/bottom bands
-                span_sizes: list[float] = []
-                top_band_counter: Counter[str] = Counter()
-                bottom_band_counter: Counter[str] = Counter()
-                for page_idx in range(page_count):
-                    page = pdf_doc[page_idx]
-                    page_h = float(page.rect.height) or 1.0
-                    seen_top_page: set[str] = set()
-                    seen_bottom_page: set[str] = set()
-                    for block in page.get_text("dict").get("blocks", []):
-                        if block.get("type") != 0:
-                            continue
-                        bb = block.get("bbox") or (0.0, 0.0, 0.0, 0.0)
-                        by0, by1 = float(bb[1]), float(bb[3])
-                        lines_txt: list[str] = []
-                        for line in block.get("lines", []):
-                            for sp in line.get("spans", []):
-                                st = str(sp.get("text") or "").strip()
-                                if st:
-                                    lines_txt.append(st)
-                                    if len(span_sizes) < 4000:
-                                        span_sizes.append(float(sp.get("size") or 11.0))
-                        btxt = _normalize_band_text(" ".join(lines_txt))
-                        if not btxt:
-                            continue
-                        if by1 <= page_h * 0.10:
-                            seen_top_page.add(btxt)
-                        elif by0 >= page_h * 0.90:
-                            seen_bottom_page.add(btxt)
-                    for item in seen_top_page:
-                        top_band_counter[item] += 1
-                    for item in seen_bottom_page:
-                        bottom_band_counter[item] += 1
-
-                body_font_size = statistics.median(span_sizes) if span_sizes else 11.0
-                repeat_threshold = max(2, int(page_count * 0.4)) if page_count >= 3 else page_count + 1
-                repeating_headers = {
-                    k for k, v in top_band_counter.items() if v >= repeat_threshold
-                }
-                repeating_footers = {
-                    k for k, v in bottom_band_counter.items() if v >= repeat_threshold
-                }
-
-                # Second pass: extract structured paragraphs + embedded images per page
-                seen_xrefs: dict[int, ProcessedImage] = {}
-                per_page_elements: list[list[tuple[str, str]]] = []
-                per_page_images: list[list[ProcessedImage]] = []
-                for page_idx in range(page_count):
-                    els, imgs = _extract_pdf_page_elements(
-                        pdf_doc,
-                        page_idx,
-                        body_font_size=body_font_size,
-                        repeating_headers=repeating_headers,
-                        repeating_footers=repeating_footers,
-                        seen_xrefs=seen_xrefs,
-                    )
-                    per_page_elements.append(els)
-                    per_page_images.append(imgs)
-
-                # Build chapters using PDF bookmarks (TOC) if available
-                raw_toc = pdf_doc.get_toc(simple=True) or []
-                valid_toc = [
-                    (int(entry[0]), str(entry[1]).strip(), int(entry[2]))
-                    for entry in raw_toc
-                    if len(entry) >= 3
-                    and str(entry[1]).strip()
-                    and 1 <= int(entry[2]) <= page_count
-                ]
-
-                html_sections: list[tuple[str, str]] = []
-                section_imgs: list[list[ProcessedImage]] = []
-
-                if valid_toc:
-                    min_level = min(e[0] for e in valid_toc)
-                    top_toc = [e for e in valid_toc if e[0] == min_level]
-                    chosen_toc = top_toc if len(top_toc) >= 2 else [
-                        e for e in valid_toc if e[0] <= min_level + 1
-                    ]
-                    # Deduplicate same start page keeping earliest bookmark title
-                    toc_points: list[tuple[int, str]] = []
-                    seen_pages: set[int] = set()
-                    for _lvl, t_title, p1 in sorted(chosen_toc, key=lambda x: x[2]):
-                        p0 = p1 - 1
-                        if p0 not in seen_pages:
-                            seen_pages.add(p0)
-                            toc_points.append((p0, t_title[:120]))
-
-                    if toc_points and toc_points[0][0] > 0:
-                        intro_els: list[tuple[str, str]] = []
-                        intro_imgs: list[ProcessedImage] = []
-                        for p in range(0, toc_points[0][0]):
-                            intro_els.extend(per_page_elements[p])
-                            intro_imgs.extend(per_page_images[p])
-                        if intro_els:
-                            html_sections.append(("前言", _elements_to_html(intro_els)))
-                            section_imgs.append(intro_imgs)
-
-                    for i, (start_p, sec_title) in enumerate(toc_points):
-                        end_p = toc_points[i + 1][0] if i + 1 < len(toc_points) else page_count
-                        sec_els: list[tuple[str, str]] = []
-                        sec_im: list[ProcessedImage] = []
-                        for p in range(start_p, end_p):
-                            sec_els.extend(per_page_elements[p])
-                            sec_im.extend(per_page_images[p])
-                        if sec_els:
-                            html_sections.append((sec_title, _elements_to_html(sec_els)))
-                            section_imgs.append(sec_im)
-
-                if not html_sections:
-                    # Merge across pages and split on chapter headings or ~12,000 char chunks
-                    all_els: list[tuple[str, str]] = []
-                    img_by_fname: dict[str, ProcessedImage] = {}
-                    for els, imgs in zip(per_page_elements, per_page_images, strict=True):
-                        for im in imgs:
-                            img_by_fname[im.filename] = im
-                        # Merge sentence split across page boundary when natural
-                        if (
-                            all_els
-                            and els
-                            and all_els[-1][0] == "p"
-                            and els[0][0] == "p"
-                            and not all_els[-1][1].rstrip().endswith(_SENTENCE_END_CHARS)
-                            and not CHAPTER_HEADING_RE.match(els[0][1])
-                        ):
-                            merged_p = _join_pdf_lines([all_els[-1][1], els[0][1]])
-                            all_els[-1] = ("p", merged_p)
-                            all_els.extend(els[1:])
-                        else:
-                            all_els.extend(els)
-
-                    heading_indices = [
-                        idx
-                        for idx, (kind, payload) in enumerate(all_els)
-                        if kind in ("p", "h2") and CHAPTER_HEADING_RE.match(payload.strip())
-                    ]
-                    if len(heading_indices) >= 2:
-                        if heading_indices[0] > 0:
-                            pre_els = all_els[: heading_indices[0]]
-                            html_sections.append(("前言", _elements_to_html(pre_els)))
-                            section_imgs.append(
-                                [
-                                    img_by_fname[p]
-                                    for k, p in pre_els
-                                    if k == "img" and p in img_by_fname
-                                ]
-                            )
-                        for idx_pos, start_i in enumerate(heading_indices):
-                            end_i = (
-                                heading_indices[idx_pos + 1]
-                                if idx_pos + 1 < len(heading_indices)
-                                else len(all_els)
-                            )
-                            sec_title = all_els[start_i][1].strip()[:120]
-                            body_els = all_els[start_i + 1 : end_i]
-                            if body_els:
-                                html_sections.append((sec_title, _elements_to_html(body_els)))
-                                section_imgs.append(
-                                    [
-                                        img_by_fname[p]
-                                        for k, p in body_els
-                                        if k == "img" and p in img_by_fname
-                                    ]
-                                )
-                    else:
-                        buf_els: list[tuple[str, str]] = []
-                        buf_chars = 0
-                        for el in all_els:
-                            buf_els.append(el)
-                            if el[0] != "img":
-                                buf_chars += len(el[1])
-                            if buf_chars >= 12000:
-                                label = f"{pdf_title} ({len(html_sections) + 1})"
-                                html_sections.append((label, _elements_to_html(buf_els)))
-                                section_imgs.append(
-                                    [
-                                        img_by_fname[p]
-                                        for k, p in buf_els
-                                        if k == "img" and p in img_by_fname
-                                    ]
-                                )
-                                buf_els = []
-                                buf_chars = 0
-                        if buf_els:
-                            label = (
-                                pdf_title
-                                if not html_sections
-                                else f"{pdf_title} ({len(html_sections) + 1})"
-                            )
-                            html_sections.append((label, _elements_to_html(buf_els)))
-                            section_imgs.append(
-                                [
-                                    img_by_fname[p]
-                                    for k, p in buf_els
-                                    if k == "img" and p in img_by_fname
-                                ]
-                            )
-
-                if not html_sections:
-                    html_sections = [(pdf_title, "<p>（正文为空）</p>")]
-                    section_imgs = [[]]
-
-                lang = detect_language("\n".join(sample_texts))
-                return _build_epub_from_sections(
-                    sections=html_sections,
-                    title=pdf_title,
-                    author=pdf_author,
-                    language=lang,
+                return _reflow_text_pdf_to_epub(
+                    pdf_doc,
+                    pdf_title=pdf_title,
+                    pdf_author=pdf_author,
+                    sample_texts=sample_texts,
                     dst=dst,
                     cover_out=cover_out,
-                    notes=f"Reflowed text PDF ({page_count} pages, {len(seen_xrefs)} image(s)) to Kindle EPUB3",
-                    section_images=section_imgs,
                 )
             finally:
                 pdf_doc.close()
@@ -1659,6 +1463,1417 @@ async def convert_book_to_kindle_epub(
     raise RuntimeError(
         f"Format .{ext} requires Calibre CLI (ebook-convert) in the worker container."
     )
+
+
+_SCAN_PROFILES: tuple[tuple[int, int, float], ...] = (
+    # (target_long_edge_px, ink_threshold, median_blend)
+    (1550, 146, 0.35),  # ~150 DPI on B5/A4
+    (1396, 145, 0.40),  # ~135 DPI
+    (1282, 145, 0.40),  # ~124 DPI
+    (1179, 143, 0.42),  # ~114 DPI
+    (1065, 140, 0.45),  # ~103 DPI
+    (960, 138, 0.48),   # ~93 DPI
+    (850, 135, 0.50),   # ~82 DPI
+    (740, 132, 0.50),   # ~72 DPI
+    (620, 128, 0.50),   # ~60 DPI legibility floor
+)
+
+_MAX_SCANNED_EPUB_PAGES_PER_CHAPTER = 25
+
+
+def _open_pdf_checked(src: Path) -> Any:
+    if not src.exists():
+        raise FileNotFoundError(f"PDF 文件不存在: {src}")
+    try:
+        pdf_doc = pymupdf.open(str(src))
+    except Exception as exc:
+        raise ValueError(f"无效或已损坏的 PDF 文件: {exc}") from exc
+    if pdf_doc.needs_pass:
+        pdf_doc.close()
+        raise ValueError("该 PDF 已加密受密码保护，请先解除密码后再上传或转换")
+    if len(pdf_doc) == 0:
+        pdf_doc.close()
+        raise ValueError("该 PDF 文件不包含任何页面")
+    return pdf_doc
+
+
+def _classify_pdf_document(pdf_doc: Any) -> tuple[bool, list[str], int]:
+    page_count = len(pdf_doc)
+    non_ws_counts: list[int] = []
+    sample_texts: list[str] = []
+    total_chars = 0
+    for page_idx in range(page_count):
+        txt = str(pdf_doc[page_idx].get_text("text")).strip()
+        non_ws = len(re.sub(r"\s+", "", txt))
+        non_ws_counts.append(non_ws)
+        total_chars += non_ws
+        if txt and len(sample_texts) < 10:
+            sample_texts.append(txt)
+
+    median_chars = statistics.median(non_ws_counts) if non_ws_counts else 0
+    sparse_ratio = (
+        sum(1 for c in non_ws_counts if c < 40) / len(non_ws_counts)
+        if non_ws_counts
+        else 1.0
+    )
+    is_scanned = median_chars < 80 or sparse_ratio > 0.60
+    return is_scanned, sample_texts, total_chars
+
+
+def _sanitize_pdf_toc(raw_toc: list[Any], page_count: int) -> list[list[Any]]:
+    """Normalize PDF bookmark hierarchy so PyMuPDF `set_toc()` never rejects malformed levels."""
+    cleaned: list[list[Any]] = []
+    prev_lvl = 0
+    for entry in raw_toc:
+        if not isinstance(entry, (list, tuple)) or len(entry) < 3:
+            continue
+        title = str(entry[1] or "").strip()
+        try:
+            raw_lvl = int(entry[0])
+            page_num = int(entry[2])
+        except (TypeError, ValueError):
+            continue
+        if not title or page_num < 1 or page_num > page_count:
+            continue
+        lvl = 1 if not cleaned else max(1, min(raw_lvl, prev_lvl + 1))
+        cleaned.append([lvl, title[:200], page_num])
+        prev_lvl = lvl
+    return cleaned
+
+
+def _reflow_text_pdf_to_epub(
+    pdf_doc: Any,
+    *,
+    pdf_title: str,
+    pdf_author: str,
+    sample_texts: list[str],
+    dst: Path,
+    cover_out: Path,
+    max_image_width: int = 1000,
+    image_quality: int = 78,
+    image_grayscale: bool = False,
+    max_images: int = _MAX_PDF_IMAGES,
+) -> ConvertedBookResult:
+    page_count = len(pdf_doc)
+
+    # First pass: estimate body font size and detect repeating top/bottom bands
+    span_sizes: list[float] = []
+    top_band_counter: Counter[str] = Counter()
+    bottom_band_counter: Counter[str] = Counter()
+    for page_idx in range(page_count):
+        page = pdf_doc[page_idx]
+        page_h = float(page.rect.height) or 1.0
+        seen_top_page: set[str] = set()
+        seen_bottom_page: set[str] = set()
+        for block in page.get_text("dict").get("blocks", []):
+            if block.get("type") != 0:
+                continue
+            bb = block.get("bbox") or (0.0, 0.0, 0.0, 0.0)
+            by0, by1 = float(bb[1]), float(bb[3])
+            lines_txt: list[str] = []
+            for line in block.get("lines", []):
+                for sp in line.get("spans", []):
+                    st = str(sp.get("text") or "").strip()
+                    if st:
+                        lines_txt.append(st)
+                        if len(span_sizes) < 4000:
+                            span_sizes.append(float(sp.get("size") or 11.0))
+            btxt = _normalize_band_text(" ".join(lines_txt))
+            if not btxt:
+                continue
+            if by1 <= page_h * 0.10:
+                seen_top_page.add(btxt)
+            elif by0 >= page_h * 0.90:
+                seen_bottom_page.add(btxt)
+        for item in seen_top_page:
+            top_band_counter[item] += 1
+        for item in seen_bottom_page:
+            bottom_band_counter[item] += 1
+
+    body_font_size = statistics.median(span_sizes) if span_sizes else 11.0
+    repeat_threshold = max(2, int(page_count * 0.4)) if page_count >= 3 else page_count + 1
+    repeating_headers = {k for k, v in top_band_counter.items() if v >= repeat_threshold}
+    repeating_footers = {k for k, v in bottom_band_counter.items() if v >= repeat_threshold}
+
+    # Second pass: extract structured paragraphs + embedded images per page
+    seen_xrefs: dict[int, ProcessedImage] = {}
+    per_page_elements: list[list[tuple[str, str]]] = []
+    per_page_images: list[list[ProcessedImage]] = []
+    for page_idx in range(page_count):
+        els, imgs = _extract_pdf_page_elements(
+            pdf_doc,
+            page_idx,
+            body_font_size=body_font_size,
+            repeating_headers=repeating_headers,
+            repeating_footers=repeating_footers,
+            seen_xrefs=seen_xrefs,
+            max_image_width=max_image_width,
+            image_quality=image_quality,
+            image_grayscale=image_grayscale,
+            max_images=max_images,
+        )
+        per_page_elements.append(els)
+        per_page_images.append(imgs)
+
+    # Build chapters using PDF bookmarks (TOC) if available
+    raw_toc = pdf_doc.get_toc(simple=True) or []
+    valid_toc = [
+        (int(entry[0]), str(entry[1]).strip(), int(entry[2]))
+        for entry in raw_toc
+        if len(entry) >= 3
+        and str(entry[1]).strip()
+        and 1 <= int(entry[2]) <= page_count
+    ]
+
+    html_sections: list[tuple[str, str]] = []
+    section_imgs: list[list[ProcessedImage]] = []
+
+    if valid_toc:
+        min_level = min(e[0] for e in valid_toc)
+        top_toc = [e for e in valid_toc if e[0] == min_level]
+        chosen_toc = (
+            top_toc
+            if len(top_toc) >= 2
+            else [e for e in valid_toc if e[0] <= min_level + 1]
+        )
+        toc_points: list[tuple[int, str]] = []
+        seen_pages: set[int] = set()
+        for _lvl, t_title, p1 in sorted(chosen_toc, key=lambda x: x[2]):
+            p0 = p1 - 1
+            if p0 not in seen_pages:
+                seen_pages.add(p0)
+                toc_points.append((p0, t_title[:120]))
+
+        if toc_points and toc_points[0][0] > 0:
+            intro_els: list[tuple[str, str]] = []
+            intro_imgs: list[ProcessedImage] = []
+            for p in range(0, toc_points[0][0]):
+                intro_els.extend(per_page_elements[p])
+                intro_imgs.extend(per_page_images[p])
+            if intro_els:
+                html_sections.append(("前言", _elements_to_html(intro_els)))
+                section_imgs.append(intro_imgs)
+
+        for i, (start_p, sec_title) in enumerate(toc_points):
+            end_p = toc_points[i + 1][0] if i + 1 < len(toc_points) else page_count
+            sec_els: list[tuple[str, str]] = []
+            sec_im: list[ProcessedImage] = []
+            for p in range(start_p, end_p):
+                sec_els.extend(per_page_elements[p])
+                sec_im.extend(per_page_images[p])
+            if sec_els:
+                html_sections.append((sec_title, _elements_to_html(sec_els)))
+                section_imgs.append(sec_im)
+
+    if not html_sections:
+        all_els: list[tuple[str, str]] = []
+        img_by_fname: dict[str, ProcessedImage] = {}
+        for els, imgs in zip(per_page_elements, per_page_images, strict=True):
+            for im in imgs:
+                img_by_fname[im.filename] = im
+            if (
+                all_els
+                and els
+                and all_els[-1][0] == "p"
+                and els[0][0] == "p"
+                and not all_els[-1][1].rstrip().endswith(_SENTENCE_END_CHARS)
+                and not CHAPTER_HEADING_RE.match(els[0][1])
+            ):
+                merged_p = _join_pdf_lines([all_els[-1][1], els[0][1]])
+                all_els[-1] = ("p", merged_p)
+                all_els.extend(els[1:])
+            else:
+                all_els.extend(els)
+
+        heading_indices = [
+            idx
+            for idx, (kind, payload) in enumerate(all_els)
+            if kind in ("p", "h2") and CHAPTER_HEADING_RE.match(payload.strip())
+        ]
+        if len(heading_indices) >= 2:
+            if heading_indices[0] > 0:
+                pre_els = all_els[: heading_indices[0]]
+                html_sections.append(("前言", _elements_to_html(pre_els)))
+                section_imgs.append(
+                    [img_by_fname[p] for k, p in pre_els if k == "img" and p in img_by_fname]
+                )
+            for idx_pos, start_i in enumerate(heading_indices):
+                end_i = (
+                    heading_indices[idx_pos + 1]
+                    if idx_pos + 1 < len(heading_indices)
+                    else len(all_els)
+                )
+                sec_title = all_els[start_i][1].strip()[:120]
+                body_els = all_els[start_i + 1 : end_i]
+                if body_els:
+                    html_sections.append((sec_title, _elements_to_html(body_els)))
+                    section_imgs.append(
+                        [
+                            img_by_fname[p]
+                            for k, p in body_els
+                            if k == "img" and p in img_by_fname
+                        ]
+                    )
+        else:
+            buf_els: list[tuple[str, str]] = []
+            buf_chars = 0
+            for el in all_els:
+                buf_els.append(el)
+                if el[0] != "img":
+                    buf_chars += len(el[1])
+                if buf_chars >= 12000:
+                    label = f"{pdf_title} ({len(html_sections) + 1})"
+                    html_sections.append((label, _elements_to_html(buf_els)))
+                    section_imgs.append(
+                        [
+                            img_by_fname[p]
+                            for k, p in buf_els
+                            if k == "img" and p in img_by_fname
+                        ]
+                    )
+                    buf_els = []
+                    buf_chars = 0
+            if buf_els:
+                label = (
+                    pdf_title
+                    if not html_sections
+                    else f"{pdf_title} ({len(html_sections) + 1})"
+                )
+                html_sections.append((label, _elements_to_html(buf_els)))
+                section_imgs.append(
+                    [img_by_fname[p] for k, p in buf_els if k == "img" and p in img_by_fname]
+                )
+
+    if not html_sections:
+        html_sections = [(pdf_title, "<p>（正文为空）</p>")]
+        section_imgs = [[]]
+
+    lang = detect_language("\n".join(sample_texts))
+    return _build_epub_from_sections(
+        sections=html_sections,
+        title=pdf_title,
+        author=pdf_author,
+        language=lang,
+        dst=dst,
+        cover_out=cover_out,
+        notes=f"Reflowed text PDF ({page_count} pages, {len(seen_xrefs)} image(s)) to Kindle EPUB3",
+        section_images=section_imgs,
+    )
+
+
+def _pick_sample_indices(indices: list[int], max_samples: int = 12) -> list[int]:
+    if len(indices) <= max_samples:
+        return list(indices)
+    step = len(indices) / float(max_samples)
+    picked: list[int] = []
+    seen: set[int] = set()
+    for i in range(max_samples):
+        cand = indices[min(len(indices) - 1, int(i * step))]
+        if cand not in seen:
+            seen.add(cand)
+            picked.append(cand)
+    return picked
+
+
+def _render_scanned_page_1bit(
+    page: Any,
+    *,
+    target_long_edge_px: int,
+    threshold: int,
+    median_blend: float,
+) -> Image.Image:
+    rect = page.rect
+    w_pt = max(float(rect.width), 1.0)
+    h_pt = max(float(rect.height), 1.0)
+    long_pt = max(w_pt, h_pt)
+    clamped_long = max(360, min(2200, target_long_edge_px))
+    scale = clamped_long / long_pt
+    pix = page.get_pixmap(
+        matrix=pymupdf.Matrix(scale, scale),
+        colorspace=pymupdf.csGRAY,
+        alpha=False,
+    )
+    im = Image.frombytes("L", (max(1, pix.width), max(1, pix.height)), pix.samples)
+    if median_blend > 0.0 and im.width >= 8 and im.height >= 8:
+        im = Image.blend(im, im.filter(ImageFilter.MedianFilter(3)), median_blend)
+    return im.point([255 if v >= threshold else 0 for v in range(256)], mode="1")
+
+
+def _scanned_page_to_ccitt_pdf_bytes(
+    page: Any,
+    *,
+    target_long_edge_px: int,
+    threshold: int,
+    median_blend: float,
+) -> bytes:
+    bw = _render_scanned_page_1bit(
+        page,
+        target_long_edge_px=target_long_edge_px,
+        threshold=threshold,
+        median_blend=median_blend,
+    )
+    w_pt = max(float(page.rect.width), 1.0)
+    eff_res = max(18.0, bw.width * 72.0 / w_pt)
+    buf = io.BytesIO()
+    bw.save(buf, format="PDF", resolution=eff_res)
+    return buf.getvalue()
+
+
+def _scanned_page_to_1bit_png_bytes(
+    page: Any,
+    *,
+    target_long_edge_px: int,
+    threshold: int,
+    median_blend: float,
+) -> bytes:
+    bw = _render_scanned_page_1bit(
+        page,
+        target_long_edge_px=target_long_edge_px,
+        threshold=threshold,
+        median_blend=median_blend,
+    )
+    buf = io.BytesIO()
+    bw.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+def _render_pdf_cover_jpeg(
+    page: Any,
+    *,
+    max_width: int = 760,
+    quality: int = 58,
+) -> bytes | None:
+    rect = page.rect
+    long_pt = max(float(rect.width), float(rect.height), 1.0)
+    scale = min(3.0, max(max_width * 1.35, 640.0) / long_pt)
+    pix = page.get_pixmap(
+        matrix=pymupdf.Matrix(scale, scale),
+        colorspace=pymupdf.csRGB,
+        alpha=False,
+    )
+    im = Image.frombytes("RGB", (max(1, pix.width), max(1, pix.height)), pix.samples)
+    if im.width > max_width:
+        im = im.resize(
+            (max_width, max(1, int(im.height * max_width / float(im.width)))),
+            Image.Resampling.LANCZOS,
+        )
+    buf = io.BytesIO()
+    im.save(buf, format="JPEG", quality=quality, optimize=True)
+    return buf.getvalue()
+
+
+def _select_scan_profile(
+    pdf_doc: Any,
+    body_indices: list[int],
+    *,
+    per_page_budget: float | None,
+    use_png: bool,
+) -> tuple[int, int, float]:
+    if per_page_budget is None:
+        return _SCAN_PROFILES[1]  # Crisp ~135 DPI default when unlimited
+
+    samples = _pick_sample_indices(body_indices, max_samples=12)
+    if not samples:
+        return _SCAN_PROFILES[1]
+
+    cache: dict[int, float] = {}
+
+    def _eval_profile(idx: int) -> float:
+        if idx in cache:
+            return cache[idx]
+        long_px, thr, blend = _SCAN_PROFILES[idx]
+        total = 0
+        for p_i in samples:
+            if use_png:
+                b = _scanned_page_to_1bit_png_bytes(
+                    pdf_doc[p_i],
+                    target_long_edge_px=long_px,
+                    threshold=thr,
+                    median_blend=blend,
+                )
+            else:
+                b = _scanned_page_to_ccitt_pdf_bytes(
+                    pdf_doc[p_i],
+                    target_long_edge_px=long_px,
+                    threshold=thr,
+                    median_blend=blend,
+                )
+            total += len(b)
+        avg = total / float(len(samples))
+        cache[idx] = avg
+        return avg
+
+    # Start near middle (~114 DPI) and walk up or down to find highest-quality profile <= budget
+    mid_idx = 3
+    mid_avg = _eval_profile(mid_idx)
+    if mid_avg <= per_page_budget:
+        best = mid_idx
+        for cand_idx in range(mid_idx - 1, -1, -1):
+            if _eval_profile(cand_idx) <= per_page_budget:
+                best = cand_idx
+            else:
+                break
+        return _SCAN_PROFILES[best]
+
+    for cand_idx in range(mid_idx + 1, len(_SCAN_PROFILES)):
+        if _eval_profile(cand_idx) <= per_page_budget:
+            return _SCAN_PROFILES[cand_idx]
+    return _SCAN_PROFILES[-1]
+
+
+def _build_scanned_compact_pdf(
+    pdf_doc: Any,
+    dst: Path,
+    *,
+    max_bytes: int | None,
+) -> tuple[int, int]:
+    """Stream a scanned/layout PDF into a compact CCITTFaxDecode PDF preserving cover & TOC."""
+    page_count = len(pdf_doc)
+    meta = pdf_doc.metadata or {}
+    clean_toc = _sanitize_pdf_toc(pdf_doc.get_toc(simple=True) or [], page_count)
+
+    cover_jpg: bytes | None = None
+    if page_count >= 2 and (max_bytes is None or max_bytes >= 1_200_000):
+        cov_w = 760 if (max_bytes is None or max_bytes >= 8 * 1024 * 1024) else 560
+        cov_q = 58 if (max_bytes is None or max_bytes >= 8 * 1024 * 1024) else 45
+        cand_cov = _render_pdf_cover_jpeg(pdf_doc[0], max_width=cov_w, quality=cov_q)
+        max_cov_allowance = 120_000 if max_bytes is None else min(110_000, int(max_bytes * 0.04))
+        if cand_cov and len(cand_cov) <= max_cov_allowance:
+            cover_jpg = cand_cov
+
+    body_indices = list(range(1 if cover_jpg is not None else 0, page_count))
+    per_page_budget: float | None = None
+    if max_bytes is not None and body_indices:
+        overhead = len(cover_jpg or b"") + page_count * 380 + 28_672
+        usable = max(float(len(body_indices) * 2048), max_bytes * 0.90 - overhead)
+        per_page_budget = usable / float(len(body_indices))
+
+    long_px, thr, blend = _select_scan_profile(
+        pdf_doc, body_indices, per_page_budget=per_page_budget, use_png=False
+    )
+
+    def _assemble(cur_long_px: int, cur_thr: int, cur_blend: float, keep_rgb_cover: bool) -> int:
+        out_doc = pymupdf.open()
+        try:
+            for p_idx in range(page_count):
+                rect = pdf_doc[p_idx].rect
+                if p_idx == 0 and keep_rgb_cover and cover_jpg is not None:
+                    np = out_doc.new_page(
+                        width=max(float(rect.width), 1.0),
+                        height=max(float(rect.height), 1.0),
+                    )
+                    np.insert_image(np.rect, stream=cover_jpg)
+                else:
+                    one_pdf = _scanned_page_to_ccitt_pdf_bytes(
+                        pdf_doc[p_idx],
+                        target_long_edge_px=cur_long_px,
+                        threshold=cur_thr,
+                        median_blend=cur_blend,
+                    )
+                    pdoc = pymupdf.open("pdf", one_pdf)
+                    try:
+                        out_doc.insert_pdf(pdoc)
+                    finally:
+                        pdoc.close()
+            out_doc.set_metadata(
+                {
+                    "title": str(meta.get("title") or ""),
+                    "author": str(meta.get("author") or ""),
+                    "subject": str(meta.get("subject") or ""),
+                    "creator": "InkPress PDF Optimizer",
+                }
+            )
+            if clean_toc:
+                with contextlib.suppress(Exception):
+                    out_doc.set_toc(clean_toc)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            out_doc.save(str(dst), garbage=4, deflate=True, deflate_images=False)
+        finally:
+            out_doc.close()
+        return dst.stat().st_size
+
+    size_bytes = _assemble(long_px, thr, blend, cover_jpg is not None)
+    used_long_px = long_px
+
+    # Corrective pass if un-sampled dense pages pushed size slightly past max_bytes
+    if max_bytes is not None and size_bytes > max_bytes and used_long_px > 540:
+        ratio = (max_bytes / float(size_bytes)) * 0.90
+        next_long_px = max(540, int(used_long_px * (ratio**0.72)))
+        size_bytes = _assemble(next_long_px, min(thr, 134), 0.50, max_bytes >= 3_000_000)
+        used_long_px = next_long_px
+        if size_bytes > max_bytes and used_long_px > 480:
+            size_bytes = _assemble(480, 128, 0.50, False)
+            used_long_px = 480
+
+    approx_dpi = max(50, round(used_long_px / 10.3))
+    return size_bytes, approx_dpi
+
+
+def compress_pdf_file(
+    src: Path,
+    dst: Path,
+    *,
+    max_mb: float | None = 10.0,
+) -> ExportedBookArtifact:
+    """Compress a text or scanned PDF into a smaller PDF (targeting <= max_mb when specified)."""
+    max_bytes = int(max_mb * 1024 * 1024) if (max_mb is not None and max_mb > 0) else None
+    src_size = src.stat().st_size if src.exists() else 0
+
+    pdf_doc = _open_pdf_checked(src)
+    try:
+        page_count = len(pdf_doc)
+        is_scanned, _samples, _total_chars = _classify_pdf_document(pdf_doc)
+
+        if not is_scanned:
+            # Vector text PDF: preserve selectable text & subset fonts while recompressing images
+            img_tiers: list[tuple[int, int, bool]] = (
+                [(1200, 74, False)]
+                if max_bytes is None
+                else [(1200, 72, False), (900, 56, True), (660, 40, True)]
+            )
+            best_text_size: int | None = None
+            for max_w, jpg_q, gray in img_tiers:
+                work_doc = pymupdf.open(str(src))
+                try:
+                    replaced_xrefs: set[int] = set()
+                    for p_idx in range(len(work_doc)):
+                        pg = work_doc[p_idx]
+                        for info in pg.get_images(full=True):
+                            xref = int(info[0])
+                            if xref <= 0 or xref in replaced_xrefs:
+                                continue
+                            replaced_xrefs.add(xref)
+                            with contextlib.suppress(Exception):
+                                extracted = work_doc.extract_image(xref)
+                                raw_img = extracted.get("image")
+                                if not raw_img or len(raw_img) < 8192:
+                                    continue
+                                opt_jpg = optimize_image_bytes(
+                                    raw_img,
+                                    max_width=max_w,
+                                    grayscale=gray,
+                                    quality=jpg_q,
+                                )
+                                if opt_jpg and len(opt_jpg) < int(len(raw_img) * 0.92):
+                                    pg.replace_image(xref, stream=opt_jpg)
+                    with contextlib.suppress(Exception):
+                        work_doc.subset_fonts()
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    work_doc.save(str(dst), garbage=4, deflate=True)
+                finally:
+                    work_doc.close()
+
+                cur_sz = dst.stat().st_size
+                best_text_size = cur_sz
+                if max_bytes is None or cur_sz <= max_bytes:
+                    break
+
+            if best_text_size is not None and (max_bytes is None or best_text_size <= max_bytes):
+                if best_text_size >= src_size and (max_bytes is None or src_size <= max_bytes):
+                    shutil.copy2(src, dst)
+                    return ExportedBookArtifact(
+                        path=dst,
+                        target_format="pdf",
+                        file_size_bytes=src_size,
+                        chapter_count=page_count,
+                        notes=f"原始 PDF 已处于最优体积（{src_size / 1048576:.2f} MB）",
+                    )
+                return ExportedBookArtifact(
+                    path=dst,
+                    target_format="pdf",
+                    file_size_bytes=best_text_size,
+                    chapter_count=page_count,
+                    notes=(
+                        f"已无损保留文字层并精简图片与字体子集"
+                        f"（{src_size / 1048576:.2f} MB → {best_text_size / 1048576:.2f} MB）"
+                    ),
+                )
+
+        # Scanned / image-only PDF (or text PDF whose vector/glyph streams still exceeded budget)
+        out_size, approx_dpi = _build_scanned_compact_pdf(pdf_doc, dst, max_bytes=max_bytes)
+        if out_size >= src_size and (max_bytes is None or src_size <= max_bytes):
+            shutil.copy2(src, dst)
+            return ExportedBookArtifact(
+                path=dst,
+                target_format="pdf",
+                file_size_bytes=src_size,
+                chapter_count=page_count,
+                notes=f"原始 PDF 已足够精简（{src_size / 1048576:.2f} MB）",
+            )
+        note_prefix = (
+            f"已按可读性下限压缩至 {out_size / 1048576:.2f} MB"
+            if (max_bytes is not None and out_size > max_bytes)
+            else f"已生成墨水屏级轻量化 PDF（约 {approx_dpi} DPI，{src_size / 1048576:.2f} MB → {out_size / 1048576:.2f} MB）"
+        )
+        return ExportedBookArtifact(
+            path=dst,
+            target_format="pdf",
+            file_size_bytes=out_size,
+            chapter_count=page_count,
+            notes=note_prefix,
+        )
+    finally:
+        pdf_doc.close()
+
+
+def _reencode_archive_image_smaller(
+    raw: bytes,
+    ext: str,
+    *,
+    max_width: int,
+    quality: int,
+    grayscale: bool,
+) -> bytes | None:
+    """Re-encode an EPUB raster asset in its OWN format so OPF/XHTML href & media-type stay valid."""
+    try:
+        with Image.open(io.BytesIO(raw)) as img:
+            if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+                rgba = img.convert("RGBA")
+                bg = Image.new("RGB", rgba.size, (255, 255, 255))
+                bg.paste(rgba, mask=rgba.split()[3])
+                work: Image.Image = bg
+            else:
+                work = img.convert("RGB")
+
+            if work.width > max_width:
+                new_h = max(1, int(work.height * max_width / float(work.width)))
+                work = work.resize((max_width, new_h), Image.Resampling.LANCZOS)
+
+            if grayscale:
+                work = ImageOps.autocontrast(work.convert("L"), cutoff=0.5)
+
+            out = io.BytesIO()
+            if ext in (".jpg", ".jpeg"):
+                work.save(out, format="JPEG", quality=quality, optimize=True)
+            elif ext == ".png":
+                if grayscale and quality <= 42:
+                    bw = work.convert("L").point(
+                        [255 if v >= 145 else 0 for v in range(256)], mode="1"
+                    )
+                    bw.save(out, format="PNG", optimize=True)
+                else:
+                    colors = 16 if grayscale else 64
+                    quant = work.quantize(colors=colors)
+                    quant.save(out, format="PNG", optimize=True)
+            elif ext == ".webp":
+                work.save(out, format="WEBP", quality=quality, method=4)
+            else:
+                return None
+
+            cand = out.getvalue()
+            return cand if len(cand) < len(raw) else None
+    except Exception:
+        return None
+
+
+def recompress_epub_to_budget(
+    src: Path,
+    dst: Path,
+    *,
+    max_bytes: int,
+) -> ExportedBookArtifact:
+    """Shrink an existing EPUB's embedded raster images progressively to fit under `max_bytes`."""
+    src_val = validate_epub(src)
+    work_src = src
+    cleanup_norm: Path | None = None
+    try:
+        if not src_val.valid:
+            cleanup_norm = dst.parent / f".norm_{uuid.uuid4().hex[:10]}.epub"
+            norm_cov = dst.parent / f".norm_cov_{uuid.uuid4().hex[:10]}.jpg"
+            try:
+                normalize_epub_for_kindle(src, cleanup_norm, norm_cov)
+                work_src = cleanup_norm
+            finally:
+                norm_cov.unlink(missing_ok=True)
+
+        cur_size = work_src.stat().st_size
+        if cur_size <= max_bytes:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(work_src, dst)
+            val = validate_epub(dst)
+            return ExportedBookArtifact(
+                path=dst,
+                target_format="epub",
+                file_size_bytes=dst.stat().st_size,
+                chapter_count=val.chapter_count,
+                notes=f"EPUB 体积已符合上限（{dst.stat().st_size / 1048576:.2f} MB）",
+            )
+
+        tiers = (
+            (960, 62, True),
+            (780, 48, True),
+            (620, 36, True),
+            (480, 28, True),
+        )
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        for max_w, qual, gray in tiers:
+            with zipfile.ZipFile(work_src, "r") as zin, zipfile.ZipFile(dst, "w") as zout:
+                zout.writestr(
+                    "mimetype", b"application/epub+zip", compress_type=zipfile.ZIP_STORED
+                )
+                for info in zin.infolist():
+                    if info.filename == "mimetype":
+                        continue
+                    data = zin.read(info.filename)
+                    ext = Path(info.filename).suffix.lower()
+                    if ext in (".jpg", ".jpeg", ".png", ".webp"):
+                        smaller = _reencode_archive_image_smaller(
+                            data, ext, max_width=max_w, quality=qual, grayscale=gray
+                        )
+                        if smaller is not None:
+                            data = smaller
+                    zout.writestr(info.filename, data, compress_type=zipfile.ZIP_DEFLATED)
+
+            if dst.stat().st_size <= max_bytes:
+                break
+
+        post_val = validate_epub(dst)
+        if not post_val.valid:
+            raise RuntimeError(f"压缩后 EPUB 校验未通过: {'; '.join(post_val.errors)}")
+        final_sz = dst.stat().st_size
+        return ExportedBookArtifact(
+            path=dst,
+            target_format="epub",
+            file_size_bytes=final_sz,
+            chapter_count=post_val.chapter_count,
+            notes=f"已精简 EPUB 插图体积（{cur_size / 1048576:.2f} MB → {final_sz / 1048576:.2f} MB）",
+        )
+    finally:
+        if cleanup_norm is not None:
+            cleanup_norm.unlink(missing_ok=True)
+
+
+def _group_scanned_pdf_page_ranges(
+    pdf_doc: Any,
+    page_count: int,
+    *,
+    max_pages_per_chapter: int = _MAX_SCANNED_EPUB_PAGES_PER_CHAPTER,
+) -> list[tuple[str, int, int]]:
+    """Build (chapter_title, start_page_0based, end_page_exclusive) ranges using PDF TOC or chunks."""
+    raw_toc = pdf_doc.get_toc(simple=True) or []
+    valid_toc = [
+        (int(entry[0]), str(entry[1]).strip(), int(entry[2]))
+        for entry in raw_toc
+        if len(entry) >= 3 and str(entry[1]).strip() and 1 <= int(entry[2]) <= page_count
+    ]
+
+    raw_spans: list[tuple[str, int, int]] = []
+    if valid_toc:
+        min_level = min(e[0] for e in valid_toc)
+        top_toc = [e for e in valid_toc if e[0] == min_level]
+        chosen_toc = (
+            top_toc
+            if len(top_toc) >= 2
+            else [e for e in valid_toc if e[0] <= min_level + 1]
+        )
+        toc_points: list[tuple[int, str]] = []
+        seen_pages: set[int] = set()
+        for _lvl, t_title, p1 in sorted(chosen_toc, key=lambda x: x[2]):
+            p0 = p1 - 1
+            if p0 not in seen_pages:
+                seen_pages.add(p0)
+                toc_points.append((p0, t_title[:110]))
+
+        if toc_points and toc_points[0][0] > 0:
+            raw_spans.append(("前言 / 封面页", 0, toc_points[0][0]))
+        for i, (start_p, sec_title) in enumerate(toc_points):
+            end_p = toc_points[i + 1][0] if i + 1 < len(toc_points) else page_count
+            if end_p > start_p:
+                raw_spans.append((sec_title, start_p, end_p))
+
+    if not raw_spans:
+        chunk = 20
+        if page_count <= chunk:
+            return [(f"全书正文（共 {page_count} 页）", 0, page_count)]
+        return [
+            (
+                f"第 {start + 1}–{min(page_count, start + chunk)} 页",
+                start,
+                min(page_count, start + chunk),
+            )
+            for start in range(0, page_count, chunk)
+        ]
+
+    # Split any huge TOC bookmark (e.g. a 100-page magazine issue) into snappy <=25-page chapters
+    final_ranges: list[tuple[str, int, int]] = []
+    for base_title, s_p, e_p in raw_spans:
+        span_len = e_p - s_p
+        if span_len <= max_pages_per_chapter:
+            final_ranges.append((base_title, s_p, e_p))
+        else:
+            parts = (span_len + max_pages_per_chapter - 1) // max_pages_per_chapter
+            for part_idx in range(parts):
+                cs = s_p + part_idx * max_pages_per_chapter
+                ce = min(e_p, cs + max_pages_per_chapter)
+                final_ranges.append((f"{base_title} ({part_idx + 1}/{parts})", cs, ce))
+    return final_ranges
+
+
+def convert_pdf_to_epub_with_budget(
+    src: Path,
+    dst: Path,
+    cover_out: Path,
+    *,
+    title_override: str = "",
+    author_override: str = "",
+    max_mb: float | None = 10.0,
+) -> ConvertedBookResult:
+    """Convert ANY PDF (both text PDFs and 0-text scanned PDFs) into a Kindle-valid EPUB3."""
+    max_bytes = int(max_mb * 1024 * 1024) if (max_mb is not None and max_mb > 0) else None
+    pdf_doc = _open_pdf_checked(src)
+    try:
+        meta = pdf_doc.metadata or {}
+        fallback_title = src.stem
+        pdf_title = title_override.strip() or (meta.get("title") or "").strip() or fallback_title
+        pdf_author = author_override.strip() or (meta.get("author") or "").strip()
+        page_count = len(pdf_doc)
+
+        # Render first page cover thumbnail
+        cov_bytes = _render_pdf_cover_jpeg(
+            pdf_doc[0],
+            max_width=720 if (max_bytes is None or max_bytes >= 5 * 1024 * 1024) else 520,
+            quality=65 if (max_bytes is None or max_bytes >= 5 * 1024 * 1024) else 48,
+        )
+        if cov_bytes:
+            cover_out.parent.mkdir(parents=True, exist_ok=True)
+            cover_out.write_bytes(cov_bytes)
+
+        is_scanned, sample_texts, _total_chars = _classify_pdf_document(pdf_doc)
+        if not is_scanned:
+            tight = max_bytes is not None and max_bytes <= 8 * 1024 * 1024
+            res = _reflow_text_pdf_to_epub(
+                pdf_doc,
+                pdf_title=pdf_title,
+                pdf_author=pdf_author,
+                sample_texts=sample_texts,
+                dst=dst,
+                cover_out=cover_out,
+                max_image_width=760 if tight else 1000,
+                image_quality=58 if tight else 76,
+                image_grayscale=tight,
+            )
+            if max_bytes is not None and res.file_size_bytes > max_bytes:
+                tmp_recomp = dst.parent / f".recomp_{uuid.uuid4().hex[:8]}.epub"
+                try:
+                    shutil.copy2(dst, tmp_recomp)
+                    shrunk = recompress_epub_to_budget(tmp_recomp, dst, max_bytes=max_bytes)
+                    res.file_size_bytes = shrunk.file_size_bytes
+                    res.notes = f"{res.notes}；{shrunk.notes}"
+                finally:
+                    tmp_recomp.unlink(missing_ok=True)
+            return res
+
+        # Scanned / image-only PDF -> E-Ink optimized 1-bit PNG EPUB3 with TOC chapters
+        all_indices = list(range(page_count))
+        per_page_budget: float | None = None
+        if max_bytes is not None and page_count > 0:
+            zip_overhead = len(cov_bytes or b"") + page_count * 260 + 49_152
+            usable = max(float(page_count * 2048), max_bytes * 0.90 - zip_overhead)
+            per_page_budget = usable / float(page_count)
+
+        long_px, thr, blend = _select_scan_profile(
+            pdf_doc, all_indices, per_page_budget=per_page_budget, use_png=True
+        )
+        page_ranges = _group_scanned_pdf_page_ranges(pdf_doc, page_count)
+        lang = detect_language("\n".join(sample_texts)) if sample_texts else "zh-CN"
+
+        def _build_scanned_epub(cur_long_px: int, cur_thr: int, cur_blend: float) -> ConvertedBookResult:
+            sections: list[tuple[str, str]] = []
+            section_images: list[list[ProcessedImage]] = []
+            for ch_title, s_p, e_p in page_ranges:
+                ch_parts: list[str] = []
+                ch_imgs: list[ProcessedImage] = []
+                for p_idx in range(s_p, e_p):
+                    png_data = _scanned_page_to_1bit_png_bytes(
+                        pdf_doc[p_idx],
+                        target_long_edge_px=cur_long_px,
+                        threshold=cur_thr,
+                        median_blend=cur_blend,
+                    )
+                    fname = f"images/page_{p_idx + 1:04d}.png"
+                    ch_imgs.append(
+                        ProcessedImage(
+                            original_url=f"pdf://page/{p_idx + 1}",
+                            filename=fname,
+                            media_type="image/png",
+                            data=png_data,
+                        )
+                    )
+                    ch_parts.append(
+                        f'<figure class="pdf-page"><img src="{fname}" alt="第 {p_idx + 1} 页"/></figure>'
+                    )
+                sections.append((ch_title, "\n".join(ch_parts)))
+                section_images.append(ch_imgs)
+
+            approx_dpi = max(50, round(cur_long_px / 10.3))
+            built = _build_epub_from_sections(
+                sections=sections,
+                title=pdf_title,
+                author=pdf_author,
+                language=lang,
+                dst=dst,
+                cover_out=cover_out,
+                notes=f"扫描版 PDF 已转换为墨水屏高清 EPUB3（共 {page_count} 页，{len(sections)} 章，约 {approx_dpi} DPI）",
+                section_images=section_images,
+            )
+            val = validate_epub(dst)
+            if not val.valid:
+                raise RuntimeError(f"生成的扫描版 EPUB 校验失败: {'; '.join(val.errors)}")
+            return built
+
+        result = _build_scanned_epub(long_px, thr, blend)
+        if max_bytes is not None and result.file_size_bytes > max_bytes and long_px > 520:
+            ratio = (max_bytes / float(result.file_size_bytes)) * 0.90
+            next_long_px = max(500, int(long_px * (ratio**0.72)))
+            result = _build_scanned_epub(next_long_px, min(thr, 134), 0.50)
+            if result.file_size_bytes > max_bytes and next_long_px > 460:
+                result = _build_scanned_epub(460, 128, 0.50)
+        return result
+    finally:
+        pdf_doc.close()
+
+
+def convert_epub_to_pdf(
+    src_epub: Path,
+    dst_pdf: Path,
+    *,
+    title: str = "",
+    author: str = "",
+    max_mb: float | None = 10.0,
+) -> ExportedBookArtifact:
+    """Render an EPUB3 book or daily edition into a clean A5 CJK PDF with cover, images & bookmarks."""
+    if not src_epub.exists() or not zipfile.is_zipfile(src_epub):
+        raise ValueError("无效或不存在的 EPUB 文件，无法转换为 PDF")
+
+    chapters = list_epub_chapters(src_epub)
+    if not chapters:
+        raise ValueError("该 EPUB 不包含可排版的章节内容")
+
+    mediabox = pymupdf.paper_rect("a5")  # 420 x 595 pt
+    where = pymupdf.Rect(
+        mediabox.x0 + 28, mediabox.y0 + 32, mediabox.x1 - 28, mediabox.y1 - 32
+    )
+    max_bytes = int(max_mb * 1024 * 1024) if (max_mb is not None and max_mb > 0) else None
+
+    out_doc = pymupdf.open()
+    toc_entries: list[list[Any]] = []
+
+    try:
+        with zipfile.ZipFile(src_epub, "r") as zf:
+            opf_info = _parse_opf_structure(zf)
+            eff_title = title.strip() or (opf_info.title if opf_info else "") or src_epub.stem
+            eff_author = author.strip() or (opf_info.author if opf_info else "")
+            zf_names = {posixpath.normpath(n).lstrip("/"): n for n in zf.namelist()}
+
+            # Insert cover page if present
+            cover_zip_member = opf_info.cover_image_path if opf_info else None
+            if not cover_zip_member and "OEBPS/images/cover.jpg" in zf_names:
+                cover_zip_member = zf_names["OEBPS/images/cover.jpg"]
+            if cover_zip_member and cover_zip_member in zf.namelist():
+                cov_opt = optimize_image_bytes(zf.read(cover_zip_member), max_width=800, quality=72)
+                if cov_opt:
+                    cov_page = out_doc.new_page(width=mediabox.width, height=mediabox.height)
+                    cov_page.insert_image(cov_page.rect, stream=cov_opt)
+
+            # Register raster images into PyMuPDF Archive under normalized zip paths
+            arch = pymupdf.Archive()
+            img_max_w = 760 if (max_bytes is not None and max_bytes <= 8 * 1024 * 1024) else 1000
+            img_qual = 60 if (max_bytes is not None and max_bytes <= 8 * 1024 * 1024) else 76
+            registered_imgs: set[str] = set()
+            for norm_path, orig_name in zf_names.items():
+                ext = Path(norm_path).suffix.lower()
+                if ext in (".jpg", ".jpeg", ".png", ".gif", ".webp"):
+                    raw_img = zf.read(orig_name)
+                    if ext == ".png" and len(raw_img) < 90_000:
+                        # Preserve crisp small/1-bit PNGs (e.g. scanned page or diagram) directly
+                        arch.add(raw_img, norm_path)
+                        registered_imgs.add(norm_path)
+                    else:
+                        opt = optimize_image_bytes(raw_img, max_width=img_max_w, quality=img_qual)
+                        if opt:
+                            arch.add(opt, norm_path)
+                            registered_imgs.add(norm_path)
+
+            story_css = (
+                "body { font-family: sans-serif; font-size: 10.5pt; line-height: 1.68; color: #111; } "
+                "h1 { font-size: 15pt; line-height: 1.35; margin-top: 4pt; margin-bottom: 8pt; } "
+                "h2 { font-size: 12.5pt; line-height: 1.35; margin-top: 10pt; margin-bottom: 5pt; } "
+                "h3 { font-size: 11pt; margin-top: 8pt; margin-bottom: 4pt; } "
+                "p { margin-top: 0; margin-bottom: 7pt; } "
+                "blockquote { margin-left: 12pt; color: #333; } "
+                "img { max-width: 348pt; max-height: 495pt; display: block; margin: 6pt auto; } "
+                "pre, code { font-family: monospace; font-size: 9pt; } "
+            )
+
+            for ch in chapters:
+                fname = str(ch["filename"])
+                ch_title = str(ch["title"] or "章节")
+                raw_html = _decode_html_bytes(zf.read(fname))
+                soup = _parse_xhtml_soup(raw_html)
+
+                for bad in soup.find_all(
+                    ["script", "style", "iframe", "object", "embed", "noscript", "svg"]
+                ):
+                    bad.decompose()
+                for div in list(soup.find_all("div")):
+                    cls_attr = div.get("class")
+                    cls_tokens = (
+                        cls_attr if isinstance(cls_attr, list) else str(cls_attr or "").split()
+                    )
+                    if "chapter-nav" in cls_tokens or "qr-footer" in cls_tokens:
+                        div.decompose()
+
+                for img in list(soup.find_all("img")):
+                    src = str(img.get("src") or "").strip()
+                    resolved = _resolve_epub_path(fname, src) if src else ""
+                    if resolved in registered_imgs:
+                        img["src"] = resolved
+                        for attr in list(img.attrs.keys()):
+                            if attr not in ("src", "alt"):
+                                img.attrs.pop(attr, None)
+                    else:
+                        img.decompose()
+
+                body = soup.body if soup.body else soup
+                body_inner = body.decode_contents().strip()
+                if not body_inner:
+                    continue
+                if not _starts_with_h1(body_inner):
+                    body_inner = f"<h1>{html_escape.escape(ch_title)}</h1>\n{body_inner}"
+
+                doc_html = (
+                    f"<!DOCTYPE html><html><head><meta charset='utf-8'/>"
+                    f"<style>{story_css}</style></head><body>{body_inner}</body></html>"
+                )
+                start_page_1based = len(out_doc) + 1
+                ch_buf = io.BytesIO()
+                writer = pymupdf.DocumentWriter(ch_buf)
+                story = pymupdf.Story(html=doc_html, archive=arch)
+                more = 1
+                page_guard = 0
+                max_ch_pages = max(120, len(body_inner) // 80)
+                while more and page_guard < max_ch_pages:
+                    page_guard += 1
+                    dev = writer.begin_page(mediabox)
+                    more, _filled = story.place(where)
+                    story.draw(dev)
+                    writer.end_page()
+                writer.close()
+
+                ch_pdf = pymupdf.open("pdf", ch_buf.getvalue())
+                try:
+                    if len(ch_pdf) > 0:
+                        out_doc.insert_pdf(ch_pdf)
+                        toc_entries.append([1, ch_title[:180], start_page_1based])
+                finally:
+                    ch_pdf.close()
+
+        if len(out_doc) == 0:
+            raise ValueError("转换生成的 PDF 内容为空")
+
+        out_doc.set_metadata(
+            {
+                "title": eff_title,
+                "author": eff_author,
+                "creator": "InkPress EPUB-to-PDF Engine",
+            }
+        )
+        if toc_entries:
+            with contextlib.suppress(Exception):
+                out_doc.set_toc(toc_entries)
+        with contextlib.suppress(Exception):
+            out_doc.subset_fonts()
+
+        dst_pdf.parent.mkdir(parents=True, exist_ok=True)
+        out_doc.save(str(dst_pdf), garbage=4, deflate=True)
+        total_pages = len(out_doc)
+    finally:
+        out_doc.close()
+
+    final_sz = dst_pdf.stat().st_size
+    if max_bytes is not None and final_sz > max_bytes:
+        tmp_src = dst_pdf.parent / f".epub2pdf_{uuid.uuid4().hex[:8]}.pdf"
+        try:
+            shutil.copy2(dst_pdf, tmp_src)
+            shrunk = compress_pdf_file(tmp_src, dst_pdf, max_mb=max_mb)
+            return ExportedBookArtifact(
+                path=dst_pdf,
+                target_format="pdf",
+                file_size_bytes=shrunk.file_size_bytes,
+                chapter_count=total_pages,
+                notes=f"已由 EPUB 排版生成轻量化 PDF（共 {total_pages} 页，{shrunk.file_size_bytes / 1048576:.2f} MB）",
+            )
+        finally:
+            tmp_src.unlink(missing_ok=True)
+
+    return ExportedBookArtifact(
+        path=dst_pdf,
+        target_format="pdf",
+        file_size_bytes=final_sz,
+        chapter_count=total_pages,
+        notes=f"已由 EPUB 排版生成带书签目录的 PDF（共 {total_pages} 页，{final_sz / 1048576:.2f} MB）",
+    )
+
+
+def extract_book_to_txt(
+    src_path: Path,
+    dst_txt: Path,
+    *,
+    title: str = "",
+    author: str = "",
+) -> ExportedBookArtifact:
+    """Extract clean UTF-8 plain text with chapter structure from an EPUB or text PDF."""
+    ext = src_path.suffix.lower()
+    blocks: list[str] = []
+    header_title = title.strip() or src_path.stem
+    blocks.append(header_title)
+    if author.strip():
+        blocks.append(f"作者：{author.strip()}")
+    blocks.append("=" * 40)
+
+    extracted_chars = 0
+    chapter_count = 0
+
+    if ext == ".epub":
+        chapters = list_epub_chapters(src_path)
+        with zipfile.ZipFile(src_path, "r") as zf:
+            for ch in chapters:
+                fname = str(ch["filename"])
+                ch_title = str(ch["title"] or "").strip()
+                soup = _parse_xhtml_soup(_decode_html_bytes(zf.read(fname)))
+                for bad in soup.find_all(["script", "style", "noscript"]):
+                    bad.decompose()
+                for div in list(soup.find_all("div")):
+                    cls_attr = div.get("class")
+                    cls_tokens = (
+                        cls_attr if isinstance(cls_attr, list) else str(cls_attr or "").split()
+                    )
+                    if "chapter-nav" in cls_tokens or "qr-footer" in cls_tokens:
+                        div.decompose()
+                body = soup.body if soup.body else soup
+                paras = [
+                    re.sub(r"\s+", " ", elem.get_text(" ", strip=True)).strip()
+                    for elem in body.find_all(["h1", "h2", "h3", "h4", "p", "li", "blockquote", "pre"])
+                ]
+                paras = [p for p in paras if p]
+                if not paras:
+                    raw_body_txt = body.get_text("\n", strip=True)
+                    if raw_body_txt:
+                        paras = [ln.strip() for ln in raw_body_txt.splitlines() if ln.strip()]
+                if not paras:
+                    continue
+                chapter_count += 1
+                ch_text = "\n\n".join(paras)
+                extracted_chars += len(re.sub(r"\s+", "", ch_text))
+                if ch_title and (not paras or paras[0] != ch_title):
+                    blocks.append(f"\n## {ch_title}\n\n{ch_text}")
+                else:
+                    blocks.append(f"\n{ch_text}")
+    elif ext == ".pdf":
+        pdf_doc = _open_pdf_checked(src_path)
+        try:
+            for p_idx in range(len(pdf_doc)):
+                page_txt = str(pdf_doc[p_idx].get_text("text") or "").strip()
+                if not page_txt:
+                    continue
+                chapter_count += 1
+                extracted_chars += len(re.sub(r"\s+", "", page_txt))
+                blocks.append(f"\n--- 第 {p_idx + 1} 页 ---\n\n{page_txt}")
+        finally:
+            pdf_doc.close()
+    else:
+        raise ValueError(f"不支持从 {ext} 提取纯文本")
+
+    if extracted_chars < 20:
+        raise ValueError(
+            "该文件为扫描图片排版（不含可提取的文字层），无法导出纯文本 TXT；请选择转换为「EPUB 电子书」或「轻量化 PDF」下载。"
+        )
+
+    final_text = "\n".join(blocks).strip() + "\n"
+    dst_txt.parent.mkdir(parents=True, exist_ok=True)
+    dst_txt.write_text(final_text, encoding="utf-8")
+    sz = dst_txt.stat().st_size
+    return ExportedBookArtifact(
+        path=dst_txt,
+        target_format="txt",
+        file_size_bytes=sz,
+        chapter_count=chapter_count,
+        notes=f"已提取 UTF-8 纯文本（约 {extracted_chars} 字）",
+    )
+
+
+async def export_book_format(
+    *,
+    primary_path: Path,
+    original_path: Path | None,
+    output_path: Path,
+    cover_dir: Path,
+    target_format: str,
+    title: str = "",
+    author: str = "",
+    max_mb: float | None = 10.0,
+    existing_mobi_path: Path | None = None,
+) -> ExportedBookArtifact:
+    """Convert/compress a library book into `target_format` ('epub'|'pdf'|'mobi'|'txt') atomically."""
+    fmt = target_format.strip().lower()
+    if fmt not in EXPORTABLE_BOOK_FORMATS:
+        raise ValueError(f"不支持的目标导出格式: {target_format}")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_uid = uuid.uuid4().hex[:10]
+    tmp_out = output_path.parent / f".tmp_export_{tmp_uid}.{fmt}"
+    tmp_aux_epub = output_path.parent / f".tmp_aux_{tmp_uid}.epub"
+    tmp_cov = cover_dir / f".tmp_cov_{tmp_uid}.jpg"
+
+    max_bytes = int(max_mb * 1024 * 1024) if (max_mb is not None and max_mb > 0) else None
+    primary_ext = primary_path.suffix.lower()
+    orig_pdf = (
+        original_path
+        if (original_path is not None and original_path.exists() and original_path.suffix.lower() == ".pdf")
+        else None
+    )
+
+    try:
+        if fmt == "epub":
+            if primary_ext == ".epub" and primary_path.exists():
+                if max_bytes is None or primary_path.stat().st_size <= max_bytes:
+                    await asyncio.to_thread(shutil.copy2, primary_path, tmp_out)
+                    val = await asyncio.to_thread(validate_epub, tmp_out)
+                    art = ExportedBookArtifact(
+                        path=output_path,
+                        target_format="epub",
+                        file_size_bytes=tmp_out.stat().st_size,
+                        chapter_count=val.chapter_count,
+                        notes="Kindle 标准 EPUB3 电子书",
+                    )
+                else:
+                    art = await asyncio.to_thread(
+                        recompress_epub_to_budget, primary_path, tmp_out, max_bytes=max_bytes
+                    )
+            else:
+                src_pdf = orig_pdf or primary_path
+                if not src_pdf.exists() or src_pdf.suffix.lower() != ".pdf":
+                    raise ValueError("未找到可用的源文件进行 EPUB 转换")
+                conv = await asyncio.to_thread(
+                    convert_pdf_to_epub_with_budget,
+                    src_pdf,
+                    tmp_out,
+                    tmp_cov,
+                    title_override=title,
+                    author_override=author,
+                    max_mb=max_mb,
+                )
+                saved_cov: Path | None = None
+                if conv.cover_path and conv.cover_path.exists():
+                    perm_cov = cover_dir / f"export_cov_{tmp_uid}.jpg"
+                    cover_dir.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(conv.cover_path, perm_cov)
+                    saved_cov = perm_cov
+                art = ExportedBookArtifact(
+                    path=output_path,
+                    target_format="epub",
+                    file_size_bytes=conv.file_size_bytes,
+                    chapter_count=conv.chapter_count,
+                    cover_path=saved_cov,
+                    notes=conv.notes,
+                )
+
+        elif fmt == "pdf":
+            if orig_pdf is not None or primary_ext == ".pdf":
+                src_pdf = orig_pdf if orig_pdf is not None else primary_path
+                art = await asyncio.to_thread(
+                    compress_pdf_file, src_pdf, tmp_out, max_mb=max_mb
+                )
+            elif primary_ext == ".epub" and primary_path.exists():
+                art = await asyncio.to_thread(
+                    convert_epub_to_pdf,
+                    primary_path,
+                    tmp_out,
+                    title=title,
+                    author=author,
+                    max_mb=max_mb,
+                )
+            else:
+                raise ValueError("未找到可用的源文件进行 PDF 转换")
+
+        elif fmt == "mobi":
+            if (
+                existing_mobi_path is not None
+                and existing_mobi_path.exists()
+                and existing_mobi_path.stat().st_size > 0
+                and (max_bytes is None or existing_mobi_path.stat().st_size <= max_bytes)
+            ):
+                await asyncio.to_thread(shutil.copy2, existing_mobi_path, tmp_out)
+                art = ExportedBookArtifact(
+                    path=output_path,
+                    target_format="mobi",
+                    file_size_bytes=tmp_out.stat().st_size,
+                    notes="已复用预编译双内核 Kindle MOBI 文件",
+                )
+            else:
+                if not _has_binary("ebook-convert"):
+                    raise RuntimeError(
+                        "当前运行容器未安装 Calibre (ebook-convert)，请确保 inkpress-worker 正常运行后再导出 MOBI"
+                    )
+                if primary_ext == ".epub" and primary_path.exists():
+                    if max_bytes is not None and primary_path.stat().st_size > max_bytes:
+                        await asyncio.to_thread(
+                            recompress_epub_to_budget,
+                            primary_path,
+                            tmp_aux_epub,
+                            max_bytes=max_bytes,
+                        )
+                        epub_for_mobi = tmp_aux_epub
+                    else:
+                        epub_for_mobi = primary_path
+                else:
+                    src_pdf = orig_pdf or primary_path
+                    await asyncio.to_thread(
+                        convert_pdf_to_epub_with_budget,
+                        src_pdf,
+                        tmp_aux_epub,
+                        tmp_cov,
+                        title_override=title,
+                        author_override=author,
+                        max_mb=max_mb or 15.0,
+                    )
+                    epub_for_mobi = tmp_aux_epub
+
+                await _run_calibre_convert(
+                    epub_for_mobi, tmp_out, extra_args=["--mobi-file-type=both"]
+                )
+                art = ExportedBookArtifact(
+                    path=output_path,
+                    target_format="mobi",
+                    file_size_bytes=tmp_out.stat().st_size,
+                    notes=f"已通过 Calibre 生成 KF8+MOBI7 双格式电子书（{tmp_out.stat().st_size / 1048576:.2f} MB）",
+                )
+
+        else:  # fmt == "txt"
+            src_for_txt = (
+                primary_path
+                if (primary_ext == ".epub" and primary_path.exists())
+                else (orig_pdf or primary_path)
+            )
+            art = await asyncio.to_thread(
+                extract_book_to_txt,
+                src_for_txt,
+                tmp_out,
+                title=title,
+                author=author,
+            )
+
+        if not tmp_out.exists() or tmp_out.stat().st_size == 0:
+            raise RuntimeError("转换输出文件为空")
+
+        os.replace(tmp_out, output_path)
+        art.path = output_path
+        art.file_size_bytes = output_path.stat().st_size
+        return art
+    finally:
+        tmp_out.unlink(missing_ok=True)
+        tmp_aux_epub.unlink(missing_ok=True)
+        tmp_cov.unlink(missing_ok=True)
 
 
 def list_epub_chapters(epub_path: Path) -> list[dict[str, object]]:

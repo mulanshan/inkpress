@@ -12,11 +12,17 @@ import pymupdf
 import pytest
 from inkpress.publishing.book_converter import (
     SUPPORTED_BOOK_FORMATS,
+    _render_scanned_page_1bit,
     _run_calibre_convert,
+    compress_pdf_file,
     convert_book_to_kindle_epub,
+    convert_epub_to_pdf,
+    convert_pdf_to_epub_with_budget,
+    extract_book_to_txt,
     list_epub_chapters,
     normalize_epub_for_kindle,
     read_epub_chapter_html,
+    recompress_epub_to_budget,
 )
 from inkpress.publishing.epub_validator import MISSING_NCX_ERROR, validate_epub
 from PIL import Image
@@ -561,3 +567,193 @@ async def test_cbr_rejected_calibre_args_timeout_and_docx_conversion(tmp_path: P
     assert "Pandoc" in pandoc_res.notes
     assert "in-place" in pandoc_res.notes.lower()
     assert validate_epub(pandoc_res.kindle_epub_path).valid
+
+
+def _make_noisy_scan_png(seed: int, size: tuple[int, int] = (900, 1260)) -> bytes:
+    """Create a realistic noisy scanned magazine page PNG (uncompressed ~1MB, JPEG ~250KB)."""
+    img = Image.new("L", size, 238)
+    px = img.load()
+    assert px is not None
+    w, h = size
+    # Simulate paper grain + horizontal lines of dark strokes
+    for y in range(40, h - 40, 22):
+        for x in range(50, w - 50):
+            if ((x * 13 + y * 7 + seed) % 19) < 8:
+                px[x, y] = 25
+                if y + 1 < h:
+                    px[x, y + 1] = 35
+    for y in range(0, h, 3):
+        for x in range(0, w, 3):
+            px[x, y] = max(0, min(255, int(px[x, y]) - ((x * 31 + y * 17 + seed) % 28)))
+    buf = BytesIO()
+    img.save(buf, format="JPEG", quality=92)
+    return buf.getvalue()
+
+
+async def test_scanned_and_text_pdf_compression_and_scanned_pdf_to_epub(tmp_path: Path) -> None:
+    # 1. Multi-page noisy scanned PDF (with RGB cover + 30 pages across 2 malformed-level bookmarks)
+    scanned_pdf = tmp_path / "magazine_scan.pdf"
+    sdoc = pymupdf.open()
+    cov_page = sdoc.new_page(width=540, height=745)
+    cov_page.draw_rect(pymupdf.Rect(0, 0, 540, 745), color=(0.8, 0.2, 0.1), fill=(0.8, 0.2, 0.1))
+    page_jpg_a = _make_noisy_scan_png(1)
+    page_jpg_b = _make_noisy_scan_png(2)
+    for idx in range(29):
+        pg = sdoc.new_page(width=540, height=745)
+        pg.insert_image(pg.rect, stream=page_jpg_a if idx % 2 == 0 else page_jpg_b)
+    sdoc.set_metadata({"title": "1991合订本", "author": "编辑部"})
+    sdoc.set_toc([[1, "第一期", 1], [1, "第二期", 28]])
+    sdoc.save(str(scanned_pdf))
+    sdoc.close()
+
+    orig_size = scanned_pdf.stat().st_size
+    assert orig_size > 400_000
+
+    # Compress scanned PDF strictly under 1.0 MB while preserving page count & TOC bookmarks
+    compact_pdf = tmp_path / "compact.pdf"
+    comp_res = compress_pdf_file(scanned_pdf, compact_pdf, max_mb=1.0)
+    assert compact_pdf.exists()
+    assert comp_res.file_size_bytes <= 1 * 1024 * 1024
+    assert comp_res.file_size_bytes < orig_size
+    with pymupdf.open(str(compact_pdf)) as out_doc:
+        assert len(out_doc) == 30
+        toc = out_doc.get_toc()
+        assert len(toc) == 2
+        assert toc[0][1] == "第一期"
+
+    # Convert 30-page 0-text scanned PDF into Kindle-valid EPUB3 (with automatic <=25p TOC chunking)
+    scanned_epub = tmp_path / "scan_out.epub"
+    scan_cov = tmp_path / "scan_cov.jpg"
+    epub_res = convert_pdf_to_epub_with_budget(
+        scanned_pdf,
+        scanned_epub,
+        scan_cov,
+        max_mb=1.0,
+    )
+    assert scanned_epub.exists()
+    assert epub_res.file_size_bytes <= 1 * 1024 * 1024
+    val = validate_epub(scanned_epub)
+    assert val.valid, f"Scanned PDF -> EPUB failed validation: {val.errors}"
+    # 27 pages in bookmark 1 (>25 -> split into 2 chapters) + 3 pages in bookmark 2 = 3 chapters
+    chapters = list_epub_chapters(scanned_epub)
+    assert len(chapters) == 3
+    assert "第一期 (1/2)" in str(chapters[0]["title"])
+    ch0_html = str(read_epub_chapter_html(scanned_epub, 0, book_id=9)["html"])
+    assert "/api/v1/books/9/asset/OEBPS/images/page_0001.png" in ch0_html
+
+    # 0-text scanned PDF -> TXT must raise friendly ValueError instead of writing empty file
+    with pytest.raises(ValueError, match="文字层"):
+        extract_book_to_txt(scanned_pdf, tmp_path / "should_fail.txt")
+
+    # 2. Vector text PDF with bloated embedded photo -> preserves selectable text while shrinking
+    bloated_text_pdf = tmp_path / "bloated_text.pdf"
+    big_rgb = Image.effect_noise((1600, 1200), 80.0).convert("RGB")
+    big_buf = BytesIO()
+    big_rgb.save(big_buf, format="PNG")
+    tdoc = pymupdf.open()
+    for pno in range(1, 4):
+        tp = tdoc.new_page(width=595, height=842)
+        tp.insert_textbox(
+            pymupdf.Rect(60, 60, 535, 320),
+            (
+                f"Chapter {pno}: Selectable vector text must remain searchable after compression. "
+                * 8
+            ),
+            fontsize=11,
+        )
+        if pno == 1:
+            tp.insert_image(pymupdf.Rect(60, 340, 500, 680), stream=big_buf.getvalue())
+    tdoc.save(str(bloated_text_pdf))
+    tdoc.close()
+    assert bloated_text_pdf.stat().st_size > 1_000_000
+
+    shrunk_text_pdf = tmp_path / "shrunk_text.pdf"
+    t_comp = compress_pdf_file(bloated_text_pdf, shrunk_text_pdf, max_mb=1.0)
+    assert t_comp.file_size_bytes <= 1 * 1024 * 1024
+    assert t_comp.file_size_bytes < bloated_text_pdf.stat().st_size // 2
+    with pymupdf.open(str(shrunk_text_pdf)) as check_tdoc:
+        assert "Selectable vector text must remain searchable" in check_tdoc[0].get_text()
+
+
+async def test_epub_to_pdf_recompress_txt_and_huge_mediabox_guard(tmp_path: Path) -> None:
+    # 1. Build a rich CJK EPUB with embedded illustration, then export to PDF and TXT
+    noise_jpg_buf = BytesIO()
+    Image.effect_noise((1200, 900), 65.0).convert("RGB").save(
+        noise_jpg_buf, format="JPEG", quality=95
+    )
+    src_md = tmp_path / "rich.md"
+    src_md.write_text(
+        "# 第一章 导论\n\n这是一段用于测试 EPUB 转 PDF 与纯文本导出的中文段落内容。\n\n"
+        "## 第二章 深入分析\n\n包含第二章节的详细论述与排版验证。\n",
+        encoding="utf-8",
+    )
+    epub_built = await convert_book_to_kindle_epub(
+        src_md,
+        output_dir=tmp_path / "epubs",
+        cover_dir=tmp_path / "covers",
+        title_override="排版转换测试书",
+        author_override="墨印作者",
+    )
+
+    out_pdf = tmp_path / "from_epub.pdf"
+    pdf_art = convert_epub_to_pdf(
+        epub_built.kindle_epub_path,
+        out_pdf,
+        title="排版转换测试书",
+        author="墨印作者",
+        max_mb=5.0,
+    )
+    assert out_pdf.exists() and pdf_art.file_size_bytes > 0
+    assert pdf_art.file_size_bytes <= 5 * 1024 * 1024
+    with pymupdf.open(str(out_pdf)) as pdoc:
+        full_txt = "\n".join(pdoc[i].get_text() for i in range(len(pdoc)))
+        assert "导论" in full_txt
+        assert len(pdoc.get_toc()) >= 2
+
+    out_txt = tmp_path / "from_epub.txt"
+    txt_art = extract_book_to_txt(
+        epub_built.kindle_epub_path, out_txt, title="排版转换测试书", author="墨印作者"
+    )
+    assert out_txt.exists() and txt_art.file_size_bytes > 0
+    txt_content = out_txt.read_text(encoding="utf-8")
+    assert "排版转换测试书" in txt_content
+    assert "作者：墨印作者" in txt_content
+    assert "深入分析" in txt_content
+
+    # 2. Recompress an oversized EPUB with heavy JPEG asset down under budget
+    heavy_epub = tmp_path / "heavy.epub"
+    with (
+        zipfile.ZipFile(epub_built.kindle_epub_path, "r") as zin,
+        zipfile.ZipFile(heavy_epub, "w") as zout,
+    ):
+        zout.writestr("mimetype", b"application/epub+zip", compress_type=zipfile.ZIP_STORED)
+        for info in zin.infolist():
+            if info.filename == "mimetype":
+                continue
+            if info.filename == "OEBPS/images/cover.jpg":
+                zout.writestr(info.filename, noise_jpg_buf.getvalue(), compress_type=zipfile.ZIP_DEFLATED)
+            else:
+                zout.writestr(info.filename, zin.read(info.filename), compress_type=zipfile.ZIP_DEFLATED)
+
+    orig_heavy = heavy_epub.stat().st_size
+    shrunk_epub = tmp_path / "shrunk.epub"
+    recomp = recompress_epub_to_budget(heavy_epub, shrunk_epub, max_bytes=300_000)
+    assert recomp.file_size_bytes <= 300_000
+    assert recomp.file_size_bytes < orig_heavy
+    assert validate_epub(shrunk_epub).valid
+
+    # 3. Bogus 12000x16000 pt MediaBox page must clamp cleanly without OOM
+    giant_doc = pymupdf.open()
+    gp = giant_doc.new_page(width=12000, height=16000)
+    gp.draw_rect(pymupdf.Rect(1000, 1000, 4000, 4000), color=(0, 0, 0), fill=(0, 0, 0))
+    bw_img = _render_scanned_page_1bit(
+        giant_doc[0], target_long_edge_px=1000, threshold=145, median_blend=0.3
+    )
+    assert max(bw_img.size) <= 1005
+    giant_doc.close()
+
+    # 4. Corrupt PDF raises ValueError cleanly
+    corrupt_pdf = tmp_path / "bad.pdf"
+    corrupt_pdf.write_bytes(b"not-a-pdf")
+    with pytest.raises(ValueError, match="PDF"):
+        compress_pdf_file(corrupt_pdf, tmp_path / "out_bad.pdf", max_mb=5.0)

@@ -948,11 +948,26 @@ async def test_dedup_ledger_refreshes_delivered_at_and_dlq_marks_db_failed(
             original_path="/tmp/p.pdf",
             conversion_status="converting",
         )
-        session.add_all([poison_deliv, poison_book])
+        poison_export_book = Book(
+            kind="uploaded_book",
+            title="Poison Export Book",
+            conversion_status="ready",
+            metadata_json={
+                "exports": {
+                    "pdf_10mb": {
+                        "target_format": "pdf",
+                        "max_mb": 10.0,
+                        "status": "converting",
+                    }
+                }
+            },
+        )
+        session.add_all([poison_deliv, poison_book, poison_export_book])
         await session.commit()
         ed_id = ed.id
         poison_deliv_id = poison_deliv.id
         poison_book_id = poison_book.id
+        poison_exp_book_id = poison_export_book.id
 
     async def noop_sync(_s: Any, _src: Any) -> dict[str, int]:
         return {"new": 0, "skipped": 0, "failed": 0}
@@ -976,6 +991,7 @@ async def test_dedup_ledger_refreshes_delivered_at_and_dlq_marks_db_failed(
             return [
                 {"message_id": "11-0", "consumer": "w1", "time_since_delivered": 400_000, "times_delivered": 3},
                 {"message_id": "12-0", "consumer": "w1", "time_since_delivered": 400_000, "times_delivered": 3},
+                {"message_id": "13-0", "consumer": "w1", "time_since_delivered": 400_000, "times_delivered": 3},
             ]
 
         async def xrange(self, _k: str, min: str, **_kw: Any) -> list[tuple[str, dict[str, str]]]:
@@ -983,8 +999,12 @@ async def test_dedup_ledger_refreshes_delivered_at_and_dlq_marks_db_failed(
                 payload = json.dumps(
                     {"type": "build_and_deliver_edition", "kwargs": {"edition_id": ed_id, "delivery_id": poison_deliv_id}}
                 )
-            else:
+            elif min == "12-0":
                 payload = json.dumps({"type": "convert_book", "kwargs": {"book_id": poison_book_id}})
+            else:
+                payload = json.dumps(
+                    {"type": "export_book", "kwargs": {"book_id": poison_exp_book_id, "target_format": "pdf", "max_mb": 10}}
+                )
             return [(min, {"payload": payload})]
 
         async def xadd(self, *_a: Any, **_kw: Any) -> str:
@@ -1000,9 +1020,13 @@ async def test_dedup_ledger_refreshes_delivered_at_and_dlq_marks_db_failed(
             return 1
 
     evicted = await _reclaim_once(DlqFakeRedis(), "reclaimer-db")  # type: ignore[arg-type]
-    assert evicted == 2
+    assert evicted == 3
     async with factory() as session:
         d_after = await session.get(Delivery, poison_deliv_id)
         b_after = await session.get(Book, poison_book_id)
+        exp_b_after = await session.get(Book, poison_exp_book_id)
         assert d_after is not None and d_after.status == "failed" and "DLQ" in (d_after.error_message or "")
         assert b_after is not None and b_after.conversion_status == "failed" and "DLQ" in (b_after.conversion_error or "")
+        assert exp_b_after is not None
+        exp_state = (exp_b_after.metadata_json or {})["exports"]["pdf_10mb"]
+        assert exp_state["status"] == "failed" and "DLQ" in (exp_state.get("error") or "")

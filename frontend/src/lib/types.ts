@@ -136,6 +136,19 @@ export interface EditionItem {
   sources: EditionSourceLink[];
 }
 
+export type ExportTargetFormat = "epub" | "pdf" | "mobi" | "txt";
+
+export interface BookExportInfo {
+  key: string;
+  target_format: ExportTargetFormat | string;
+  max_mb: number | null;
+  status: "ready" | "converting" | "failed";
+  size_bytes: number;
+  notes: string;
+  error: string | null;
+  updated_at: string | null;
+}
+
 export interface BookItem {
   id: number;
   kind: "edition_issue" | "uploaded_book" | "magazine" | "web_clip";
@@ -145,16 +158,28 @@ export interface BookItem {
   description: string;
   language: string;
   original_format: string;
+  active_format?: string;
+  has_original?: boolean;
+  original_size_bytes?: number;
   file_size_bytes: number;
   conversion_status: "ready" | "converting" | "failed";
   conversion_error: string | null;
   metadata: Record<string, unknown>;
+  exports?: Record<string, BookExportInfo>;
   has_cover: boolean;
   can_read_online: boolean;
   scheduled_push_at: string | null;
   pushed_count: number;
   last_pushed_at: string | null;
   created_at: string;
+}
+
+export interface BookExportResponse {
+  status: "ready" | "converting" | "failed";
+  export_key: string;
+  export?: BookExportInfo;
+  download_url: string;
+  item: BookItem;
 }
 
 export interface DeliveryItem {

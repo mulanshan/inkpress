@@ -1,16 +1,19 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertCircle,
   ArrowLeft,
+  ArrowRightLeft,
   BookOpen,
   CalendarClock,
+  Check,
   ChevronLeft,
   ChevronRight,
   Copy,
   Download,
   ExternalLink,
   List,
+  Loader2,
   Rss,
   RotateCw,
   Send,
@@ -20,7 +23,7 @@ import {
 } from "lucide-react";
 import { apiRequest, copyToClipboard, formatBytes, formatRelativeTime } from "../lib/api";
 import { useReaderAppearance } from "../lib/theme";
-import type { BookItem } from "../lib/types";
+import type { BookExportResponse, BookItem, ExportTargetFormat } from "../lib/types";
 import { ReaderSettingsBar } from "../components/ReaderSettingsBar";
 import { useToast } from "../components/Toast";
 
@@ -30,8 +33,75 @@ interface ChapterMeta {
   title: string;
 }
 
+interface PendingExportJob {
+  bookId: number;
+  bookTitle: string;
+  exportKey: string;
+  downloadUrl: string;
+}
+
 const BOOK_PROGRESS_KEY = "inkpress_book_chapter_v1";
 const UPLOAD_ACCEPT = ".epub,.mobi,.azw3,.azw,.txt,.md,.markdown,.html,.htm,.docx,.pdf,.fb2,.cbz,.rtf";
+const SIZE_LIMIT_OPTIONS: Array<{ label: string; value: number | null }> = [
+  { label: "≤ 5 MB", value: 5 },
+  { label: "≤ 10 MB（推荐）", value: 10 },
+  { label: "≤ 15 MB", value: 15 },
+  { label: "≤ 25 MB", value: 25 },
+  { label: "不限体积", value: null },
+];
+
+const EXPORT_FORMAT_OPTIONS: Array<{
+  id: ExportTargetFormat;
+  title: string;
+  badge: string;
+  desc: string;
+}> = [
+  {
+    id: "epub",
+    title: "EPUB 电子书 (.epub)",
+    badge: "墨水屏 / 在线读",
+    desc: "文字自动重排分章；扫描版 PDF 自动生成高清墨水屏分页 EPUB3",
+  },
+  {
+    id: "pdf",
+    title: "轻量化 PDF (.pdf)",
+    badge: "高压缩省空间",
+    desc: "智能精简图片或墨水屏级黑白扫描高压缩，保留彩色封面与目录书签",
+  },
+  {
+    id: "mobi",
+    title: "Kindle MOBI (.mobi)",
+    badge: "KF8 双内核",
+    desc: "兼容旧款 Kindle 与墨水屏内置浏览器直连下载",
+  },
+  {
+    id: "txt",
+    title: "纯文本 TXT (.txt)",
+    badge: "UTF-8",
+    desc: "提取带章节结构的纯文本（需原书含可提取文字层）",
+  },
+];
+
+function buildClientExportKey(fmt: ExportTargetFormat, maxMb: number | null): string {
+  if (fmt === "txt" || maxMb === null) {
+    return `${fmt}_unlimited`;
+  }
+  return `${fmt}_${maxMb}mb`;
+}
+
+function triggerBrowserDownload(url: string): void {
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.rel = "noopener";
+  anchor.style.display = "none";
+  document.body.appendChild(anchor);
+  anchor.click();
+  window.setTimeout(() => {
+    if (anchor.parentNode) {
+      anchor.parentNode.removeChild(anchor);
+    }
+  }, 1500);
+}
 
 function loadSavedChapter(bookId: number): number {
   try {
@@ -78,6 +148,15 @@ export function LibraryPage() {
   const [reconvertingId, setReconvertingId] = useState<number | null>(null);
   const [scheduleBook, setScheduleBook] = useState<BookItem | null>(null);
   const [scheduleTime, setScheduleTime] = useState("");
+
+  const [exportModalBook, setExportModalBook] = useState<BookItem | null>(null);
+  const [exportFormat, setExportFormat] = useState<ExportTargetFormat>("epub");
+  const [exportMaxMb, setExportMaxMb] = useState<number | null>(10);
+  const [exportSetDefault, setExportSetDefault] = useState(false);
+  const [exportSubmitting, setExportSubmitting] = useState(false);
+  const [exportError, setExportError] = useState("");
+  const [pendingExports, setPendingExports] = useState<PendingExportJob[]>([]);
+  const pollingBusyRef = useRef(false);
 
   const booksQuery = useQuery({
     queryKey: ["books", kindFilter],
@@ -269,6 +348,119 @@ export function LibraryPage() {
       notify(err instanceof Error ? err.message : "删除失败", "error");
     }
   };
+
+  const openExportModal = (book: BookItem) => {
+    const activeFmt = (book.active_format || book.original_format || "epub").toLowerCase();
+    setExportModalBook(book);
+    setExportFormat(activeFmt === "pdf" ? "epub" : "pdf");
+    setExportMaxMb(10);
+    setExportSetDefault(false);
+    setExportError("");
+  };
+
+  const submitExportDownload = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!exportModalBook) return;
+    setExportSubmitting(true);
+    setExportError("");
+    const targetBook = exportModalBook;
+    try {
+      const resp = await apiRequest<BookExportResponse>(`/api/v1/books/${targetBook.id}/export`, {
+        method: "POST",
+        body: JSON.stringify({
+          target_format: exportFormat,
+          max_mb: exportFormat === "txt" ? null : exportMaxMb,
+          set_as_default:
+            (exportFormat === "epub" || exportFormat === "pdf") ? exportSetDefault : false,
+        }),
+      });
+      setExportModalBook(resp.item);
+      await qc.invalidateQueries({ queryKey: ["books"] });
+
+      if (resp.status === "ready") {
+        triggerBrowserDownload(resp.download_url);
+        const sizeLabel = resp.export?.size_bytes ? `（${formatBytes(resp.export.size_bytes)}）` : "";
+        notify(`已准备就绪${sizeLabel}，开始下载`, "success");
+        setExportModalBook(null);
+      } else if (resp.status === "converting") {
+        setPendingExports((prev) => {
+          const filtered = prev.filter(
+            (j) => !(j.bookId === targetBook.id && j.exportKey === resp.export_key),
+          );
+          return [
+            ...filtered,
+            {
+              bookId: targetBook.id,
+              bookTitle: targetBook.title,
+              exportKey: resp.export_key,
+              downloadUrl: resp.download_url,
+            },
+          ];
+        });
+      } else {
+        const errMsg = resp.export?.error || "格式转换失败";
+        setExportError(errMsg);
+        notify(errMsg, "error");
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "发起格式转换失败";
+      setExportError(msg);
+      notify(msg, "error");
+    } finally {
+      setExportSubmitting(false);
+    }
+  };
+
+  useEffect(() => {
+    if (pendingExports.length === 0) return;
+    let cancelled = false;
+    const timer = window.setInterval(async () => {
+      if (cancelled || pollingBusyRef.current) return;
+      pollingBusyRef.current = true;
+      try {
+        for (const job of pendingExports) {
+          if (cancelled) break;
+          try {
+            const res = await apiRequest<BookExportResponse>(
+              `/api/v1/books/${job.bookId}/exports/${job.exportKey}`,
+            );
+            if (cancelled) break;
+            if (res.status === "ready") {
+              setPendingExports((prev) =>
+                prev.filter(
+                  (j) => !(j.bookId === job.bookId && j.exportKey === job.exportKey),
+                ),
+              );
+              await qc.invalidateQueries({ queryKey: ["books"] });
+              setExportModalBook((cur) => (cur && cur.id === job.bookId ? null : cur));
+              triggerBrowserDownload(res.download_url);
+              const sizeStr = res.export?.size_bytes
+                ? `（${formatBytes(res.export.size_bytes)}）`
+                : "";
+              notify(`《${job.bookTitle}》转换完成${sizeStr}，已开始下载`, "success");
+            } else if (res.status === "failed") {
+              setPendingExports((prev) =>
+                prev.filter(
+                  (j) => !(j.bookId === job.bookId && j.exportKey === job.exportKey),
+                ),
+              );
+              const errMsg = res.export?.error || "格式转换失败";
+              setExportError(errMsg);
+              notify(`《${job.bookTitle}》转换失败：${errMsg}`, "error");
+            }
+          } catch {
+            // Transient network hiccup; retry on next poll tick
+          }
+        }
+      } finally {
+        pollingBusyRef.current = false;
+      }
+    }, 1500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [pendingExports, qc, notify]);
 
   const handleReaderContentClick = (e: React.MouseEvent<HTMLDivElement>) => {
     const anchor = (e.target as HTMLElement | null)?.closest("a");
@@ -750,8 +942,17 @@ export function LibraryPage() {
       ) : (
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
           {books.map((book) => {
-            const isPdfDownload =
-              !book.can_read_online && book.original_format.toLowerCase() === "pdf";
+            const activeFmt = (book.active_format || book.original_format || "epub").toLowerCase();
+            const isPdfDownload = !book.can_read_online && activeFmt === "pdf";
+            const isExportingBook = pendingExports.some((j) => j.bookId === book.id);
+            const badgeLabel =
+              book.conversion_status === "ready"
+                ? book.original_format.toLowerCase() === "pdf" && activeFmt === "epub"
+                  ? "PDF · EPUB"
+                  : book.original_format.toUpperCase()
+                : book.conversion_status === "converting"
+                  ? "转码中…"
+                  : "转码失败";
             return (
               <div
                 key={book.id}
@@ -805,11 +1006,7 @@ export function LibraryPage() {
                             : "transparent",
                       }}
                     >
-                      {book.conversion_status === "ready"
-                        ? book.original_format.toUpperCase()
-                        : book.conversion_status === "converting"
-                          ? "转码中…"
-                          : "转码失败"}
+                      {badgeLabel}
                     </span>
                   </div>
 
@@ -845,7 +1042,7 @@ export function LibraryPage() {
                   className="px-4 py-3 border-t flex flex-wrap items-center justify-between gap-2 text-xs"
                   style={{ borderColor: "var(--border-hairline)" }}
                 >
-                  <div className="flex items-center gap-1.5">
+                  <div className="flex flex-wrap items-center gap-1.5">
                     {book.conversion_status === "failed" ? (
                       <button
                         type="button"
@@ -889,6 +1086,30 @@ export function LibraryPage() {
                           <Send className="w-3.5 h-3.5" />
                           <span>推 Kindle</span>
                         </button>
+                        {book.conversion_status === "ready" && (
+                          <button
+                            type="button"
+                            onClick={() => openExportModal(book)}
+                            className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border cursor-pointer"
+                            style={{
+                              borderColor: isExportingBook
+                                ? "var(--accent)"
+                                : "var(--border-hairline)",
+                              backgroundColor: isExportingBook
+                                ? "var(--accent-soft)"
+                                : "var(--bg-canvas)",
+                              color: isExportingBook ? "var(--accent)" : "var(--fg-primary)",
+                            }}
+                            title="转换为 EPUB、10MB 以内轻量化 PDF 等其他格式下载"
+                          >
+                            {isExportingBook ? (
+                              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                            ) : (
+                              <ArrowRightLeft className="w-3.5 h-3.5" />
+                            )}
+                            <span>{isExportingBook ? "转换中…" : "转换下载"}</span>
+                          </button>
+                        )}
                       </>
                     )}
                   </div>
@@ -911,7 +1132,7 @@ export function LibraryPage() {
                         href={`/api/v1/books/${book.id}/download`}
                         className="p-1.5 rounded-lg hover:opacity-80"
                         style={{ color: "var(--fg-secondary)" }}
-                        title={isPdfDownload ? "下载 PDF" : "下载 EPUB"}
+                        title={isPdfDownload ? "直接下载当前 PDF" : "直接下载当前 EPUB"}
                       >
                         <Download className="w-4 h-4" />
                       </a>
@@ -932,6 +1153,276 @@ export function LibraryPage() {
           })}
         </div>
       )}
+
+      {/* Convert to other formats & compress download modal */}
+      {exportModalBook && (() => {
+        const latestModalBook =
+          books.find((b) => b.id === exportModalBook.id) ?? exportModalBook;
+        const selectedKey = buildClientExportKey(exportFormat, exportMaxMb);
+        const cachedInfo = latestModalBook.exports?.[selectedKey];
+        const isCachedReady = cachedInfo?.status === "ready" && cachedInfo.size_bytes > 0;
+        const isJobRunning = pendingExports.some(
+          (j) => j.bookId === latestModalBook.id && j.exportKey === selectedKey,
+        );
+        const curActiveFmt = (
+          latestModalBook.active_format ||
+          latestModalBook.original_format ||
+          "epub"
+        ).toUpperCase();
+
+        return (
+          <div
+            className="fixed inset-0 z-40 bg-black/45 flex items-center justify-center p-4 overflow-y-auto"
+            onClick={(e) => {
+              if (e.target === e.currentTarget && !exportSubmitting) {
+                setExportModalBook(null);
+              }
+            }}
+          >
+            <form
+              onSubmit={submitExportDownload}
+              className="max-w-lg w-full rounded-2xl border p-6 space-y-5 my-8"
+              style={{
+                backgroundColor: "var(--bg-surface)",
+                borderColor: "var(--border-hairline)",
+                boxShadow: "var(--shadow-paper)",
+              }}
+            >
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <p
+                    className="text-[11px] uppercase tracking-[0.16em] mb-1"
+                    style={{ color: "var(--accent)" }}
+                  >
+                    FORMAT CONVERTER &amp; SIZE OPTIMIZER
+                  </p>
+                  <h3 className="font-editorial text-xl font-semibold">转换其他格式下载</h3>
+                  <p
+                    className="text-xs mt-1 truncate"
+                    style={{ color: "var(--fg-secondary)" }}
+                    title={latestModalBook.title}
+                  >
+                    《{latestModalBook.title}》 · 当前 {curActiveFmt} ·{" "}
+                    {formatBytes(latestModalBook.file_size_bytes)}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setExportModalBook(null)}
+                  className="p-1.5 rounded-lg cursor-pointer shrink-0"
+                  style={{ color: "var(--fg-muted)" }}
+                  aria-label="关闭窗口"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              <div>
+                <label
+                  className="block text-xs font-medium mb-2"
+                  style={{ color: "var(--fg-secondary)" }}
+                >
+                  选择目标下载格式
+                </label>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                  {EXPORT_FORMAT_OPTIONS.map((opt) => {
+                    const selected = exportFormat === opt.id;
+                    return (
+                      <button
+                        key={opt.id}
+                        type="button"
+                        onClick={() => {
+                          setExportFormat(opt.id);
+                          setExportError("");
+                        }}
+                        className="text-left rounded-xl border p-3 cursor-pointer flex flex-col justify-between gap-1.5"
+                        style={{
+                          borderColor: selected ? "var(--accent)" : "var(--border-hairline)",
+                          backgroundColor: selected ? "var(--accent-soft)" : "var(--bg-canvas)",
+                        }}
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="font-medium text-xs">{opt.title}</span>
+                          <span
+                            className="text-[10px] px-1.5 py-0.5 rounded-md border shrink-0"
+                            style={{
+                              borderColor: "var(--border-hairline)",
+                              backgroundColor: "var(--bg-surface)",
+                              color: selected ? "var(--accent)" : "var(--fg-muted)",
+                            }}
+                          >
+                            {opt.badge}
+                          </span>
+                        </div>
+                        <p className="text-[11px] leading-relaxed" style={{ color: "var(--fg-secondary)" }}>
+                          {opt.desc}
+                        </p>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {exportFormat !== "txt" && (
+                <div>
+                  <label
+                    className="block text-xs font-medium mb-2"
+                    style={{ color: "var(--fg-secondary)" }}
+                  >
+                    文件体积上限控制
+                  </label>
+                  <div className="flex flex-wrap gap-1.5">
+                    {SIZE_LIMIT_OPTIONS.map((opt) => {
+                      const active = exportMaxMb === opt.value;
+                      return (
+                        <button
+                          key={String(opt.value)}
+                          type="button"
+                          onClick={() => {
+                            setExportMaxMb(opt.value);
+                            setExportError("");
+                          }}
+                          className="text-xs px-3 py-1.5 rounded-lg border cursor-pointer"
+                          style={{
+                            borderColor: active ? "var(--accent)" : "var(--border-hairline)",
+                            backgroundColor: active ? "var(--fg-primary)" : "var(--bg-canvas)",
+                            color: active ? "var(--bg-canvas)" : "var(--fg-secondary)",
+                            fontWeight: active ? 600 : 400,
+                          }}
+                        >
+                          {opt.label}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <p className="text-[11px] mt-1.5" style={{ color: "var(--fg-muted)" }}>
+                    {isCachedReady ? (
+                      <span className="inline-flex items-center gap-1" style={{ color: "var(--accent)" }}>
+                        <Check className="w-3.5 h-3.5" />
+                        <span>
+                          已生成该规格缓存（{formatBytes(cachedInfo.size_bytes)}），点击下方按钮即可秒速下载
+                        </span>
+                      </span>
+                    ) : (
+                      "自适应采样调控图像分辨率与墨水屏二值化清晰度，自动将输出体积压入目标上限以内。"
+                    )}
+                  </p>
+                </div>
+              )}
+
+              {(exportFormat === "epub" || exportFormat === "pdf") && (
+                <label
+                  className="flex items-start gap-2.5 rounded-xl border p-3 text-xs cursor-pointer"
+                  style={{
+                    borderColor: "var(--border-hairline)",
+                    backgroundColor: "var(--bg-canvas)",
+                  }}
+                >
+                  <input
+                    type="checkbox"
+                    checked={exportSetDefault}
+                    onChange={(e) => setExportSetDefault(e.target.checked)}
+                    className="mt-0.5 accent-[var(--accent)]"
+                  />
+                  <span style={{ color: "var(--fg-secondary)" }}>
+                    同时设为该书默认文件（更新卡片体积，供「阅读」、「推 Kindle」与默认下载直接使用；原始上传文件仍安全保留）
+                  </span>
+                </label>
+              )}
+
+              {isJobRunning && (
+                <div
+                  className="rounded-xl border px-3.5 py-3 text-xs flex items-start gap-2.5"
+                  style={{
+                    borderColor: "var(--accent)",
+                    backgroundColor: "var(--accent-soft)",
+                    color: "var(--fg-primary)",
+                  }}
+                >
+                  <Loader2 className="w-4 h-4 animate-spin shrink-0 mt-0.5" style={{ color: "var(--accent)" }} />
+                  <div>
+                    <div className="font-medium">正在后台转换并压缩体积…</div>
+                    <div className="mt-0.5" style={{ color: "var(--fg-secondary)" }}>
+                      多页扫描文档约需 10～25 秒，完成后将自动弹出浏览器下载（即使关闭此窗口也会自动下载）。
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {exportError && (
+                <div
+                  className="rounded-xl border px-3.5 py-2.5 text-xs"
+                  style={{
+                    borderColor: "var(--border-danger)",
+                    backgroundColor: "var(--bg-danger-soft)",
+                    color: "var(--fg-danger)",
+                  }}
+                >
+                  {exportError}
+                </div>
+              )}
+
+              <div
+                className="pt-3 border-t flex flex-wrap items-center justify-between gap-3"
+                style={{ borderColor: "var(--border-hairline)" }}
+              >
+                <div>
+                  {latestModalBook.has_original && (
+                    <a
+                      href={`/api/v1/books/${latestModalBook.id}/download?variant=original`}
+                      className="inline-flex items-center gap-1 text-xs underline underline-offset-2 hover:opacity-80"
+                      style={{ color: "var(--fg-muted)" }}
+                    >
+                      <Download className="w-3.5 h-3.5" />
+                      <span>
+                        下载原始上传文件 (.{latestModalBook.original_format.toUpperCase()}
+                        {latestModalBook.original_size_bytes
+                          ? ` · ${formatBytes(latestModalBook.original_size_bytes)}`
+                          : ""}
+                        )
+                      </span>
+                    </a>
+                  )}
+                </div>
+
+                <div className="flex items-center gap-2 ml-auto">
+                  <button
+                    type="button"
+                    onClick={() => setExportModalBook(null)}
+                    className="px-3.5 py-2 rounded-lg text-xs border cursor-pointer"
+                    style={{ borderColor: "var(--border-hairline)" }}
+                  >
+                    关闭
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={exportSubmitting || isJobRunning}
+                    className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-medium cursor-pointer disabled:opacity-50"
+                    style={{ backgroundColor: "var(--accent)", color: "var(--accent-fg)" }}
+                  >
+                    {exportSubmitting || isJobRunning ? (
+                      <>
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        <span>正在转换…</span>
+                      </>
+                    ) : isCachedReady && !exportSetDefault ? (
+                      <>
+                        <Download className="w-3.5 h-3.5" />
+                        <span>立即下载 ({formatBytes(cachedInfo.size_bytes)})</span>
+                      </>
+                    ) : (
+                      <>
+                        <Download className="w-3.5 h-3.5" />
+                        <span>转换并下载</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+              </div>
+            </form>
+          </div>
+        );
+      })()}
 
       {/* Schedule push modal */}
       {scheduleBook && (

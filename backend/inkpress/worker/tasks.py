@@ -47,6 +47,7 @@ from inkpress.logging import get_logger
 from inkpress.publishing.book_converter import (
     build_companion_kindle_mobi,
     convert_book_to_kindle_epub,
+    export_book_format,
 )
 from inkpress.publishing.epub_builder import EpubChapterInput, build_kindle_edition_epubs
 from inkpress.settings_store import get_ai_config, get_network_config, get_smtp_config
@@ -1467,11 +1468,255 @@ async def run_build_and_deliver_edition_bg(
         logger.warning("bg_edition_error", edition_id=edition_id, err=str(exc))
 
 
+def normalize_export_max_mb(target_format: str, max_mb: float | None) -> float | None:
+    fmt = target_format.strip().lower()
+    if fmt == "txt" or max_mb is None:
+        return None
+    clamped = max(1.0, min(100.0, float(max_mb)))
+    rounded = round(clamped, 1)
+    return float(int(rounded)) if rounded.is_integer() else rounded
+
+
+def make_export_key(target_format: str, max_mb: float | None) -> str:
+    fmt = target_format.strip().lower()
+    norm_mb = normalize_export_max_mb(fmt, max_mb)
+    if norm_mb is None:
+        return f"{fmt}_unlimited"
+    mb_tag = str(int(norm_mb)) if norm_mb.is_integer() else str(norm_mb).replace(".", "_")
+    return f"{fmt}_{mb_tag}mb"
+
+
+def _locate_existing_book_mobi(book: Book, lib_root: Path) -> Path | None:
+    meta = book.metadata_json if isinstance(book.metadata_json, dict) else {}
+    candidates: list[str] = []
+    if meta.get("kindle_mobi_path"):
+        candidates.append(str(meta["kindle_mobi_path"]))
+    if book.kindle_epub_path and book.kindle_epub_path.lower().endswith(".epub"):
+        candidates.append(str(Path(book.kindle_epub_path).with_suffix(".mobi")))
+    epub_parent = (
+        Path(book.kindle_epub_path).resolve().parent if book.kindle_epub_path else None
+    )
+    for cand in candidates:
+        p = Path(cand)
+        if not p.exists():
+            continue
+        resolved = p.resolve()
+        if resolved.is_relative_to(lib_root) or (
+            epub_parent is not None and resolved.parent == epub_parent
+        ):
+            return p
+    return None
+
+
+async def run_export_book(
+    book_id: int,
+    *,
+    target_format: str,
+    max_mb: float | None = 10.0,
+    set_as_default: bool = False,
+) -> dict[str, Any]:
+    settings = get_settings()
+    settings.ensure_storage_dirs()
+    factory = get_session_factory()
+    lib_root = settings.library_data_dir.resolve()
+
+    fmt = target_format.strip().lower()
+    norm_mb = normalize_export_max_mb(fmt, max_mb)
+    export_key = make_export_key(fmt, norm_mb)
+
+    async with factory() as session:
+        book = await session.get(Book, book_id)
+        if book is None:
+            return {"error": "book_not_found", "book_id": book_id}
+        if book.conversion_status != "ready":
+            raise ValueError("该图书尚未完成初始入库转码，请稍后再试")
+
+        primary_path = Path(book.kindle_epub_path) if book.kindle_epub_path else Path("")
+        orig_path = Path(book.original_path) if book.original_path else None
+        existing_mobi = _locate_existing_book_mobi(book, lib_root)
+        book_title = book.title
+        book_author = book.author
+
+        meta = dict(book.metadata_json or {})
+        exports_map = dict(meta.get("exports") or {})
+        exports_map[export_key] = {
+            "target_format": fmt,
+            "max_mb": norm_mb,
+            "status": "converting",
+            "path": str(exports_map.get(export_key, {}).get("path") or ""),
+            "size_bytes": int(exports_map.get(export_key, {}).get("size_bytes") or 0),
+            "notes": "",
+            "error": None,
+            "updated_at": utcnow().isoformat(),
+        }
+        meta["exports"] = exports_map
+        book.metadata_json = meta
+        await session.commit()
+
+    output_path = settings.library_data_dir / "exports" / f"book_{book_id}_{export_key}.{fmt}"
+    await publish_event(
+        "book.export.started",
+        {"book_id": book_id, "export_key": export_key, "target_format": fmt, "max_mb": norm_mb},
+    )
+
+    try:
+        artifact = await export_book_format(
+            primary_path=primary_path,
+            original_path=orig_path,
+            output_path=output_path,
+            cover_dir=settings.library_data_dir / "covers",
+            target_format=fmt,
+            title=book_title,
+            author=book_author,
+            max_mb=norm_mb,
+            existing_mobi_path=existing_mobi,
+        )
+
+        promoted_epub_or_pdf: Path | None = None
+        promoted_mobi: Path | None = None
+        if set_as_default and fmt in ("epub", "pdf"):
+            import shutil as _shutil
+
+            uid = uuid.uuid4().hex[:10]
+            safe_stem = re.sub(r"[^\w\u4e00-\u9fff.-]+", "_", book_title).strip("._")[:80] or f"book_{book_id}"
+            promoted_epub_or_pdf = settings.library_data_dir / "epubs" / f"{safe_stem}_{uid}.{fmt}"
+            promoted_epub_or_pdf.parent.mkdir(parents=True, exist_ok=True)
+            await asyncio.to_thread(_shutil.copy2, artifact.path, promoted_epub_or_pdf)
+            if fmt == "epub":
+                promoted_mobi = await build_companion_kindle_mobi(promoted_epub_or_pdf)
+
+        async with factory() as save_session:
+            book = await save_session.get(Book, book_id)
+            if book is None:
+                artifact.path.unlink(missing_ok=True)
+                if promoted_epub_or_pdf is not None:
+                    promoted_epub_or_pdf.unlink(missing_ok=True)
+                return {"error": "book_not_found", "book_id": book_id}
+
+            updated_meta = dict(book.metadata_json or {})
+            exports_map = dict(updated_meta.get("exports") or {})
+            exports_map[export_key] = {
+                "target_format": fmt,
+                "max_mb": norm_mb,
+                "status": "ready",
+                "path": str(artifact.path),
+                "size_bytes": artifact.file_size_bytes,
+                "notes": artifact.notes,
+                "error": None,
+                "updated_at": utcnow().isoformat(),
+            }
+            updated_meta["exports"] = exports_map
+
+            if artifact.cover_path and artifact.cover_path.exists():
+                if not book.cover_path or not Path(book.cover_path).exists():
+                    book.cover_path = str(artifact.cover_path)
+                else:
+                    artifact.cover_path.unlink(missing_ok=True)
+
+            if fmt == "mobi" and norm_mb is None:
+                updated_meta["kindle_mobi_path"] = str(artifact.path)
+
+            if promoted_epub_or_pdf is not None:
+                old_primary = Path(book.kindle_epub_path) if book.kindle_epub_path else None
+                old_orig = Path(book.original_path).resolve() if book.original_path else None
+                book.kindle_epub_path = str(promoted_epub_or_pdf)
+                book.file_size_bytes = promoted_epub_or_pdf.stat().st_size
+                updated_meta.pop("chapters_cache", None)
+                updated_meta.pop("chapters_cache_sig", None)
+                if artifact.chapter_count > 0:
+                    updated_meta["chapter_count"] = artifact.chapter_count
+                updated_meta["conversion_notes"] = artifact.notes
+                if promoted_mobi is not None:
+                    updated_meta["kindle_mobi_path"] = str(promoted_mobi)
+                elif fmt == "pdf":
+                    updated_meta.pop("kindle_mobi_path", None)
+
+                if (
+                    old_primary is not None
+                    and old_primary.exists()
+                    and old_primary.resolve() != promoted_epub_or_pdf.resolve()
+                    and (old_orig is None or old_primary.resolve() != old_orig)
+                    and old_primary.resolve().is_relative_to((settings.library_data_dir / "epubs").resolve())
+                ):
+                    with contextlib.suppress(OSError):
+                        old_primary.unlink(missing_ok=True)
+
+            book.metadata_json = updated_meta
+            await save_session.commit()
+
+        await publish_event(
+            "book.export.completed",
+            {
+                "book_id": book_id,
+                "export_key": export_key,
+                "target_format": fmt,
+                "size_bytes": artifact.file_size_bytes,
+            },
+        )
+        return {
+            "book_id": book_id,
+            "export_key": export_key,
+            "status": "ready",
+            "size_bytes": artifact.file_size_bytes,
+            "notes": artifact.notes,
+        }
+    except Exception as exc:
+        async with factory() as err_session:
+            try:
+                book = await err_session.get(Book, book_id)
+                if book is not None:
+                    err_meta = dict(book.metadata_json or {})
+                    exports_map = dict(err_meta.get("exports") or {})
+                    exports_map[export_key] = {
+                        "target_format": fmt,
+                        "max_mb": norm_mb,
+                        "status": "failed",
+                        "path": "",
+                        "size_bytes": 0,
+                        "notes": "",
+                        "error": str(exc)[:1000],
+                        "updated_at": utcnow().isoformat(),
+                    }
+                    err_meta["exports"] = exports_map
+                    book.metadata_json = err_meta
+                    await err_session.commit()
+            except Exception:
+                await err_session.rollback()
+        await publish_event(
+            "book.export.failed",
+            {"book_id": book_id, "export_key": export_key, "error": str(exc)},
+        )
+        raise
+
+
 async def run_convert_book_bg(book_id: int) -> None:
     try:
         await run_convert_book(book_id)
     except Exception as exc:
         logger.warning("bg_convert_book_error", book_id=book_id, err=str(exc))
+
+
+async def run_export_book_bg(
+    book_id: int,
+    *,
+    target_format: str,
+    max_mb: float | None = 10.0,
+    set_as_default: bool = False,
+) -> None:
+    try:
+        await run_export_book(
+            book_id,
+            target_format=target_format,
+            max_mb=max_mb,
+            set_as_default=set_as_default,
+        )
+    except Exception as exc:
+        logger.warning(
+            "bg_export_book_error",
+            book_id=book_id,
+            target_format=target_format,
+            err=str(exc),
+        )
 
 
 async def run_deliver_book_bg(
@@ -1503,8 +1748,10 @@ class _JobHandle:
             mapped["source_id"] = args[0]
         elif self.job_type == "build_and_deliver_edition" and args:
             mapped["edition_id"] = args[0]
-        elif (self.job_type == "convert_book" and args) or (
-            self.job_type == "deliver_book" and args
+        elif (
+            (self.job_type == "convert_book" and args)
+            or (self.job_type == "deliver_book" and args)
+            or (self.job_type == "export_book" and args)
         ):
             mapped["book_id"] = args[0]
         elif self.job_type == "retry_delivery" and args:
@@ -1516,4 +1763,5 @@ sync_source_task = _JobHandle("sync_source")
 build_and_deliver_edition_task = _JobHandle("build_and_deliver_edition")
 convert_book_task = _JobHandle("convert_book")
 deliver_book_task = _JobHandle("deliver_book")
+export_book_task = _JobHandle("export_book")
 retry_delivery_task = _JobHandle("retry_delivery")

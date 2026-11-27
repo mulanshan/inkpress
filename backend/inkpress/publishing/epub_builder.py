@@ -106,6 +106,13 @@ figure {
   margin: 1em 0;
   text-align: center;
 }
+figure.pdf-page {
+  margin: 0.35em 0;
+  page-break-inside: avoid;
+}
+figure.pdf-page img {
+  margin: 0 auto;
+}
 figcaption {
   font-size: 0.82em;
   color: #666666;

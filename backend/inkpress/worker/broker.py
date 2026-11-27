@@ -104,3 +104,18 @@ async def get_stream_queue_depth(client: aioredis.Redis) -> int:
         return int(await client.xlen(JOBS_STREAM_KEY))
     except Exception:
         return 0
+
+
+async def has_live_worker(*, require_calibre: bool = False) -> bool:
+    """Return True if an active `inkpress-worker` published a fresh heartbeat in Redis."""
+    try:
+        client = aioredis.from_url(get_settings().redis_url, decode_responses=True)
+        try:
+            hb = await read_worker_heartbeat(client)
+            if not hb:
+                return False
+            return not (require_calibre and not hb.get("calibre_ebook_convert"))
+        finally:
+            await client.aclose()
+    except Exception:
+        return False

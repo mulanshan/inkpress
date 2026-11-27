@@ -137,6 +137,12 @@ class BookDeliverRequest(BaseModel):
     target_email: str = ""
 
 
+class BookExportRequest(BaseModel):
+    target_format: str = Field(pattern="^(epub|pdf|mobi|txt)$")
+    max_mb: float | None = Field(default=10.0, ge=1.0, le=100.0, allow_inf_nan=False)
+    set_as_default: bool = False
+
+
 class SmtpSettingsUpdate(BaseModel):
     host: str | None = None
     port: int | None = Field(default=None, ge=1, le=65535)

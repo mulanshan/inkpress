@@ -1117,3 +1117,148 @@ async def test_opds_catalog_and_kindle_minimal_direct_download(
     assert r_del_issue.status_code == 200
     assert not issue_mobi.exists()
 
+
+async def test_book_export_other_formats_compress_pdf_promote_and_cleanup(
+    test_client: httpx.AsyncClient, tmp_path: Path
+) -> None:
+    import pymupdf
+    from inkpress.publishing.epub_validator import validate_epub
+
+    headers = await _bootstrap_and_headers(test_client)
+
+    # Create a 6-page scanned PDF inside library_data_dir/originals
+    settings = get_settings()
+    settings.ensure_storage_dirs()
+    orig_pdf = settings.library_data_dir / "originals" / "yanhuang_scan.pdf"
+    active_pdf = settings.library_data_dir / "epubs" / "yanhuang_active.pdf"
+
+    img_buf = io.BytesIO()
+    Image.effect_noise((900, 1250), 55.0).convert("RGB").save(img_buf, format="JPEG", quality=92)
+    doc = pymupdf.open()
+    for _p_idx in range(6):
+        pg = doc.new_page(width=540, height=745)
+        pg.insert_image(pg.rect, stream=img_buf.getvalue())
+    doc.set_toc([[1, "创刊号", 1], [1, "第二期", 4]])
+    doc.save(str(orig_pdf))
+    doc.close()
+    active_pdf.write_bytes(orig_pdf.read_bytes())
+    orig_bytes_len = orig_pdf.stat().st_size
+
+    factory = get_session_factory()
+    async with factory() as session:
+        scan_book = Book(
+            kind="magazine",
+            title="炎黄春秋合订本测试",
+            author="杂志社",
+            original_format="pdf",
+            original_path=str(orig_pdf),
+            kindle_epub_path=str(active_pdf),
+            file_size_bytes=orig_bytes_len,
+            conversion_status="ready",
+        )
+        session.add(scan_book)
+        await session.commit()
+        book_id = scan_book.id
+
+    # 1. Invalid parameters rejected cleanly (422 / 400)
+    r_bad_mb = await test_client.post(
+        f"/api/v1/books/{book_id}/export",
+        headers=headers,
+        json={"target_format": "pdf", "max_mb": 0},
+    )
+    assert r_bad_mb.status_code == 422
+
+    r_bad_fmt = await test_client.post(
+        f"/api/v1/books/{book_id}/export",
+        headers=headers,
+        json={"target_format": "exe", "max_mb": 10},
+    )
+    assert r_bad_fmt.status_code == 422
+
+    r_bad_key = await test_client.get(
+        f"/api/v1/books/{book_id}/exports/BAD-KEY!/download", headers=headers
+    )
+    assert r_bad_key.status_code == 400
+
+    # 2. Scanned 0-text PDF -> TXT returns friendly 400 error
+    r_txt_scan = await test_client.post(
+        f"/api/v1/books/{book_id}/export?inline=true",
+        headers=headers,
+        json={"target_format": "txt"},
+    )
+    assert r_txt_scan.status_code == 400
+    assert "文字层" in r_txt_scan.json()["detail"]
+
+    # 3. Export scanned PDF -> Compact PDF (<= 10 MB)
+    r_exp_pdf = await test_client.post(
+        f"/api/v1/books/{book_id}/export?inline=true",
+        headers=headers,
+        json={"target_format": "pdf", "max_mb": 10},
+    )
+    assert r_exp_pdf.status_code == 200
+    pdf_data = r_exp_pdf.json()
+    assert pdf_data["status"] == "ready"
+    assert pdf_data["export_key"] == "pdf_10mb"
+    # Public API must NEVER expose server filesystem `path` inside item.exports
+    assert "path" not in pdf_data["item"]["exports"]["pdf_10mb"]
+    assert pdf_data["export"]["size_bytes"] < orig_bytes_len
+    assert pdf_data["export"]["size_bytes"] <= 10 * 1024 * 1024
+
+    r_dl_pdf = await test_client.get(pdf_data["download_url"], headers=headers)
+    assert r_dl_pdf.status_code == 200
+    assert r_dl_pdf.headers["content-type"] == "application/pdf"
+    assert "10MB.pdf" in unquote_header(r_dl_pdf.headers.get("content-disposition", ""))
+    assert r_dl_pdf.content.startswith(b"%PDF")
+
+    # Status polling endpoint returns ready
+    r_poll = await test_client.get(
+        f"/api/v1/books/{book_id}/exports/pdf_10mb", headers=headers
+    )
+    assert r_poll.status_code == 200
+    assert r_poll.json()["status"] == "ready"
+
+    # 4. Export scanned PDF -> Kindle EPUB3 (<= 10 MB) with set_as_default=True
+    r_exp_epub = await test_client.post(
+        f"/api/v1/books/{book_id}/export?inline=true",
+        headers=headers,
+        json={"target_format": "epub", "max_mb": 10, "set_as_default": True},
+    )
+    assert r_exp_epub.status_code == 200
+    epub_payload = r_exp_epub.json()
+    assert epub_payload["status"] == "ready"
+    assert epub_payload["item"]["can_read_online"] is True
+    assert epub_payload["item"]["active_format"] == "epub"
+
+    r_dl_epub = await test_client.get(epub_payload["download_url"], headers=headers)
+    assert r_dl_epub.status_code == 200
+    assert r_dl_epub.headers["content-type"] == "application/epub+zip"
+    saved_dl_epub = tmp_path / "downloaded_scan.epub"
+    saved_dl_epub.write_bytes(r_dl_epub.content)
+    assert validate_epub(saved_dl_epub).valid
+
+    # Online reader chapters now work on the promoted scanned book!
+    r_ch = await test_client.get(f"/api/v1/books/{book_id}/chapters", headers=headers)
+    assert r_ch.status_code == 200
+    assert len(r_ch.json()["chapters"]) == 2
+
+    # Original untouched PDF is still downloadable via ?variant=original!
+    r_orig = await test_client.get(
+        f"/api/v1/books/{book_id}/download?variant=original", headers=headers
+    )
+    assert r_orig.status_code == 200
+    assert len(r_orig.content) == orig_bytes_len
+
+    # 5. Deleting book removes all cached export artifacts from disk
+    export_files_before = list((settings.library_data_dir / "exports").glob(f"book_{book_id}_*"))
+    assert len(export_files_before) == 2
+    r_del = await test_client.delete(f"/api/v1/books/{book_id}", headers=headers)
+    assert r_del.status_code == 200
+    export_files_after = list((settings.library_data_dir / "exports").glob(f"book_{book_id}_*"))
+    assert export_files_after == []
+
+
+def unquote_header(val: str) -> str:
+    from urllib.parse import unquote
+
+    return unquote(val)
+

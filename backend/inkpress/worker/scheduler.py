@@ -147,6 +147,11 @@ async def run_retention_gc(
                 extra_paths = [
                     str(p) for p in (meta.get("volume_paths") or []) if str(p).strip()
                 ]
+                raw_exps = meta.get("exports")
+                if isinstance(raw_exps, dict):
+                    for exp_val in raw_exps.values():
+                        if isinstance(exp_val, dict) and str(exp_val.get("path") or "").strip():
+                            extra_paths.append(str(exp_val["path"]))
                 mobi_hint = str(meta.get("kindle_mobi_path") or "").strip()
                 sidecar_mobi = (
                     str(Path(b.kindle_epub_path).with_suffix(".mobi"))

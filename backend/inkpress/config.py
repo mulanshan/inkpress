@@ -64,7 +64,7 @@ class Settings(BaseSettings):
     ai_enabled: bool = Field(default=False, alias="AI_ENABLED")
 
     def ensure_storage_dirs(self) -> None:
-        for sub in ("originals", "epubs", "covers", "editions", "tmp"):
+        for sub in ("originals", "epubs", "covers", "editions", "tmp", "exports"):
             (self.library_data_dir / sub).mkdir(parents=True, exist_ok=True)
 
 
