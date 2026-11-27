@@ -963,3 +963,74 @@ async def test_timezone_direct_newsnow_handlers_author_cleaning_v2ex_and_dup_has
         await assert_safe_public_url("http://[2001::1f0d:5f21]/")
     with pytest.raises(ValueError, match="Blocked hostname"):
         await assert_safe_public_url("https://rebind-evil.example.com/")
+
+
+async def test_smart_fetch_bytes_proxy_fallback_overseas_cdns_and_cw_boilerplate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from inkpress.ingestion.fetcher import should_use_proxy, smart_fetch_bytes
+
+    # Known overseas image CDNs immediately route via outbound proxy in auto mode
+    assert should_use_proxy("https://storage.googleapis.com/cwg-tw/pic.jpg", "auto", "http://127.0.0.1:7890")
+    assert should_use_proxy("https://i.imgur.com/abc.png", "auto", "http://127.0.0.1:7890")
+    assert should_use_proxy("https://huggingface.co/datasets/x/y.png", "auto", "http://127.0.0.1:7890")
+
+    # Unknown non-domestic image host falls back to outbound_proxy when direct connection fails
+    async def noop_safe(_url: str, **_kw: Any) -> None:
+        return None
+
+    monkeypatch.setattr("inkpress.ingestion.fetcher.assert_safe_public_url", noop_safe)
+    seen_proxies: list[str | None] = []
+
+    class FakeStreamResp:
+        def __init__(self, proxy: str | None) -> None:
+            self.proxy = proxy
+            self.is_redirect = False
+            self.headers = {"content-type": "image/jpeg"}
+            self.url = "https://cdn.unknown-overseas.example/photo.jpg"
+            self.status_code = 200
+
+        async def __aenter__(self) -> FakeStreamResp:
+            if self.proxy is None:
+                raise httpx.ConnectTimeout("Direct connection timed out")
+            return self
+
+        async def __aexit__(self, *_a: Any) -> None:
+            return None
+
+        def raise_for_status(self) -> None:
+            return None
+
+        async def aiter_bytes(self, chunk_size: int = 65536) -> Any:
+            yield b"\xff\xd8\xff\xd9"
+
+    class FakeClient:
+        def __init__(self, *, proxy: str | None = None, **_kw: Any) -> None:
+            self.proxy = proxy
+            seen_proxies.append(proxy)
+
+        async def __aenter__(self) -> FakeClient:
+            return self
+
+        async def __aexit__(self, *_a: Any) -> None:
+            return None
+
+        def stream(self, _method: str, _url: str, **_kw: Any) -> FakeStreamResp:
+            return FakeStreamResp(self.proxy)
+
+    monkeypatch.setattr("inkpress.ingestion.fetcher.httpx.AsyncClient", FakeClient)
+    raw, ctype = await smart_fetch_bytes(
+        "https://cdn.unknown-overseas.example/photo.jpg",
+        use_proxy="auto",
+        outbound_proxy="http://127.0.0.1:7890",
+    )
+    assert raw == b"\xff\xd8\xff\xd9"
+    assert ctype == "image/jpeg"
+    assert seen_proxies == [None, "http://127.0.0.1:7890"]
+
+    # CommonWealth (天下雜誌) paywall CTA lines stripped cleanly
+    cw_html = "<p>天下旗艦訂閱全新上線</p><p>立即訂閱</p><p>這是天下雜誌真實報導第一段內容。</p>"
+    clean_h, clean_p, _ = sanitize_article_html(cw_html)
+    assert "天下旗艦訂閱全新上線" not in clean_h
+    assert "立即訂閱" not in clean_p
+    assert "真實報導第一段內容" in clean_p

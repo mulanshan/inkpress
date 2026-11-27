@@ -899,3 +899,110 @@ async def test_deep_read_reservation_roundup_routing_delta_hotlist_and_archive_g
     await run_retention_gc(now, archive_days=60)
     assert not old_epub.exists()
     assert user_epub.exists()
+
+
+async def test_dedup_ledger_refreshes_delivered_at_and_dlq_marks_db_failed(
+    worker_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    factory = get_session_factory()
+    now = utcnow()
+    async with factory() as session:
+        src = Source(name="Evergreen", kind="webpage", identifier="https://example.com/evergreen")
+        ed = Edition(
+            name="Dedup Refresh Ed",
+            ai_briefing_enabled=False,
+            dedup_window_days=14,
+            retention_days=30,
+            target_emails="kindle@example.com",
+        )
+        session.add_all([src, ed])
+        await session.flush()
+        session.add(EditionSource(edition_id=ed.id, source_id=src.id, sort_order=0))
+        art = Article(
+            source_id=src.id,
+            canonical_url="https://example.com/evergreen",
+            content_hash="eg-1",
+            title="Evergreen Guide",
+            source_name="Evergreen",
+            category="科技",
+            clean_html="<p>Evergreen article body content that stays updated.</p>",
+            plain_text="Evergreen article body content that stays updated.",
+            word_count=200,
+            published_at=now,
+            fetched_at=now,
+        )
+        session.add(art)
+        await session.flush()
+        # Delivered 20 days ago (> dedup_window_days=14, < archive_days=60)
+        session.add(
+            ArticleDelivery(
+                edition_id=ed.id,
+                article_id=art.id,
+                delivered_at=now - timedelta(days=20),
+            )
+        )
+        poison_deliv = Delivery(edition_id=ed.id, title="Poison Edition", status="pending")
+        poison_book = Book(
+            kind="uploaded_book",
+            title="Poison PDF",
+            original_path="/tmp/p.pdf",
+            conversion_status="converting",
+        )
+        session.add_all([poison_deliv, poison_book])
+        await session.commit()
+        ed_id = ed.id
+        poison_deliv_id = poison_deliv.id
+        poison_book_id = poison_book.id
+
+    async def noop_sync(_s: Any, _src: Any) -> dict[str, int]:
+        return {"new": 0, "skipped": 0, "failed": 0}
+
+    async def noop_smtp(**_kw: Any) -> None:
+        return None
+
+    monkeypatch.setattr("inkpress.worker.tasks.sync_source", noop_sync)
+    monkeypatch.setattr("inkpress.worker.tasks.send_ebook_via_smtp", noop_smtp)
+
+    # 1. Re-delivery after 14-day dedup window succeeds ONCE and refreshes delivered_at,
+    #    so an immediate subsequent run skips instead of re-sending endlessly!
+    r1 = await run_build_and_deliver_edition(ed_id, trigger="manual", send_email=True)
+    assert r1["status"] == "sent"
+    r2 = await run_build_and_deliver_edition(ed_id, trigger="manual", send_email=True)
+    assert r2["status"] == "skipped"
+
+    # 2. DLQ eviction transitions linked pending Delivery & converting Book to "failed" in DB!
+    class DlqFakeRedis:
+        async def xpending_range(self, *_a: Any, **_kw: Any) -> list[dict[str, Any]]:
+            return [
+                {"message_id": "11-0", "consumer": "w1", "time_since_delivered": 400_000, "times_delivered": 3},
+                {"message_id": "12-0", "consumer": "w1", "time_since_delivered": 400_000, "times_delivered": 3},
+            ]
+
+        async def xrange(self, _k: str, min: str, **_kw: Any) -> list[tuple[str, dict[str, str]]]:
+            if min == "11-0":
+                payload = json.dumps(
+                    {"type": "build_and_deliver_edition", "kwargs": {"edition_id": ed_id, "delivery_id": poison_deliv_id}}
+                )
+            else:
+                payload = json.dumps({"type": "convert_book", "kwargs": {"book_id": poison_book_id}})
+            return [(min, {"payload": payload})]
+
+        async def xadd(self, *_a: Any, **_kw: Any) -> str:
+            return "dlq-x"
+
+        async def xautoclaim(self, *_a: Any, **_kw: Any) -> tuple[str, list[Any]]:
+            return ("0-0", [])
+
+        async def xack(self, *_a: Any, **_kw: Any) -> int:
+            return 1
+
+        async def xdel(self, *_a: Any, **_kw: Any) -> int:
+            return 1
+
+    evicted = await _reclaim_once(DlqFakeRedis(), "reclaimer-db")  # type: ignore[arg-type]
+    assert evicted == 2
+    async with factory() as session:
+        d_after = await session.get(Delivery, poison_deliv_id)
+        b_after = await session.get(Book, poison_book_id)
+        assert d_after is not None and d_after.status == "failed" and "DLQ" in (d_after.error_message or "")
+        assert b_after is not None and b_after.conversion_status == "failed" and "DLQ" in (b_after.conversion_error or "")

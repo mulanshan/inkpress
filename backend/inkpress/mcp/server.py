@@ -412,17 +412,28 @@ async def _dispatch_tool(session: AsyncSession, name: str, args: dict[str, Any])
         kind = str(args["kind"])
         if kind not in ("newsnow", "rss", "rsshub", "webpage", "webpage_list"):
             raise ValueError(f"Unsupported source kind: {kind}")
+        src_name = str(args["name"]).strip()
+        ident = str(args["identifier"]).strip()
+        if not src_name or not ident:
+            raise ValueError("Source name and identifier must not be empty")
         strategy = str(args.get("fetch_strategy") or "extract_web")
         if strategy not in ("fulltext_rss", "extract_web", "newsnow_digest", "byparr_browser"):
             raise ValueError(f"Unsupported fetch_strategy: {strategy}")
         proxy_mode = str(args.get("use_proxy") or "auto")
         if proxy_mode not in ("auto", "direct", "proxy"):
             raise ValueError(f"Unsupported use_proxy: {proxy_mode}")
+        dup_src = (
+            await session.execute(
+                select(Source).where(Source.kind == kind, Source.identifier == ident)
+            )
+        ).scalar_one_or_none()
+        if dup_src is not None:
+            raise ValueError(f"Source ({kind}, {ident}) already exists (id={dup_src.id})")
         ai_opts = args.get("ai_options")
         src = Source(
-            name=str(args["name"]).strip(),
+            name=src_name,
             kind=kind,
-            identifier=str(args["identifier"]).strip(),
+            identifier=ident,
             category=str(args.get("category") or "综合"),
             fetch_strategy=strategy,
             use_proxy=proxy_mode,
@@ -438,13 +449,32 @@ async def _dispatch_tool(session: AsyncSession, name: str, args: dict[str, Any])
         existing_src = await session.get(Source, int(args["source_id"]))
         if existing_src is None:
             return {"error": "source_not_found"}
+        target_kind = existing_src.kind
+        target_ident = existing_src.identifier
         if "kind" in args and args["kind"] is not None:
             new_kind = str(args["kind"])
             if new_kind not in ("newsnow", "rss", "rsshub", "webpage", "webpage_list"):
                 raise ValueError(f"Unsupported source kind: {new_kind}")
-            existing_src.kind = new_kind
+            target_kind = new_kind
         if "identifier" in args and args["identifier"] is not None:
-            existing_src.identifier = str(args["identifier"]).strip()
+            cleaned_ident = str(args["identifier"]).strip()
+            if not cleaned_ident:
+                raise ValueError("Source identifier must not be empty")
+            target_ident = cleaned_ident
+        if (target_kind != existing_src.kind) or (target_ident != existing_src.identifier):
+            dup_other = (
+                await session.execute(
+                    select(Source).where(
+                        Source.kind == target_kind,
+                        Source.identifier == target_ident,
+                        Source.id != existing_src.id,
+                    )
+                )
+            ).scalar_one_or_none()
+            if dup_other is not None:
+                raise ValueError(f"Source ({target_kind}, {target_ident}) already exists")
+            existing_src.kind = target_kind
+            existing_src.identifier = target_ident
         if "name" in args and args["name"] is not None:
             existing_src.name = str(args["name"]).strip() or existing_src.name
         if "category" in args and args["category"] is not None:

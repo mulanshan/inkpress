@@ -573,3 +573,44 @@ async def test_tall_infographic_slicing_grayscale_landmarks_and_toc_reading_time
         # Both image slices embedded sequentially with class="sliced-img"
         assert 'class="sliced-img"' in ch1_xml
         assert "_p2.jpg" in ch1_xml
+
+
+async def test_include_qr_links_skips_synthetic_local_urls(tmp_path: Path) -> None:
+    vols = await build_kindle_edition_epubs(
+        output_dir=tmp_path,
+        edition_title="二维码过滤测试",
+        subtitle="测试",
+        issue_number=1,
+        issue_date=datetime(2026, 11, 27, 6, 0, tzinfo=UTC),
+        chapters_input=[
+            EpubChapterInput(
+                title="【今日全网图文辑要】",
+                source_name="AI 跨源精编",
+                category="图卦辑要",
+                author="AI",
+                published_at=datetime(2026, 11, 27, 6, 0, tzinfo=UTC),
+                canonical_url="https://inkpress.local/curated/2026-11-27",
+                body_html="<p>合成辑要章节不应生成伪域名二维码。</p>",
+            ),
+            EpubChapterInput(
+                title="外部真实文章",
+                source_name="少数派",
+                category="科技",
+                author="作者",
+                published_at=datetime(2026, 11, 27, 6, 0, tzinfo=UTC),
+                canonical_url="https://sspai.com/post/99999",
+                body_html="<p>真实外部链接应生成二维码。</p>",
+            ),
+        ],
+        include_qr_links=True,
+        download_images=False,
+    )
+    val = validate_epub(vols[0].path)
+    assert val.valid, val.errors
+    with zipfile.ZipFile(vols[0].path, "r") as zf:
+        ch1 = zf.read("OEBPS/ch_001.xhtml").decode("utf-8")
+        ch2 = zf.read("OEBPS/ch_002.xhtml").decode("utf-8")
+        assert "qr-footer" not in ch1
+        assert "images/qr_001.jpg" not in zf.namelist()
+        assert "qr-footer" in ch2
+        assert "OEBPS/images/qr_002.jpg" in zf.namelist()

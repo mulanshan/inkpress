@@ -11,9 +11,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from inkpress.api.deps import get_current_user
-from inkpress.api.schemas import EditionCreate, EditionUpdate
+from inkpress.api.schemas import EditionCreate, EditionSourceLinkIn, EditionUpdate
 from inkpress.db.base import get_db
-from inkpress.db.models import Edition, EditionSource, User
+from inkpress.db.models import Edition, EditionSource, Source, User
 from inkpress.worker.tasks import (
     build_and_deliver_edition_task,
     run_build_and_deliver_edition,
@@ -90,21 +90,55 @@ async def list_editions(
     return {"items": [_edition_dict(e) for e in rows]}
 
 
+def _validate_timezone(tz_name: str) -> str:
+    cleaned = tz_name.strip()
+    try:
+        ZoneInfo(cleaned)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"无效的时区名称: {cleaned}") from exc
+    return cleaned
+
+
+async def _validate_and_dedup_source_links(
+    session: AsyncSession,
+    links: list[EditionSourceLinkIn],
+) -> list[EditionSourceLinkIn]:
+    deduped: list[EditionSourceLinkIn] = []
+    seen: set[int] = set()
+    for link in links:
+        if link.source_id not in seen:
+            seen.add(link.source_id)
+            deduped.append(link)
+    if seen:
+        existing_ids = set(
+            (await session.execute(select(Source.id).where(Source.id.in_(seen)))).scalars().all()
+        )
+        missing = sorted(seen - existing_ids)
+        if missing:
+            raise HTTPException(status_code=400, detail=f"不存在的订阅源 ID: {missing}")
+    return deduped
+
+
 @router.post("", status_code=status.HTTP_201_CREATED)
 async def create_edition(
     payload: EditionCreate,
     _user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
+    cleaned_name = payload.name.strip()
+    if not cleaned_name:
+        raise HTTPException(status_code=400, detail="刊物名称不能为空")
     if not croniter.is_valid(payload.cron_expr):
         raise HTTPException(status_code=400, detail=f"无效的 Cron 表达式: {payload.cron_expr}")
+    valid_tz = _validate_timezone(payload.timezone)
+    valid_links = await _validate_and_dedup_source_links(session, payload.sources)
 
     ed = Edition(
-        name=payload.name.strip(),
+        name=cleaned_name,
         subtitle=payload.subtitle.strip(),
         cover_style=payload.cover_style,
         cron_expr=payload.cron_expr.strip(),
-        timezone=payload.timezone.strip(),
+        timezone=valid_tz,
         lookback_hours=payload.lookback_hours,
         dedup_window_days=payload.dedup_window_days,
         max_articles=payload.max_articles,
@@ -120,7 +154,7 @@ async def create_edition(
     session.add(ed)
     await session.flush()
 
-    for idx, link in enumerate(payload.sources):
+    for idx, link in enumerate(valid_links):
         session.add(
             EditionSource(
                 edition_id=ed.id,
@@ -158,8 +192,16 @@ async def update_edition(
     if ed is None:
         raise HTTPException(status_code=404, detail="Edition not found")
 
+    if payload.name is not None and not payload.name.strip():
+        raise HTTPException(status_code=400, detail="刊物名称不能为空")
     if payload.cron_expr is not None and not croniter.is_valid(payload.cron_expr):
         raise HTTPException(status_code=400, detail=f"无效的 Cron 表达式: {payload.cron_expr}")
+    if payload.timezone is not None:
+        _validate_timezone(payload.timezone)
+
+    valid_links: list[EditionSourceLinkIn] | None = None
+    if payload.sources is not None:
+        valid_links = await _validate_and_dedup_source_links(session, payload.sources)
 
     for field in (
         "name",
@@ -181,12 +223,12 @@ async def update_edition(
     ):
         val = getattr(payload, field)
         if val is not None:
-            setattr(ed, field, val)
+            setattr(ed, field, val.strip() if isinstance(val, str) else val)
 
-    if payload.sources is not None:
+    if valid_links is not None:
         ed.source_links.clear()
         await session.flush()
-        for idx, link in enumerate(payload.sources):
+        for idx, link in enumerate(valid_links):
             ed.source_links.append(
                 EditionSource(
                     edition_id=ed.id,

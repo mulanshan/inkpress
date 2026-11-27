@@ -28,7 +28,7 @@
   - Automatic multi-volume splitting (< 18 MB/vol) with volume-scoped navigation links and stateful multi-volume retry
 - **Email-Free Direct E-Ink Ecosystem**:
   - **OPDS 1.2 Catalog (`/api/v1/opds`)**: Standard Atom OPDS navigation, acquisition, and OpenSearch feeds (HTTP Basic Auth / Token / Session) for KOReader, Onyx Boox, PocketBook, and Foliate
-  - **`/kindle` Minimal Direct-Download Page**: Zero-JS, high-contrast black-on-white HTML bookshelf for one-tap EPUB downloads from Kindle Experimental Browser
+  - **`/kindle` Minimal Direct-Download & Reader Page**: Zero-JS, high-contrast black-on-white HTML bookshelf offering native `.MOBI` direct downloads (bypassing Kindle Experimental Browser's `.epub` filter), `.EPUB` downloads for Kobo/Boox/KOReader, one-tap email push, and an inline paginated HTML chapter reader
 - **Personal Book & Magazine Library**: Upload `EPUB`, `MOBI`, `AZW3`, `TXT`, `Markdown`, `HTML`, `DOCX`, `PDF`, `FB2`, `RTF`, or `CBZ` (streaming upload up to 100 MB) — automatic Kindle EPUB normalization/repair (with in-place `toc.ncx` injection), built-in web reading, immediate push, or scheduled delivery.
 - **AI-Ops Native (MCP Server)**: Built-in Streamable HTTP `POST /api/v1/mcp` JSON-RPC 2.0 server with Bearer Token authentication, `Origin` verification, read-only toggle, and operational tools (`get_health`, `search_articles`, `clip_url`, `update_source`, `update_edition`, `trigger_edition_now`, `retry_delivery`, `validate_book_epub`, etc.).
 

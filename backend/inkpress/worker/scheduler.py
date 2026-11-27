@@ -147,7 +147,20 @@ async def run_retention_gc(
                 extra_paths = [
                     str(p) for p in (meta.get("volume_paths") or []) if str(p).strip()
                 ]
-                for p_str in {b.original_path, b.kindle_epub_path, b.cover_path or "", *extra_paths}:
+                mobi_hint = str(meta.get("kindle_mobi_path") or "").strip()
+                sidecar_mobi = (
+                    str(Path(b.kindle_epub_path).with_suffix(".mobi"))
+                    if b.kindle_epub_path and b.kindle_epub_path.lower().endswith(".epub")
+                    else ""
+                )
+                for p_str in {
+                    b.original_path,
+                    b.kindle_epub_path,
+                    b.cover_path or "",
+                    mobi_hint,
+                    sidecar_mobi,
+                    *extra_paths,
+                }:
                     if p_str:
                         p = Path(p_str)
                         if p.exists():

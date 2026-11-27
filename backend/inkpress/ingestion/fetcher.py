@@ -60,6 +60,12 @@ OVERSEAS_HINTS = (
     "v2ex.com",
     "mktnews.net",
     "fastbull.com",
+    "googleapis.com",
+    "imgur.com",
+    "huggingface.co",
+    "twimg.com",
+    "substackcdn.com",
+    "redd.it",
 )
 
 DOMESTIC_HINTS = (
@@ -505,29 +511,51 @@ async def smart_fetch_bytes(
     if referer:
         headers["Referer"] = referer
 
-    async with httpx.AsyncClient(
-        proxy=proxy,
-        timeout=timeout,
-        follow_redirects=False,
-        verify=False,
-        trust_env=False,
-    ) as client:
-        current_url = url
-        for hop in range(MAX_REDIRECTS + 1):
-            if hop > 0:
-                await assert_safe_public_url(current_url, allow_internal_hosts=allow_internal_hosts)
-            async with client.stream("GET", current_url, headers=headers) as resp:
-                if resp.is_redirect and resp.headers.get("location"):
-                    if hop >= MAX_REDIRECTS:
-                        raise httpx.TooManyRedirects(
-                            f"Exceeded {MAX_REDIRECTS} redirects for {url}",
-                            request=resp.request,
-                        )
-                    current_url = urljoin(str(resp.url), resp.headers["location"])
-                    continue
-                resp.raise_for_status()
-                content_type = resp.headers.get("content-type", "application/octet-stream")
-                raw = await _read_response_limited(resp, max_bytes, str(resp.url))
-                return raw, content_type
+    host = (urlparse(url).hostname or "").strip().lower().rstrip(".")
+    is_domestic = any(_host_matches_domain(host, d) for d in DOMESTIC_HINTS)
+    attempts: list[str | None] = [proxy]
+    if outbound_proxy and proxy is None and use_proxy == "auto" and not is_domestic:
+        attempts.append(outbound_proxy)
 
-    raise RuntimeError(f"Failed to fetch binary {url}: too many redirects")
+    last_exc: Exception | None = None
+    for attempt_proxy in attempts:
+        try:
+            async with httpx.AsyncClient(
+                proxy=attempt_proxy,
+                timeout=timeout,
+                follow_redirects=False,
+                verify=False,
+                trust_env=False,
+            ) as client:
+                current_url = url
+                for hop in range(MAX_REDIRECTS + 1):
+                    if hop > 0:
+                        await assert_safe_public_url(
+                            current_url, allow_internal_hosts=allow_internal_hosts
+                        )
+                    async with client.stream("GET", current_url, headers=headers) as resp:
+                        if resp.is_redirect and resp.headers.get("location"):
+                            if hop >= MAX_REDIRECTS:
+                                raise httpx.TooManyRedirects(
+                                    f"Exceeded {MAX_REDIRECTS} redirects for {url}",
+                                    request=resp.request,
+                                )
+                            current_url = urljoin(str(resp.url), resp.headers["location"])
+                            continue
+                        resp.raise_for_status()
+                        content_type = resp.headers.get("content-type", "application/octet-stream")
+                        raw = await _read_response_limited(resp, max_bytes, str(resp.url))
+                        return raw, content_type
+                raise RuntimeError(f"Failed to fetch binary {url}: too many redirects")
+        except ValueError:
+            raise
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code in (401, 403, 404, 410, 418):
+                raise
+            last_exc = exc
+        except Exception as exc:
+            last_exc = exc
+
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError(f"Failed to fetch binary {url}")

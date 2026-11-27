@@ -463,7 +463,7 @@ async def _run_calibre_convert(src: Path, dst: Path, extra_args: list[str] | Non
         "ebook-convert",
         str(src),
         str(dst),
-        "--epub-version=3",
+        *(["--epub-version=3"] if dst.suffix.lower() == ".epub" else []),
         *(extra_args or []),
     ]
     proc = await asyncio.create_subprocess_exec(
@@ -480,6 +480,48 @@ async def _run_calibre_convert(src: Path, dst: Path, extra_args: list[str] | Non
     if proc.returncode != 0 or not dst.exists():
         err = (stderr or stdout).decode("utf-8", errors="replace")[-800:]
         raise RuntimeError(f"ebook-convert failed (rc={proc.returncode}): {err}")
+
+
+async def build_companion_kindle_mobi(epub_path: Path, *, timeout: float = 120.0) -> Path | None:
+    """Build a dual KF8+MOBI7 `.mobi` companion alongside an `.epub` when Calibre CLI is available.
+
+    Kindle Experimental Browser (firmware >= 5.16.4) blocks `.epub` and `.azw3` direct HTTP
+    downloads and only accepts `.mobi`/`.azw`/`.prc`/`.txt` extensions.
+    """
+    if (
+        not epub_path.exists()
+        or epub_path.suffix.lower() != ".epub"
+        or not _has_binary("ebook-convert")
+    ):
+        return None
+    mobi_path = epub_path.with_suffix(".mobi")
+    cmd = [
+        "ebook-convert",
+        str(epub_path),
+        str(mobi_path),
+        "--mobi-file-type=both",
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except TimeoutError:
+            proc.kill()
+            await proc.wait()
+            mobi_path.unlink(missing_ok=True)
+            logger.warning("companion_mobi_timeout", epub=epub_path.name)
+            return None
+        if proc.returncode == 0 and mobi_path.exists() and mobi_path.stat().st_size > 0:
+            return mobi_path
+        mobi_path.unlink(missing_ok=True)
+    except Exception as exc:
+        mobi_path.unlink(missing_ok=True)
+        logger.warning("companion_mobi_failed", epub=epub_path.name, err=str(exc))
+    return None
 
 
 async def _run_pandoc_docx_to_epub(src: Path, dst: Path, title: str, author: str = "") -> None:
@@ -1660,7 +1702,14 @@ def list_epub_chapters(epub_path: Path) -> list[dict[str, object]]:
     return chapters
 
 
-def read_epub_chapter_html(epub_path: Path, chapter_index: int, book_id: int) -> dict[str, object]:
+def read_epub_chapter_html(
+    epub_path: Path,
+    chapter_index: int,
+    book_id: int,
+    *,
+    asset_url_prefix: str | None = None,
+    asset_query_suffix: str = "",
+) -> dict[str, object]:
     """Return strictly sanitized HTML of an EPUB chapter with rewritten asset & chapter URLs."""
     if not epub_path.exists() or epub_path.suffix.lower() != ".epub":
         raise ValueError(f"EPUB file is unavailable or not an EPUB: {epub_path.name}")
@@ -1676,6 +1725,7 @@ def read_epub_chapter_html(epub_path: Path, chapter_index: int, book_id: int) ->
         posixpath.normpath(str(ch["filename"])).lstrip("/"): int(str(ch["index"]))
         for ch in chapters
     }
+    eff_prefix = (asset_url_prefix or f"/api/v1/books/{book_id}/asset").rstrip("/")
 
     with zipfile.ZipFile(epub_path, "r") as zf:
         zf_names = {posixpath.normpath(n).lstrip("/") for n in zf.namelist()}
@@ -1708,7 +1758,7 @@ def read_epub_chapter_html(epub_path: Path, chapter_index: int, book_id: int) ->
                 if resolved.startswith("..") or resolved not in zf_names:
                     img.decompose()
                     continue
-                img["src"] = f"/api/v1/books/{book_id}/asset/{quote(resolved, safe='/')}"
+                img["src"] = f"{eff_prefix}/{quote(resolved, safe='/')}{asset_query_suffix}"
 
         # Rewrite intra-EPUB chapter links into data-chapter-index attributes
         for a_tag in soup.find_all("a"):

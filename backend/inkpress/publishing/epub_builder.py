@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import qrcode
 from bs4 import BeautifulSoup, Tag
@@ -348,6 +348,17 @@ def _wrap_xhtml_document(
     # Guarantee XML well-formedness before writing to EPUB
     etree.fromstring(raw, parser=_safe_xml_parser())
     return raw
+
+
+def _is_external_scannable_url(url: str) -> bool:
+    """Return True iff URL is a real external HTTP(S) URL suitable for a reader-facing QR code."""
+    parsed = urlparse((url or "").strip())
+    if parsed.scheme.lower() not in ("http", "https"):
+        return False
+    host = (parsed.hostname or "").strip().lower().rstrip(".")
+    if not host or host in ("localhost", "127.0.0.1", "::1"):
+        return False
+    return not (host.endswith(".local") or host.endswith(".localhost"))
 
 
 def _make_qr_jpeg(url: str) -> bytes:
@@ -711,7 +722,7 @@ async def build_kindle_edition_epubs(
         meta_line = html_escape.escape(" · ".join(meta_parts))
 
         qr_block = ""
-        if include_qr_links and ch.canonical_url.startswith(("http://", "https://")):
+        if include_qr_links and _is_external_scannable_url(ch.canonical_url):
             qr_bytes = _make_qr_jpeg(ch.canonical_url)
             qr_name = f"images/qr_{idx:03d}.jpg"
             ch_images.append(

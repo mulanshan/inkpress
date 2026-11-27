@@ -1065,3 +1065,55 @@ async def test_opds_catalog_and_kindle_minimal_direct_download(
     assert "深入理解计算机系统" in r_kindle_auth.text
     assert "重新编译" in r_kindle_auth.text
 
+    # 5. Companion .MOBI direct download (pure ASCII Content-Disposition for Kindle browser),
+    #    OpenSearch absolute URL, SQL LIKE wildcard escaping, and zero-JS /kindle/read/{id} reader!
+    issue_mobi = issue_epub.with_suffix(".mobi")
+    issue_mobi.write_bytes(b"BOOKMOBI-KF8-PAYLOAD")
+
+    r_kindle_with_mobi = await test_client.get("/kindle")
+    assert "直下 Kindle .MOBI" in r_kindle_with_mobi.text
+    assert f"/api/v1/opds/download/{issue_id}/inkpress_{issue_id}.mobi" in r_kindle_with_mobi.text
+
+    r_mobi_dl = await test_client.get(
+        f"/api/v1/opds/download/{issue_id}/inkpress_{issue_id}.mobi", auth=basic_auth
+    )
+    assert r_mobi_dl.status_code == 200
+    assert r_mobi_dl.headers["content-type"] == "application/x-mobipocket-ebook"
+    assert r_mobi_dl.headers["content-disposition"] == f'attachment; filename="inkpress_{issue_id}.mobi"'
+    assert "filename*=" not in r_mobi_dl.headers["content-disposition"]
+    assert r_mobi_dl.content == b"BOOKMOBI-KF8-PAYLOAD"
+
+    r_eds_mobi = await test_client.get("/api/v1/opds/editions", auth=basic_auth)
+    assert "application/x-mobipocket-ebook" in r_eds_mobi.text
+    assert "http://" in r_os.text or "https://" in r_os.text
+
+    # Wildcard '%' in OPDS search must be escaped literally (should NOT match every book)
+    r_pct = await test_client.get("/api/v1/opds/search?q=%25", auth=basic_auth)
+    assert r_pct.status_code == 200
+    assert f"urn:inkpress:book:{shelf_id}" not in r_pct.text
+
+    # Zero-JS inline reader on /kindle/read/{book_id}
+    r_kread = await test_client.get(f"/kindle/read/{issue_id}?ch=0&token={ro_tok}")
+    assert r_kread.status_code == 200
+    assert "<script" not in r_kread.text.lower()
+    assert "全书目录" in r_kread.text
+
+    # Edition validation: invalid timezone & missing source_id return clean 400 (not 500)
+    r_bad_tz = await test_client.patch(
+        f"/api/v1/editions/{ed_id}",
+        headers=headers,
+        json={"timezone": "Mars/Olympus_Mons"},
+    )
+    assert r_bad_tz.status_code == 400
+    r_bad_src = await test_client.patch(
+        f"/api/v1/editions/{ed_id}",
+        headers=headers,
+        json={"sources": [{"source_id": 999999, "sort_order": 0}]},
+    )
+    assert r_bad_src.status_code == 400
+
+    # Deleting book also removes companion .mobi sidecar
+    r_del_issue = await test_client.delete(f"/api/v1/books/{issue_id}", headers=headers)
+    assert r_del_issue.status_code == 200
+    assert not issue_mobi.exists()
+

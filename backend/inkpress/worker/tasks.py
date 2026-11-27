@@ -44,7 +44,10 @@ from inkpress.db.models import (
 from inkpress.delivery.smtp import parse_recipients, send_ebook_via_smtp
 from inkpress.ingestion.service import sync_source
 from inkpress.logging import get_logger
-from inkpress.publishing.book_converter import convert_book_to_kindle_epub
+from inkpress.publishing.book_converter import (
+    build_companion_kindle_mobi,
+    convert_book_to_kindle_epub,
+)
 from inkpress.publishing.epub_builder import EpubChapterInput, build_kindle_edition_epubs
 from inkpress.settings_store import get_ai_config, get_network_config, get_smtp_config
 from inkpress.worker.broker import enqueue_job, publish_event
@@ -186,8 +189,9 @@ async def _record_article_deliveries(
     delivery_id: int,
     article_ids: list[int],
 ) -> None:
-    """Record delivered articles in the dedup ledger while safely skipping existing duplicates."""
-    if not article_ids:
+    """Upsert delivered articles in the dedup ledger, refreshing `delivered_at` on re-delivery."""
+    unique_ids = list(dict.fromkeys(article_ids))
+    if not unique_ids:
         return
     now = utcnow()
     rows = [
@@ -197,14 +201,17 @@ async def _record_article_deliveries(
             "delivery_id": delivery_id,
             "delivered_at": now,
         }
-        for aid in article_ids
+        for aid in unique_ids
     ]
     dialect = session.bind.dialect.name if session.bind is not None else ""
     if dialect == "postgresql":
         stmt = (
             pg_insert(ArticleDelivery)
             .values(rows)
-            .on_conflict_do_nothing(constraint="uq_article_delivery_edition_article")
+            .on_conflict_do_update(
+                constraint="uq_article_delivery_edition_article",
+                set_={"delivery_id": delivery_id, "delivered_at": now},
+            )
         )
         await session.execute(stmt)
         return
@@ -212,25 +219,33 @@ async def _record_article_deliveries(
         stmt_sq = (
             sqlite_insert(ArticleDelivery)
             .values(rows)
-            .on_conflict_do_nothing(index_elements=["edition_id", "article_id"])
+            .on_conflict_do_update(
+                index_elements=["edition_id", "article_id"],
+                set_={"delivery_id": delivery_id, "delivered_at": now},
+            )
         )
         await session.execute(stmt_sq)
         return
 
-    existing = set(
-        (
+    existing_rows = {
+        row.article_id: row
+        for row in (
             await session.execute(
-                select(ArticleDelivery.article_id).where(
+                select(ArticleDelivery).where(
                     ArticleDelivery.edition_id == edition_id,
-                    ArticleDelivery.article_id.in_(article_ids),
+                    ArticleDelivery.article_id.in_(unique_ids),
                 )
             )
         )
         .scalars()
         .all()
-    )
-    for aid in article_ids:
-        if aid not in existing:
+    }
+    for aid in unique_ids:
+        existing_row = existing_rows.get(aid)
+        if existing_row is not None:
+            existing_row.delivery_id = delivery_id
+            existing_row.delivered_at = now
+        else:
             session.add(
                 ArticleDelivery(
                     edition_id=edition_id,
@@ -822,6 +837,9 @@ async def _run_build_and_deliver_edition_unlocked(
             strip_links=ed_strip_links,
             outbound_proxy=net_cfg["outbound_proxy"],
         )
+        mobi_by_epub: dict[Path, Path | None] = {}
+        for vol in volumes:
+            mobi_by_epub[vol.path] = await build_companion_kindle_mobi(vol.path)
         stage_timings["epub_ms"] = int((time.monotonic() - t2) * 1000)
 
         # Phase 6: Archive generated books & attach delivery.book_id + full retry metadata BEFORE SMTP
@@ -835,6 +853,16 @@ async def _run_build_and_deliver_edition_unlocked(
             for vol in volumes:
                 cover_file = settings.library_data_dir / "covers" / f"{vol.path.stem}.jpg"
                 cover_file.write_bytes(vol.cover_bytes)
+                vol_mobi = mobi_by_epub.get(vol.path)
+                vol_meta: dict[str, Any] = {
+                    "issue_number": next_issue,
+                    "volume_index": vol.volume_index,
+                    "total_volumes": vol.total_volumes,
+                    "article_count": vol.article_count,
+                    "is_preview": not send_email,
+                }
+                if vol_mobi is not None:
+                    vol_meta["kindle_mobi_path"] = str(vol_mobi)
                 book = Book(
                     kind="edition_issue",
                     edition_id=edition_id,
@@ -848,13 +876,7 @@ async def _run_build_and_deliver_edition_unlocked(
                     cover_path=str(cover_file),
                     file_size_bytes=vol.size_bytes,
                     conversion_status="ready",
-                    metadata_json={
-                        "issue_number": next_issue,
-                        "volume_index": vol.volume_index,
-                        "total_volumes": vol.total_volumes,
-                        "article_count": vol.article_count,
-                        "is_preview": not send_email,
-                    },
+                    metadata_json=vol_meta,
                 )
                 archive_session.add(book)
                 saved_books.append(book)
@@ -1064,6 +1086,7 @@ async def run_convert_book(book_id: int) -> dict[str, Any]:
             title_override=title_override,
             author_override=author_override,
         )
+        mobi_out = await build_companion_kindle_mobi(res.kindle_epub_path)
         async with factory() as save_session:
             book = await save_session.get(Book, book_id)
             if book is None:
@@ -1080,6 +1103,10 @@ async def run_convert_book(book_id: int) -> dict[str, Any]:
             updated_meta.pop("chapters_cache_sig", None)
             updated_meta["chapter_count"] = res.chapter_count
             updated_meta["conversion_notes"] = res.notes
+            if mobi_out is not None:
+                updated_meta["kindle_mobi_path"] = str(mobi_out)
+            else:
+                updated_meta.pop("kindle_mobi_path", None)
             book.metadata_json = updated_meta
             final_title = book.title
             final_size = book.file_size_bytes

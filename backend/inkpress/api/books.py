@@ -21,14 +21,14 @@ from fastapi import (
     status,
 )
 from fastapi.responses import FileResponse
-from sqlalchemy import desc, select
+from sqlalchemy import desc, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from inkpress.api.deps import get_current_user
 from inkpress.api.schemas import BookDeliverRequest, BookScheduleRequest
 from inkpress.config import get_settings
 from inkpress.db.base import get_db
-from inkpress.db.models import Book, User
+from inkpress.db.models import Book, Delivery, User
 from inkpress.publishing.book_converter import (
     SUPPORTED_BOOK_FORMATS,
     list_epub_chapters,
@@ -416,17 +416,32 @@ async def delete_book(
     if book is None:
         raise HTTPException(status_code=404, detail="Book not found")
     lib_root = get_settings().library_data_dir.resolve()
+    epub_parent = (
+        Path(book.kindle_epub_path).resolve().parent if book.kindle_epub_path else None
+    )
     meta = book.metadata_json if isinstance(book.metadata_json, dict) else {}
+    raw_extra = list(meta.get("volume_paths") or [])
+    if meta.get("kindle_mobi_path"):
+        raw_extra.append(meta["kindle_mobi_path"])
+    if book.kindle_epub_path and book.kindle_epub_path.lower().endswith(".epub"):
+        raw_extra.append(str(Path(book.kindle_epub_path).with_suffix(".mobi")))
     extra_vol_paths = [
         str(p)
-        for p in (meta.get("volume_paths") or [])
-        if str(p).strip() and Path(str(p)).resolve().is_relative_to(lib_root)
+        for p in raw_extra
+        if str(p).strip()
+        and (
+            Path(str(p)).resolve().is_relative_to(lib_root)
+            or (epub_parent is not None and Path(str(p)).resolve().parent == epub_parent)
+        )
     ]
     for p_str in {book.original_path, book.kindle_epub_path, book.cover_path or "", *extra_vol_paths}:
         if p_str:
             p = Path(p_str)
             if p.exists():
                 p.unlink(missing_ok=True)
+    await session.execute(
+        update(Delivery).where(Delivery.book_id == book.id).values(book_id=None)
+    )
     await session.delete(book)
     await session.commit()
     return {"status": "deleted"}

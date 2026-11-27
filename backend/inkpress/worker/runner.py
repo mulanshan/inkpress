@@ -14,7 +14,7 @@ from sqlalchemy import select
 
 from inkpress.config import get_settings
 from inkpress.db.base import get_session_factory
-from inkpress.db.models import Delivery, utcnow
+from inkpress.db.models import Book, Delivery, utcnow
 from inkpress.logging import configure_logging, get_logger
 from inkpress.worker.broker import (
     JOBS_GROUP_NAME,
@@ -73,7 +73,7 @@ async def dispatch_job(job: dict[str, Any]) -> Any:
 
 
 async def recover_stale_running_deliveries(stale_minutes: int = STALE_DELIVERY_MINUTES) -> int:
-    """Mark stale 'running' / 'sending_smtp' deliveries (> stale_minutes old) as failed on startup."""
+    """Mark stale 'pending' / 'running' / 'sending_smtp' deliveries and 'converting' books as failed on startup."""
     factory = get_session_factory()
     now = utcnow()
     cutoff = now - timedelta(minutes=max(1, stale_minutes))
@@ -83,7 +83,7 @@ async def recover_stale_running_deliveries(stale_minutes: int = STALE_DELIVERY_M
             (
                 await session.execute(
                     select(Delivery).where(
-                        Delivery.status.in_(("running", "sending_smtp")),
+                        Delivery.status.in_(("pending", "running", "sending_smtp")),
                         Delivery.created_at < cutoff,
                     )
                 )
@@ -99,10 +99,78 @@ async def recover_stale_running_deliveries(stale_minutes: int = STALE_DELIVERY_M
             )
             delivery.finished_at = now
             recovered += 1
+
+        stale_books = (
+            (
+                await session.execute(
+                    select(Book).where(
+                        Book.conversion_status == "converting",
+                        Book.created_at < cutoff,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for book in stale_books:
+            book.conversion_status = "failed"
+            book.conversion_error = (
+                book.conversion_error
+                or "Worker restarted while book conversion was still in progress (stale recovery)"
+            )
+            recovered += 1
+
         if recovered:
             await session.commit()
             logger.warning("recovered_stale_running_deliveries", count=recovered)
     return recovered
+
+
+async def _mark_evicted_job_failed_in_db(raw_payload: str, times: int) -> None:
+    """Mark any Delivery or Book linked to a poison-pill stream job as failed upon DLQ eviction."""
+    if not raw_payload:
+        return
+    try:
+        parsed = json.loads(raw_payload)
+    except Exception:
+        return
+    if not isinstance(parsed, dict):
+        return
+    job_type = str(parsed.get("type") or "")
+    raw_kw = parsed.get("kwargs")
+    kw: dict[str, Any] = raw_kw if isinstance(raw_kw, dict) else {}
+
+    deliv_id = kw.get("delivery_id")
+    book_id = kw.get("book_id") if job_type == "convert_book" else None
+    if deliv_id is None and book_id is None:
+        return
+
+    try:
+        factory = get_session_factory()
+        now = utcnow()
+        async with factory() as session:
+            dirty = False
+            if deliv_id is not None:
+                deliv = await session.get(Delivery, int(deliv_id))
+                if deliv is not None and deliv.status in ("pending", "running", "sending_smtp"):
+                    deliv.status = "failed"
+                    deliv.error_message = (
+                        f"任务连续异常中断 {times} 次，已移入死信队列 (DLQ)"
+                    )
+                    deliv.finished_at = now
+                    dirty = True
+            if book_id is not None:
+                book = await session.get(Book, int(book_id))
+                if book is not None and book.conversion_status == "converting":
+                    book.conversion_status = "failed"
+                    book.conversion_error = (
+                        f"转码连续异常中断 {times} 次，已移入死信队列 (DLQ)"
+                    )
+                    dirty = True
+            if dirty:
+                await session.commit()
+    except Exception as exc:
+        logger.debug("dlq_db_fail_mark_skipped", err=str(exc))
 
 
 async def _process_stream_entry(
@@ -213,6 +281,7 @@ async def _reclaim_once(
                     maxlen=1000,
                     approximate=True,
                 )
+                await _mark_evicted_job_failed_in_db(str(dlq_fields.get("payload") or ""), times)
                 await client.xack(JOBS_STREAM_KEY, JOBS_GROUP_NAME, mid)
                 await client.xdel(JOBS_STREAM_KEY, mid)
                 evicted += 1
