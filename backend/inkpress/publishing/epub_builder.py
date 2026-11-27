@@ -11,16 +11,17 @@ from pathlib import Path
 from urllib.parse import urljoin
 
 import qrcode
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 from lxml import etree
 from lxml import html as lxml_html
 
+from inkpress.ingestion.extractor import estimate_word_count_and_time
 from inkpress.publishing.cover_generator import generate_editorial_cover
 from inkpress.publishing.epub_validator import validate_epub
 from inkpress.publishing.image_pipeline import ProcessedImage, download_and_optimize_images
 
-MAX_IMAGES_PER_CHAPTER = 20
-MAX_IMAGES_TOTAL = 150
+MAX_IMAGES_PER_CHAPTER = 60
+MAX_IMAGES_TOTAL = 220
 
 KINDLE_PAPER_CSS = """@charset "utf-8";
 body {
@@ -73,7 +74,7 @@ p.bilingual-tr {
   border-left: 2px solid #bbbbbb;
   padding-left: 0.7em;
   text-indent: 0;
-  margin-top: -0.45em;
+  margin-top: 0.2em;
   margin-bottom: 1.1em;
 }
 blockquote {
@@ -97,6 +98,9 @@ img {
   height: auto;
   display: block;
   margin: 0.9em auto;
+}
+img.sliced-img {
+  margin-top: 0.25em;
 }
 figure {
   margin: 1em 0;
@@ -140,6 +144,23 @@ th, td {
   padding-bottom: 0.7em;
   border-bottom: 1px dotted #cccccc;
 }
+.tugua-item {
+  margin-bottom: 1.55em;
+  padding-bottom: 1.05em;
+  border-bottom: 1px dotted #cccccc;
+}
+.tugua-title {
+  font-size: 1.06em;
+  line-height: 1.45;
+  margin: 0 0 0.5em 0;
+  text-indent: 0;
+  text-align: left;
+  page-break-after: avoid;
+}
+.tugua-figure {
+  margin: 0.75em 0 0.35em 0;
+  text-align: center;
+}
 .meta-tag {
   font-size: 0.8em;
   color: #666666;
@@ -163,6 +184,8 @@ class EpubChapterInput:
     ai_summary: str | None = None
     bilingual_html: str | None = None
     language: str = "zh-CN"
+    image_referers: dict[str, str] = field(default_factory=dict)
+    reading_time_min: int | None = None
 
 
 @dataclass
@@ -185,6 +208,7 @@ class _CompiledChapter:
     category: str
     xhtml_bytes: bytes
     images: list[ProcessedImage] = field(default_factory=list)
+    reading_time_min: int = 0
 
 
 @dataclass
@@ -197,6 +221,7 @@ class _DraftChapter:
     language: str
     body_without_nav: str
     images: list[ProcessedImage] = field(default_factory=list)
+    reading_time_min: int = 0
 
     def estimated_bytes(self) -> int:
         return len(self.body_without_nav.encode("utf-8")) + 512 + sum(
@@ -204,11 +229,48 @@ class _DraftChapter:
         )
 
 
+_DEAD_LINK_TEXTS = frozenset({"原文链接", "阅读原文", "查看原文", "点击查看全文", "查看详情"})
+
+
+def _norm_heading_cmp(text: str) -> str:
+    return re.sub(r"[\s\W_]+", "", text, flags=re.UNICODE).lower()
+
+
+def _strip_duplicate_leading_heading(soup: BeautifulSoup, chapter_title: str) -> None:
+    """Remove redundant leading <h1>/<h2>/<h3>/<p> inside extracted HTML that repeats the chapter header."""
+    norm_title = _norm_heading_cmp(chapter_title)
+    if not norm_title:
+        return
+    body = soup.body if soup.body else soup
+    for child in list(body.children):
+        if not isinstance(child, Tag):
+            if str(child).strip():
+                break
+            continue
+        if child.name in ("h1", "h2", "h3", "p") and not child.find("img"):
+            heading_txt = _norm_heading_cmp(child.get_text(strip=True))
+            if heading_txt and heading_txt == norm_title:
+                child.decompose()
+        break
+
+
 def _process_body_links(soup: BeautifulSoup, *, strip_links: bool, base_url: str = "") -> None:
     """Strip or normalize hyperlinks inside article content before building XHTML."""
-    for a_tag in soup.find_all("a"):
+    for a_tag in list(soup.find_all("a")):
         if strip_links:
-            a_tag.unwrap()
+            link_txt = a_tag.get_text(" ", strip=True)
+            parent = a_tag.parent
+            if link_txt in _DEAD_LINK_TEXTS and not a_tag.find("img"):
+                a_tag.decompose()
+                if (
+                    parent is not None
+                    and parent.name == "p"
+                    and not parent.get_text(strip=True)
+                    and not parent.find("img")
+                ):
+                    parent.decompose()
+            else:
+                a_tag.unwrap()
             continue
         href = str(a_tag.get("href") or "").strip()
         if not href:
@@ -336,10 +398,26 @@ def _write_strict_epub_zip(
         ),
     )
 
-    # EPUB3 nav.xhtml
+    def _toc_label(ch: _CompiledChapter) -> str:
+        if ch.reading_time_min > 0:
+            return f"{ch.title}（{ch.reading_time_min} 分钟）"
+        return ch.title
+
+    # EPUB3 nav.xhtml (with estimated reading time & Kindle KFX landmarks)
     nav_items = "\n".join(
-        f'      <li><a href="{ch.filename}#{ch.anchor_id}">{html_escape.escape(ch.title)}</a></li>'
+        f'      <li><a href="{ch.filename}#{ch.anchor_id}">{html_escape.escape(_toc_label(ch))}</a></li>'
         for ch in chapters
+    )
+    bodymatter_href = chapters[0].filename if chapters else "nav.xhtml"
+    landmarks_block = (
+        '  <nav epub:type="landmarks" id="landmarks" hidden="hidden">\n'
+        "    <h2>导览</h2>\n"
+        "    <ol>\n"
+        '      <li><a epub:type="cover" href="cover.xhtml">封面</a></li>\n'
+        '      <li><a epub:type="toc" href="nav.xhtml">目录</a></li>\n'
+        f'      <li><a epub:type="bodymatter" href="{bodymatter_href}">正文</a></li>\n'
+        "    </ol>\n"
+        "  </nav>\n"
     )
     nav_xhtml = (
         '<?xml version="1.0" encoding="utf-8"?>\n'
@@ -357,6 +435,7 @@ def _write_strict_epub_zip(
         f"{nav_items}\n"
         "    </ol>\n"
         "  </nav>\n"
+        f"{landmarks_block}"
         "</body>\n"
         "</html>\n"
     ).encode()
@@ -365,7 +444,7 @@ def _write_strict_epub_zip(
     # EPUB2 toc.ncx
     ncx_points = "\n".join(
         f'    <navPoint id="navPoint-{idx}" playOrder="{idx}">\n'
-        f"      <navLabel><text>{html_escape.escape(ch.title)}</text></navLabel>\n"
+        f"      <navLabel><text>{html_escape.escape(_toc_label(ch))}</text></navLabel>\n"
         f'      <content src="{ch.filename}#{ch.anchor_id}"/>\n'
         "    </navPoint>"
         for idx, ch in enumerate(chapters, start=1)
@@ -495,7 +574,8 @@ async def build_kindle_edition_epubs(
                 src = str(img.get("src") or "").strip()
                 if src.startswith(("http://", "https://")) and src not in seen_in_ch:
                     seen_in_ch.add(src)
-                    ch_urls.append((src, ref))
+                    item_ref = ch.image_referers.get(src, ref)
+                    ch_urls.append((src, item_ref))
                     if len(ch_urls) >= MAX_IMAGES_PER_CHAPTER:
                         break
             per_chapter_img_items.append(ch_urls)
@@ -535,6 +615,7 @@ async def build_kindle_edition_epubs(
         _process_body_links(brief_soup, strip_links=strip_links)
         brief_root = brief_soup.body if brief_soup.body else brief_soup
         safe_brief = _xml_safe_fragment(brief_root.decode_contents())
+        _, brief_mins = estimate_word_count_and_time(brief_soup.get_text(" ", strip=True))
         brief_body = (
             '<h1 id="ch-briefing" class="article-title">今日头版综述</h1>\n'
             f'<div class="article-meta">{html_escape.escape(edition_title)} · 第 {issue_number} 期 · '
@@ -550,6 +631,7 @@ async def build_kindle_edition_epubs(
                 category="导读",
                 language="zh-CN",
                 body_without_nav=brief_body,
+                reading_time_min=brief_mins,
             )
         )
 
@@ -559,20 +641,46 @@ async def build_kindle_edition_epubs(
         ch_images: list[ProcessedImage] = []
         embedded_in_ch = 0
 
-        for img in soup.find_all("img"):
+        for img in list(soup.find_all("img")):
             src = str(img.get("src") or "").strip()
             if src in downloaded and embedded_in_ch < MAX_IMAGES_PER_CHAPTER:
                 pimg = downloaded[src]
                 img["src"] = pimg.filename
                 ch_images.append(pimg)
                 embedded_in_ch += 1
+                if pimg.extra_slices:
+                    anchor_node = img
+                    alt_base = str(img.get("alt") or "").strip()
+                    total_parts = 1 + len(pimg.extra_slices)
+                    for s_idx, s_img in enumerate(pimg.extra_slices, start=2):
+                        if embedded_in_ch >= MAX_IMAGES_PER_CHAPTER:
+                            break
+                        slice_tag = soup.new_tag(
+                            "img",
+                            attrs={
+                                "src": s_img.filename,
+                                "alt": f"{alt_base} ({s_idx}/{total_parts})".strip(),
+                                "class": "sliced-img",
+                            },
+                        )
+                        anchor_node.insert_after(slice_tag)
+                        anchor_node = slice_tag
+                        ch_images.append(s_img)
+                        embedded_in_ch += 1
             else:
                 img.decompose()
 
+        _strip_duplicate_leading_heading(soup, ch.title)
         _process_body_links(soup, strip_links=strip_links, base_url=ch.canonical_url)
 
         body_root = soup.body if soup.body else soup
         safe_body = _xml_safe_fragment(body_root.decode_contents())
+
+        est_minutes = (
+            ch.reading_time_min
+            if (ch.reading_time_min is not None and ch.reading_time_min > 0)
+            else estimate_word_count_and_time(soup.get_text(" ", strip=True))[1]
+        )
 
         anchor_id = f"ch-{idx:03d}-h"
         summary_block = ""
@@ -584,12 +692,18 @@ async def build_kindle_edition_epubs(
                 "</div>\n"
             )
 
+        distinct_author = (
+            ch.author.strip()
+            if ch.author.strip()
+            and ch.author.strip().lower() != (ch.source_name or "").strip().lower()
+            else ""
+        )
         meta_parts = [
             p
             for p in (
                 ch.category,
                 ch.source_name,
-                ch.author,
+                distinct_author,
                 ch.published_at.strftime("%Y-%m-%d %H:%M"),
             )
             if p
@@ -632,6 +746,7 @@ async def build_kindle_edition_epubs(
                 language=ch.language,
                 body_without_nav=body_without_nav,
                 images=ch_images,
+                reading_time_min=est_minutes,
             )
         )
 
@@ -685,6 +800,7 @@ async def build_kindle_edition_epubs(
                         language=draft.language,
                     ),
                     images=draft.images,
+                    reading_time_min=draft.reading_time_min,
                 )
             )
 

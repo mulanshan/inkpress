@@ -744,3 +744,324 @@ async def test_mcp_origin_check_and_new_tools(
     assert r_clip.status_code == 200
     clip_data = json.loads(r_clip.json()["result"]["content"][0]["text"])
     assert clip_data["title"] == "Clipped"
+
+
+async def test_edition_sort_order_ai_options_merge_multivol_delete_and_mcp_validation(
+    test_client: httpx.AsyncClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    headers = await _bootstrap_and_headers(test_client)
+
+    # 1. Create two sources; verify extended ai_options shallow merge (P0-3)
+    r_s1 = await test_client.post(
+        "/api/v1/sources",
+        headers=headers,
+        json={
+            "name": "Zaobao",
+            "kind": "newsnow",
+            "identifier": "zaobao",
+            "ai_options": {"editorial_role": "featured_deep", "custom_flag": True, "drop_me": "old"},
+        },
+    )
+    assert r_s1.status_code == 201
+    s1_id = r_s1.json()["item"]["id"]
+
+    r_s2 = await test_client.post(
+        "/api/v1/sources",
+        headers=headers,
+        json={"name": "ITHome", "kind": "newsnow", "identifier": "ithome"},
+    )
+    assert r_s2.status_code == 201
+    s2_id = r_s2.json()["item"]["id"]
+
+    # Partial ai_options update preserves editorial_role & custom_flag, deletes empty/null keys
+    r_patch_s1 = await test_client.patch(
+        f"/api/v1/sources/{s1_id}",
+        headers=headers,
+        json={"ai_options": {"link_selector": "a.post", "drop_me": ""}},
+    )
+    assert r_patch_s1.status_code == 200
+    merged_opts = r_patch_s1.json()["item"]["ai_options"]
+    assert merged_opts["editorial_role"] == "featured_deep"
+    assert merged_opts["custom_flag"] is True
+    assert merged_opts["link_selector"] == "a.post"
+    assert "drop_me" not in merged_opts
+
+    # 2. Edition sort_order=0 at non-zero index + max_items_override round-trip (P0-2)
+    r_ed = await test_client.post(
+        "/api/v1/editions",
+        headers=headers,
+        json={
+            "name": "Order & Override Test",
+            "cron_expr": "0 7 * * *",
+            "grayscale_images": True,
+            "include_qr_links": False,
+            "sources": [
+                {"source_id": s1_id, "sort_order": 5, "max_items_override": 3},
+                {"source_id": s2_id, "sort_order": 0, "max_items_override": 12},
+            ],
+        },
+    )
+    assert r_ed.status_code == 201
+    ed_item = r_ed.json()["item"]
+    ed_id = ed_item["id"]
+    assert ed_item["grayscale_images"] is True
+    assert ed_item["include_qr_links"] is False
+    # Returned sorted by sort_order ascending -> s2 (0) first, s1 (5) second
+    assert [
+        (s["source_id"], s["sort_order"], s["max_items_override"]) for s in ed_item["sources"]
+    ] == [
+        (s2_id, 0, 12),
+        (s1_id, 5, 3),
+    ]
+
+    # 3. MCP update_source merges ai_options, update_edition validates bounds, trigger_edition_now queues async (P1-9)
+    r_tok = await test_client.post(
+        "/api/v1/settings/mcp-tokens",
+        headers=headers,
+        json={"name": "ops-rw", "readonly": False},
+    )
+    mcp_headers = {"Authorization": f"Bearer {r_tok.json()['token']}"}
+
+    r_mcp_src = await test_client.post(
+        "/api/v1/mcp",
+        headers=mcp_headers,
+        json={
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "tools/call",
+            "params": {
+                "name": "update_source",
+                "arguments": {"source_id": s1_id, "ai_options": {"content_selector": "div.body"}},
+            },
+        },
+    )
+    mcp_src = json.loads(r_mcp_src.json()["result"]["content"][0]["text"])
+    assert mcp_src["ai_options"]["editorial_role"] == "featured_deep"
+    assert mcp_src["ai_options"]["content_selector"] == "div.body"
+
+    # Invalid timezone & out-of-range retention_days rejected cleanly
+    for bad_args in (
+        {"edition_id": ed_id, "timezone": "Mars/Olympus_Mons"},
+        {"edition_id": ed_id, "retention_days": 0},
+        {"edition_id": ed_id, "max_articles": 999},
+    ):
+        r_bad = await test_client.post(
+            "/api/v1/mcp",
+            headers=mcp_headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": 11,
+                "method": "tools/call",
+                "params": {"name": "update_edition", "arguments": bad_args},
+            },
+        )
+        assert r_bad.status_code == 200
+        assert r_bad.json()["result"]["isError"] is True
+
+    async def fake_kiq(*_a: Any, **_kw: Any) -> str:
+        return "1700000-0"
+
+    monkeypatch.setattr("inkpress.mcp.server.build_and_deliver_edition_task.kiq", fake_kiq)
+
+    r_trig = await test_client.post(
+        "/api/v1/mcp",
+        headers=mcp_headers,
+        json={
+            "jsonrpc": "2.0",
+            "id": 12,
+            "method": "tools/call",
+            "params": {
+                "name": "trigger_edition_now",
+                "arguments": {"edition_id": ed_id, "send_email": False, "ignore_dedup": True},
+            },
+        },
+    )
+    assert r_trig.status_code == 200
+    trig_payload = json.loads(r_trig.json()["result"]["content"][0]["text"])
+    assert trig_payload["edition_id"] == ed_id
+    assert isinstance(trig_payload["delivery_id"], int)
+    assert trig_payload["status"] == "queued"
+    assert trig_payload["job_id"] == "1700000-0"
+
+    # 4. Multi-volume Book delete cleans up all volume_paths inside library_data_dir while blocking outside paths (P2-3)
+    epubs_dir = get_settings().library_data_dir / "epubs"
+    epubs_dir.mkdir(parents=True, exist_ok=True)
+    vol1 = epubs_dir / "clip_vol1.epub"
+    vol2 = epubs_dir / "clip_vol2.epub"
+    outside_file = tmp_path / "outside_do_not_delete.txt"
+    _make_sample_epub(vol1)
+    _make_sample_epub(vol2)
+    outside_file.write_text("protected", encoding="utf-8")
+
+    factory = get_session_factory()
+    async with factory() as session:
+        multivol_book = Book(
+            kind="web_clip",
+            title="Multi-Volume Clip",
+            original_format="epub",
+            original_path=str(vol1),
+            kindle_epub_path=str(vol1),
+            file_size_bytes=vol1.stat().st_size,
+            conversion_status="ready",
+            metadata_json={"volume_paths": [str(vol1), str(vol2), str(outside_file)]},
+        )
+        session.add(multivol_book)
+        await session.commit()
+        mv_id = multivol_book.id
+
+    r_del_mv = await test_client.delete(f"/api/v1/books/{mv_id}", headers=headers)
+    assert r_del_mv.status_code == 200
+    assert not vol1.exists()
+    assert not vol2.exists()
+    assert outside_file.exists()
+
+
+async def test_opds_catalog_and_kindle_minimal_direct_download(
+    test_client: httpx.AsyncClient, tmp_path: Path
+) -> None:
+    headers = await _bootstrap_and_headers(test_client)
+    test_client.cookies.clear()
+
+    issue_epub = tmp_path / "morning_issue.epub"
+    book_epub = tmp_path / "my_book.epub"
+    cover_jpg = tmp_path / "cover.jpg"
+    _make_sample_epub(issue_epub)
+    _make_sample_epub(book_epub)
+    buf = io.BytesIO()
+    Image.new("RGB", (20, 30), color=(40, 40, 40)).save(buf, format="JPEG")
+    cover_jpg.write_bytes(buf.getvalue())
+
+    r_ed = await test_client.post(
+        "/api/v1/editions",
+        headers=headers,
+        json={"name": "InkPress 每日精选", "cron_expr": "0 7 * * *"},
+    )
+    ed_id = r_ed.json()["item"]["id"]
+
+    factory = get_session_factory()
+    async with factory() as session:
+        b_issue = Book(
+            kind="edition_issue",
+            title="InkPress 每日精选 · 11月27日",
+            author="InkPress 编辑部",
+            language="zh-CN",
+            description="共收录 20 篇文章",
+            original_format="epub",
+            original_path=str(issue_epub),
+            kindle_epub_path=str(issue_epub),
+            cover_path=str(cover_jpg),
+            file_size_bytes=issue_epub.stat().st_size,
+            conversion_status="ready",
+            metadata_json={"edition_id": ed_id},
+        )
+        b_shelf = Book(
+            kind="uploaded_book",
+            title="深入理解计算机系统",
+            author="Randal E. Bryant",
+            language="zh-CN",
+            description="经典系统教材",
+            original_format="epub",
+            original_path=str(book_epub),
+            kindle_epub_path=str(book_epub),
+            file_size_bytes=book_epub.stat().st_size,
+            conversion_status="ready",
+        )
+        session.add_all([b_issue, b_shelf])
+        await session.commit()
+        issue_id = b_issue.id
+        shelf_id = b_shelf.id
+
+    # 1. Unauthenticated OPDS returns 401 with WWW-Authenticate: Basic
+    r_401 = await test_client.get("/api/v1/opds")
+    assert r_401.status_code == 401
+    assert "Basic" in r_401.headers.get("www-authenticate", "")
+
+    # 2. HTTP Basic Auth works for OPDS navigation, subfeeds, search, cover & download
+    basic_auth = httpx.BasicAuth("admin", "StrongPassword123!")
+    r_root = await test_client.get("/api/v1/opds", auth=basic_auth)
+    assert r_root.status_code == 200
+    assert "application/atom+xml" in r_root.headers["content-type"]
+    assert "/api/v1/opds/editions" in r_root.text
+    assert "/api/v1/opds/opensearch.xml" in r_root.text
+
+    r_os = await test_client.get("/api/v1/opds/opensearch.xml", auth=basic_auth)
+    assert r_os.status_code == 200
+    assert "OpenSearchDescription" in r_os.text
+
+    r_eds = await test_client.get("/api/v1/opds/editions", auth=basic_auth)
+    assert r_eds.status_code == 200
+    assert "InkPress 每日精选 · 11月27日" in r_eds.text
+    assert "深入理解计算机系统" not in r_eds.text
+
+    r_bks = await test_client.get("/api/v1/opds/books", auth=basic_auth)
+    assert r_bks.status_code == 200
+    assert "深入理解计算机系统" in r_bks.text
+    assert "InkPress 每日精选 · 11月27日" not in r_bks.text
+
+    r_search = await test_client.get("/api/v1/opds/search?q=计算机", auth=basic_auth)
+    assert r_search.status_code == 200
+    assert f"urn:inkpress:book:{shelf_id}" in r_search.text
+
+    r_cov = await test_client.get(f"/api/v1/opds/cover/{issue_id}", auth=basic_auth)
+    assert r_cov.status_code == 200
+    assert r_cov.headers["content-type"] == "image/jpeg"
+
+    r_dl = await test_client.get(f"/api/v1/opds/download/{issue_id}", auth=basic_auth)
+    assert r_dl.status_code == 200
+    assert r_dl.headers["content-type"] == "application/epub+zip"
+    assert r_dl.content == issue_epub.read_bytes()
+
+    # 3. Bookmarkable ?token=ink_... propagates across OPDS links & blocks readonly build on /kindle
+    r_ro = await test_client.post(
+        "/api/v1/settings/mcp-tokens",
+        headers=headers,
+        json={"name": "ereader-ro", "readonly": True},
+    )
+    ro_tok = r_ro.json()["token"]
+
+    r_opds_tok = await test_client.get(f"/api/v1/opds/recent?token={ro_tok}")
+    assert r_opds_tok.status_code == 200
+    assert f"/api/v1/opds/download/{issue_id}?token={ro_tok}" in r_opds_tok.text
+
+    r_kindle_ro = await test_client.get(f"/kindle?token={ro_tok}")
+    assert r_kindle_ro.status_code == 200
+    assert "<script" not in r_kindle_ro.text.lower()
+    assert "立即下载最新 EPUB" in r_kindle_ro.text
+    assert "重新编译" not in r_kindle_ro.text
+
+    r_build_ro = await test_client.post(
+        f"/kindle/build/{ed_id}?token={ro_tok}", follow_redirects=False
+    )
+    assert r_build_ro.status_code == 303
+    assert "msg=readonly" in r_build_ro.headers["location"]
+
+    # 4. /kindle login form -> sets session cookie -> renders zero-JS page with build button
+    r_login_get = await test_client.get("/kindle")
+    assert r_login_get.status_code == 200
+    assert 'action="/kindle/login"' in r_login_get.text
+    assert "<script" not in r_login_get.text.lower()
+
+    r_login_bad = await test_client.post(
+        "/kindle/login",
+        data={"username": "admin", "password": "wrong"},
+        follow_redirects=False,
+    )
+    assert r_login_bad.status_code == 401
+
+    r_login_ok = await test_client.post(
+        "/kindle/login",
+        data={"username": "admin", "password": "StrongPassword123!"},
+        follow_redirects=False,
+    )
+    assert r_login_ok.status_code == 303
+    assert r_login_ok.headers["location"] == "/kindle"
+    assert "inkpress_session=" in r_login_ok.headers.get("set-cookie", "")
+
+    test_client.cookies.update(r_login_ok.cookies)
+    r_kindle_auth = await test_client.get("/kindle")
+    assert r_kindle_auth.status_code == 200
+    assert "<script" not in r_kindle_auth.text.lower()
+    assert "InkPress 每日精选 · 11月27日" in r_kindle_auth.text
+    assert "深入理解计算机系统" in r_kindle_auth.text
+    assert "重新编译" in r_kindle_auth.text
+

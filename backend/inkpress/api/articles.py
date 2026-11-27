@@ -101,6 +101,7 @@ async def _push_single_article_to_kindle(
                 ai_summary=article.ai_summary,
                 bilingual_html=article.bilingual_html,
                 language=article.language,
+                reading_time_min=article.reading_time_min,
             )
         ],
         strip_links=True,
@@ -123,7 +124,10 @@ async def _push_single_article_to_kindle(
         cover_path=str(cover_file),
         file_size_bytes=total_size,
         conversion_status="ready",
-        metadata_json={"volume_count": len(vols)},
+        metadata_json={
+            "volume_count": len(vols),
+            "volume_paths": [str(v.path) for v in vols],
+        },
     )
     session.add(book)
     await session.flush()
@@ -133,7 +137,7 @@ async def _push_single_article_to_kindle(
         title=book.title,
         trigger="manual_clip",
         target_email=", ".join(recipients),
-        status="running",
+        status="sending_smtp",
         article_count=1,
         volume_count=len(vols),
         file_size_bytes=total_size,

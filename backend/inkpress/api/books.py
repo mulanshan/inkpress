@@ -415,7 +415,14 @@ async def delete_book(
     book = await session.get(Book, book_id)
     if book is None:
         raise HTTPException(status_code=404, detail="Book not found")
-    for p_str in (book.original_path, book.kindle_epub_path, book.cover_path):
+    lib_root = get_settings().library_data_dir.resolve()
+    meta = book.metadata_json if isinstance(book.metadata_json, dict) else {}
+    extra_vol_paths = [
+        str(p)
+        for p in (meta.get("volume_paths") or [])
+        if str(p).strip() and Path(str(p)).resolve().is_relative_to(lib_root)
+    ]
+    for p_str in {book.original_path, book.kindle_epub_path, book.cover_path or "", *extra_vol_paths}:
         if p_str:
             p = Path(p_str)
             if p.exists():

@@ -9,7 +9,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from inkpress.api.deps import get_current_user
 from inkpress.db.base import get_db
 from inkpress.db.models import User
-from inkpress.ingestion.fetcher import assert_safe_public_url, smart_fetch_bytes
+from inkpress.ingestion.fetcher import (
+    assert_safe_public_url,
+    infer_default_image_referer,
+    smart_fetch_bytes,
+)
 from inkpress.settings_store import get_network_config
 
 router = APIRouter(prefix="/api/v1/media", tags=["media"])
@@ -55,7 +59,7 @@ async def proxy_media_image(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=f"Unsafe media URL: {exc}") from exc
 
-    safe_referer = _sanitize_referer(referer)
+    safe_referer = _sanitize_referer(referer) or infer_default_image_referer(target_url)
     net_cfg = await get_network_config(session)
     outbound_proxy = str(net_cfg.get("outbound_proxy") or "")
 
@@ -70,12 +74,14 @@ async def proxy_media_image(
             max_bytes=MAX_MEDIA_PROXY_BYTES,
         )
     except httpx.HTTPStatusError as exc:
-        if safe_referer and exc.response.status_code in (401, 403):
+        if safe_referer and exc.response.status_code in (401, 403, 418):
+            default_ref = infer_default_image_referer(target_url)
+            fallback_ref = default_ref if (default_ref and default_ref != safe_referer) else ""
             try:
                 data, content_type = await smart_fetch_bytes(
                     target_url,
                     outbound_proxy=outbound_proxy,
-                    referer="",
+                    referer=fallback_ref,
                     timeout=15.0,
                     max_bytes=MAX_MEDIA_PROXY_BYTES,
                 )

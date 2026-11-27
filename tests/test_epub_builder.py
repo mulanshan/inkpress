@@ -23,7 +23,7 @@ from inkpress.publishing.epub_builder import (
     build_kindle_edition_epubs,
 )
 from inkpress.publishing.epub_validator import validate_epub
-from inkpress.publishing.image_pipeline import download_and_optimize_images
+from inkpress.publishing.image_pipeline import download_and_optimize_images, optimize_image_slices
 from PIL import Image, ImageDraw
 
 
@@ -375,12 +375,16 @@ async def test_image_pipeline_per_url_referer_403_retry_and_per_chapter_cap(
         noref_calls = [ref for u, ref in calls if "strict-noref.example.com" in u]
         assert noref_calls == ["https://blog.example.com/post/1", ""]
 
-        # Verify per-chapter cap (20/article) in build_kindle_edition_epubs prevents starvation
+        # Verify per-chapter cap (60/article), per-image image_referers, dead link & duplicate h1 cleanup
         calls.clear()
         ch1_imgs = "".join(
-            f'<img src="https://cdnfile.sspai.com/ch1_{i}.png" alt="i"/>' for i in range(30)
+            f'<img src="https://cdnfile.sspai.com/ch1_{i}.png" alt="i"/>' for i in range(70)
         )
-        ch2_imgs = '<img src="https://cdnfile.sspai.com/ch2_0.png" alt="c2"/>'
+        ch2_imgs = (
+            '<h1>后续文章</h1>'
+            '<img src="https://strict-noref.example.com/ch2_0.png" alt="c2"/>'
+            '<p class="source-link"><a href="https://sspai.com/post/123">原文链接</a></p>'
+        )
         vols = await build_kindle_edition_epubs(
             output_dir=tmp_path,
             edition_title="配额测试",
@@ -403,16 +407,24 @@ async def test_image_pipeline_per_url_referer_403_retry_and_per_chapter_cap(
                     category="科技",
                     author="作者",
                     published_at=datetime(2026, 11, 20, 7, 0, tzinfo=UTC),
-                    canonical_url="https://sspai.com/post/123",
+                    canonical_url="https://inkpress.local/curated/2026-11-20",
                     body_html=ch2_imgs,
+                    image_referers={
+                        "https://strict-noref.example.com/ch2_0.png": "https://blog.example.com/post/99"
+                    },
                 ),
             ],
             download_images=True,
+            strip_links=True,
         )
         val = validate_epub(vols[0].path)
         assert val.valid, val.errors
-        # 20 from ch1 + 1 from ch2 + 1 cover = 22 images (ch1 capped at 20, ch2 not starved!)
-        assert val.image_count == 22
+        # 60 from ch1 + 1 from ch2 + 1 cover = 62 images (ch1 capped at 60, ch2 not starved!)
+        assert val.image_count == 62
+        with zipfile.ZipFile(vols[0].path, "r") as zf:
+            ch2_xml = zf.read("OEBPS/ch_002.xhtml").decode("utf-8")
+            assert "原文链接" not in ch2_xml
+            assert ch2_xml.count("后续文章") == 2  # <title> + single <h1 class="article-title">
 
 
 async def test_smtp_limit_msgid_and_plain_port25(tmp_path: Path) -> None:
@@ -470,3 +482,94 @@ async def test_smtp_limit_msgid_and_plain_port25(tmp_path: Path) -> None:
         )
         assert mock_send.call_args.kwargs["use_tls"] is False
         assert mock_send.call_args.kwargs["start_tls"] is True
+
+
+async def test_tall_infographic_slicing_grayscale_landmarks_and_toc_reading_time(
+    tmp_path: Path,
+) -> None:
+    # 1. KFX compliance: p.bilingual-tr must never use negative margin-top
+    bilingual_css = KINDLE_PAPER_CSS.split("p.bilingual-tr", 1)[1].split("}", 1)[0]
+    assert "margin-top: -" not in bilingual_css
+
+    # 2. Tall infographic (1000x2600 > 2.0*width & > 1600) auto-slices with overlap & grayscale autocontrast
+    tall_img = Image.new("RGB", (1000, 2600), (210, 210, 210))
+    draw = ImageDraw.Draw(tall_img)
+    draw.rectangle((100, 100, 900, 300), fill=(60, 60, 60))
+    draw.rectangle((100, 1320, 900, 1380), fill=(40, 40, 40))  # Spans overlap zone around y=1350
+    draw.rectangle((100, 2300, 900, 2500), fill=(50, 50, 50))
+    tall_buf = BytesIO()
+    tall_img.save(tall_buf, format="PNG")
+    tall_bytes = tall_buf.getvalue()
+
+    slices = optimize_image_slices(tall_bytes, max_width=1000, grayscale=True, slice_tall=True)
+    assert len(slices) == 2
+    with Image.open(BytesIO(slices[0])) as s0, Image.open(BytesIO(slices[1])) as s1:
+        assert s0.mode == "L"
+        assert s0.size == (1000, 1350)
+        # 2600 - (1350 - 48) = 1298px -> 48px overlap preserved!
+        assert s1.size == (1000, 1298)
+        # Autocontrast stretched (40..210) close to full 0..255 e-ink dynamic range
+        extrema = s0.getextrema()
+        assert extrema[0] < 15 and extrema[1] > 245
+
+    # 3. Verify EPUB embeds all slices, deduplicates author==source_name, strips leading <p> title,
+    #    annotates TOC reading time, includes EPUB3 landmarks, and injects doubanio Referer!
+    seen_referers: dict[str, str] = {}
+
+    async def fake_fetch(url: str, *, referer: str = "", **_kw: Any) -> tuple[bytes, str]:
+        seen_referers[url] = referer
+        if "doubanio.com" in url and referer != "https://movie.douban.com/":
+            req = httpx.Request("GET", url)
+            raise httpx.HTTPStatusError("418", request=req, response=httpx.Response(418, request=req))
+        return tall_bytes, "image/png"
+
+    with patch("inkpress.publishing.image_pipeline.smart_fetch_bytes", side_effect=fake_fetch):
+        vols = await build_kindle_edition_epubs(
+            output_dir=tmp_path,
+            edition_title="长图切片与目录时长测试",
+            subtitle="测试",
+            issue_number=1,
+            issue_date=datetime(2026, 11, 27, 6, 0, tzinfo=UTC),
+            chapters_input=[
+                EpubChapterInput(
+                    title="一图读懂宏观财报数据",
+                    source_name="财联社热门",
+                    category="财经",
+                    author="财联社热门",  # Same as source_name -> must not repeat!
+                    published_at=datetime(2026, 11, 27, 6, 0, tzinfo=UTC),
+                    canonical_url="https://inkpress.local/curated/2026-11-27",
+                    body_html=(
+                        "<p><strong>一图读懂宏观财报数据</strong></p>"
+                        "<p>核心财务指标解读正文。</p>"
+                        '<figure class="tugua-figure"><img src="https://img2.doubanio.com/view/photo/tall.png" alt="长图"/></figure>'
+                    ),
+                    reading_time_min=6,
+                )
+            ],
+            grayscale_images=True,
+            download_images=True,
+        )
+
+    assert seen_referers["https://img2.doubanio.com/view/photo/tall.png"] == "https://movie.douban.com/"
+    val = validate_epub(vols[0].path)
+    assert val.valid, val.errors
+    # 1 cover + 2 slices = 3 images
+    assert val.image_count == 3
+
+    with zipfile.ZipFile(vols[0].path, "r") as zf:
+        nav_xml = zf.read("OEBPS/nav.xhtml").decode("utf-8")
+        ncx_xml = zf.read("OEBPS/toc.ncx").decode("utf-8")
+        ch1_xml = zf.read("OEBPS/ch_001.xhtml").decode("utf-8")
+
+        assert "一图读懂宏观财报数据（6 分钟）" in nav_xml
+        assert "一图读懂宏观财报数据（6 分钟）" in ncx_xml
+        assert 'epub:type="landmarks"' in nav_xml
+        assert 'epub:type="bodymatter"' in nav_xml
+        # Author == source_name deduplicated
+        assert "财联社热门 · 财联社热门" not in ch1_xml
+        assert "财经 · 财联社热门 ·" in ch1_xml
+        # Duplicate leading <p><strong>title</strong></p> stripped
+        assert ch1_xml.count("一图读懂宏观财报数据") == 2  # <title> + <h1 class="article-title">
+        # Both image slices embedded sequentially with class="sliced-img"
+        assert 'class="sliced-img"' in ch1_xml
+        assert "_p2.jpg" in ch1_xml

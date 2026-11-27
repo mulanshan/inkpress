@@ -125,7 +125,7 @@ async def create_edition(
             EditionSource(
                 edition_id=ed.id,
                 source_id=link.source_id,
-                sort_order=link.sort_order or idx,
+                sort_order=link.sort_order if link.sort_order is not None else idx,
                 max_items_override=link.max_items_override,
             )
         )
@@ -191,7 +191,7 @@ async def update_edition(
                 EditionSource(
                     edition_id=ed.id,
                     source_id=link.source_id,
-                    sort_order=link.sort_order or idx,
+                    sort_order=link.sort_order if link.sort_order is not None else idx,
                     max_items_override=link.max_items_override,
                 )
             )
@@ -226,6 +226,7 @@ async def deliver_edition_now(
     edition_id: int,
     background_tasks: BackgroundTasks,
     send_email: bool = True,
+    ignore_dedup: bool = False,
     inline: bool = False,
     _user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_db),
@@ -234,13 +235,27 @@ async def deliver_edition_now(
     if ed is None:
         raise HTTPException(status_code=404, detail="Edition not found")
     if inline:
-        res = await run_build_and_deliver_edition(ed.id, trigger="manual", send_email=send_email)
+        res = await run_build_and_deliver_edition(
+            ed.id,
+            trigger="manual",
+            send_email=send_email,
+            ignore_dedup=ignore_dedup,
+        )
         return {"status": "completed", "result": res}
     try:
-        await build_and_deliver_edition_task.kiq(ed.id, trigger="manual", send_email=send_email)
+        await build_and_deliver_edition_task.kiq(
+            ed.id,
+            trigger="manual",
+            send_email=send_email,
+            ignore_dedup=ignore_dedup,
+        )
         return {"status": "queued", "edition_id": ed.id}
     except Exception:
         background_tasks.add_task(
-            run_build_and_deliver_edition_bg, ed.id, trigger="manual", send_email=send_email
+            run_build_and_deliver_edition_bg,
+            ed.id,
+            trigger="manual",
+            send_email=send_email,
+            ignore_dedup=ignore_dedup,
         )
         return {"status": "queued_local", "edition_id": ed.id}

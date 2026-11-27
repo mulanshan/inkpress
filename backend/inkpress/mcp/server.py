@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 
 from croniter import croniter
 from fastapi import APIRouter, Depends, Header, Request, Response
@@ -27,7 +28,14 @@ from inkpress.ingestion.newsnow_catalog import NEWSNOW_CATALOG
 from inkpress.publishing.epub_validator import validate_epub
 from inkpress.security import hash_token
 from inkpress.settings_store import get_network_config
-from inkpress.worker.tasks import run_build_and_deliver_edition, run_deliver_book, run_sync_source
+from inkpress.worker.tasks import (
+    build_and_deliver_edition_task,
+    retry_delivery_task,
+    run_build_and_deliver_edition,
+    run_deliver_book,
+    run_retry_delivery,
+    run_sync_source,
+)
 
 router = APIRouter(tags=["mcp"])
 
@@ -194,6 +202,9 @@ TOOLS_SPEC: list[dict[str, Any]] = [
                 "lookback_hours": {"type": "integer"},
                 "dedup_window_days": {"type": "integer"},
                 "max_articles": {"type": "integer"},
+                "max_mb_per_volume": {"type": "integer"},
+                "grayscale_images": {"type": "boolean"},
+                "include_qr_links": {"type": "boolean"},
                 "strip_links": {"type": "boolean"},
                 "retention_days": {"type": "integer"},
                 "ai_briefing_enabled": {"type": "boolean"},
@@ -204,7 +215,7 @@ TOOLS_SPEC: list[dict[str, Any]] = [
     },
     {
         "name": "trigger_edition_now",
-        "description": "Compile and deliver an edition immediately to Kindle (or build-only if send_email=false).",
+        "description": "Queue compilation and delivery of an edition via the background Worker (or set wait=true to await inline).",
         "readonly": False,
         "inputSchema": {
             "type": "object",
@@ -212,6 +223,8 @@ TOOLS_SPEC: list[dict[str, Any]] = [
             "properties": {
                 "edition_id": {"type": "integer"},
                 "send_email": {"type": "boolean", "default": True},
+                "ignore_dedup": {"type": "boolean", "default": False},
+                "wait": {"type": "boolean", "default": False},
             },
         },
     },
@@ -248,12 +261,15 @@ TOOLS_SPEC: list[dict[str, Any]] = [
     },
     {
         "name": "retry_delivery",
-        "description": "Retry a failed delivery (reusing the built EPUB book when available).",
+        "description": "Retry a failed delivery (reusing all built EPUB volumes and closing the dedup ledger).",
         "readonly": False,
         "inputSchema": {
             "type": "object",
             "required": ["delivery_id"],
-            "properties": {"delivery_id": {"type": "integer"}},
+            "properties": {
+                "delivery_id": {"type": "integer"},
+                "wait": {"type": "boolean", "default": False},
+            },
         },
     },
     {
@@ -396,14 +412,20 @@ async def _dispatch_tool(session: AsyncSession, name: str, args: dict[str, Any])
         kind = str(args["kind"])
         if kind not in ("newsnow", "rss", "rsshub", "webpage", "webpage_list"):
             raise ValueError(f"Unsupported source kind: {kind}")
+        strategy = str(args.get("fetch_strategy") or "extract_web")
+        if strategy not in ("fulltext_rss", "extract_web", "newsnow_digest", "byparr_browser"):
+            raise ValueError(f"Unsupported fetch_strategy: {strategy}")
+        proxy_mode = str(args.get("use_proxy") or "auto")
+        if proxy_mode not in ("auto", "direct", "proxy"):
+            raise ValueError(f"Unsupported use_proxy: {proxy_mode}")
         ai_opts = args.get("ai_options")
         src = Source(
             name=str(args["name"]).strip(),
             kind=kind,
             identifier=str(args["identifier"]).strip(),
             category=str(args.get("category") or "综合"),
-            fetch_strategy=str(args.get("fetch_strategy") or "extract_web"),
-            use_proxy=str(args.get("use_proxy") or "auto"),
+            fetch_strategy=strategy,
+            use_proxy=proxy_mode,
             ai_options=ai_opts if isinstance(ai_opts, dict) else {},
             max_items=max(1, min(60, int(args.get("max_items") or 15))),
         )
@@ -428,11 +450,23 @@ async def _dispatch_tool(session: AsyncSession, name: str, args: dict[str, Any])
         if "category" in args and args["category"] is not None:
             existing_src.category = str(args["category"]).strip() or "综合"
         if "fetch_strategy" in args and args["fetch_strategy"] is not None:
-            existing_src.fetch_strategy = str(args["fetch_strategy"])
+            new_strat = str(args["fetch_strategy"])
+            if new_strat not in ("fulltext_rss", "extract_web", "newsnow_digest", "byparr_browser"):
+                raise ValueError(f"Unsupported fetch_strategy: {new_strat}")
+            existing_src.fetch_strategy = new_strat
         if "use_proxy" in args and args["use_proxy"] is not None:
-            existing_src.use_proxy = str(args["use_proxy"])
+            new_proxy = str(args["use_proxy"])
+            if new_proxy not in ("auto", "direct", "proxy"):
+                raise ValueError(f"Unsupported use_proxy: {new_proxy}")
+            existing_src.use_proxy = new_proxy
         if "ai_options" in args and isinstance(args["ai_options"], dict):
-            existing_src.ai_options = args["ai_options"]
+            merged_opts = dict(existing_src.ai_options or {})
+            for k, v in args["ai_options"].items():
+                if v is None or v == "" or v == []:
+                    merged_opts.pop(k, None)
+                else:
+                    merged_opts[k] = v
+            existing_src.ai_options = merged_opts
         if "max_items" in args and args["max_items"] is not None:
             existing_src.max_items = max(1, min(60, int(args["max_items"])))
         if "enabled" in args and args["enabled"] is not None:
@@ -444,6 +478,7 @@ async def _dispatch_tool(session: AsyncSession, name: str, args: dict[str, Any])
             "name": existing_src.name,
             "kind": existing_src.kind,
             "identifier": existing_src.identifier,
+            "ai_options": existing_src.ai_options or {},
             "enabled": existing_src.enabled,
             "status": "updated",
         }
@@ -571,13 +606,44 @@ async def _dispatch_tool(session: AsyncSession, name: str, args: dict[str, Any])
             if not croniter.is_valid(cron_str):
                 raise ValueError(f"Invalid cron expression: {cron_str}")
             ed.cron_expr = cron_str
-        for str_field in ("name", "subtitle", "timezone", "cover_style", "target_emails"):
+        if "cover_style" in args and args["cover_style"] is not None:
+            cs = str(args["cover_style"]).strip()
+            if cs not in ("editorial", "dark", "minimal"):
+                raise ValueError(f"Invalid cover_style: {cs}")
+            ed.cover_style = cs
+        if "timezone" in args and args["timezone"] is not None:
+            tz_str = str(args["timezone"]).strip()
+            try:
+                ZoneInfo(tz_str)
+            except Exception as exc:
+                raise ValueError(f"Invalid timezone: {tz_str}") from exc
+            ed.timezone = tz_str
+        for str_field in ("name", "subtitle", "target_emails"):
             if str_field in args and args[str_field] is not None:
-                setattr(ed, str_field, str(args[str_field]).strip())
-        for int_field in ("lookback_hours", "dedup_window_days", "max_articles", "retention_days"):
+                val_s = str(args[str_field]).strip()
+                if str_field == "name" and not val_s:
+                    raise ValueError("Edition name cannot be empty")
+                setattr(ed, str_field, val_s)
+        int_bounds: dict[str, tuple[int, int]] = {
+            "lookback_hours": (1, 168),
+            "dedup_window_days": (1, 90),
+            "max_articles": (1, 120),
+            "max_mb_per_volume": (4, 23),
+            "retention_days": (1, 365),
+        }
+        for int_field, (lo, hi) in int_bounds.items():
             if int_field in args and args[int_field] is not None:
-                setattr(ed, int_field, int(args[int_field]))
-        for bool_field in ("strip_links", "ai_briefing_enabled", "enabled"):
+                val_i = int(args[int_field])
+                if val_i < lo or val_i > hi:
+                    raise ValueError(f"{int_field} must be between {lo} and {hi}, got {val_i}")
+                setattr(ed, int_field, val_i)
+        for bool_field in (
+            "grayscale_images",
+            "include_qr_links",
+            "strip_links",
+            "ai_briefing_enabled",
+            "enabled",
+        ):
             if bool_field in args and args[bool_field] is not None:
                 setattr(ed, bool_field, bool(args[bool_field]))
         await session.commit()
@@ -588,16 +654,60 @@ async def _dispatch_tool(session: AsyncSession, name: str, args: dict[str, Any])
             "cron_expr": ed.cron_expr,
             "enabled": ed.enabled,
             "strip_links": ed.strip_links,
+            "grayscale_images": ed.grayscale_images,
+            "include_qr_links": ed.include_qr_links,
             "retention_days": ed.retention_days,
             "status": "updated",
         }
 
     if name == "trigger_edition_now":
-        return await run_build_and_deliver_edition(
-            int(args["edition_id"]),
+        ed_id = int(args["edition_id"])
+        ed_obj = await session.get(Edition, ed_id)
+        if ed_obj is None:
+            return {"error": "edition_not_found", "edition_id": ed_id}
+        send_email_flag = bool(args.get("send_email", True))
+        ignore_dedup_flag = bool(args.get("ignore_dedup", False))
+        wait_inline = bool(args.get("wait", False))
+        if wait_inline:
+            inline_res = await run_build_and_deliver_edition(
+                ed_id,
+                trigger="mcp",
+                send_email=send_email_flag,
+                ignore_dedup=ignore_dedup_flag,
+            )
+            return {"edition_id": ed_obj.id, **inline_res}
+        pending_deliv = Delivery(
+            edition_id=ed_obj.id,
+            title=ed_obj.name,
             trigger="mcp",
-            send_email=bool(args.get("send_email", True)),
+            status="pending",
         )
+        session.add(pending_deliv)
+        await session.commit()
+        await session.refresh(pending_deliv)
+        try:
+            job_id = await build_and_deliver_edition_task.kiq(
+                ed_obj.id,
+                trigger="mcp",
+                send_email=send_email_flag,
+                ignore_dedup=ignore_dedup_flag,
+                delivery_id=pending_deliv.id,
+            )
+            return {
+                "status": "queued",
+                "edition_id": ed_obj.id,
+                "delivery_id": pending_deliv.id,
+                "job_id": job_id,
+            }
+        except Exception:
+            fb_res = await run_build_and_deliver_edition(
+                ed_obj.id,
+                trigger="mcp",
+                send_email=send_email_flag,
+                ignore_dedup=ignore_dedup_flag,
+                delivery_id=pending_deliv.id,
+            )
+            return {"edition_id": ed_obj.id, **fb_res}
 
     if name == "list_books":
         book_rows = (
@@ -668,15 +778,17 @@ async def _dispatch_tool(session: AsyncSession, name: str, args: dict[str, Any])
         d = await session.get(Delivery, int(args["delivery_id"]))
         if d is None:
             return {"error": "delivery_not_found"}
-        if d.book_id:
-            return await run_deliver_book(
-                d.book_id, target_email=d.target_email, trigger="mcp_retry"
-            )
-        if d.edition_id:
-            return await run_build_and_deliver_edition(
-                d.edition_id, trigger="mcp_retry", send_email=True
-            )
-        return {"error": "delivery_cannot_be_retried"}
+        if d.status != "failed":
+            return {"error": "delivery_not_failed", "status": d.status}
+        if not d.book_id and not d.edition_id:
+            return {"error": "delivery_cannot_be_retried"}
+        if bool(args.get("wait", False)):
+            return await run_retry_delivery(d.id, trigger="mcp_retry")
+        try:
+            job_id = await retry_delivery_task.kiq(d.id, trigger="mcp_retry")
+            return {"status": "queued", "delivery_id": d.id, "job_id": job_id}
+        except Exception:
+            return await run_retry_delivery(d.id, trigger="mcp_retry")
 
     if name == "test_extract_url":
         target_url = str(args["url"]).strip()

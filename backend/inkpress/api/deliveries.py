@@ -16,10 +16,8 @@ from inkpress.db.base import get_db
 from inkpress.db.models import Delivery, User
 from inkpress.worker.broker import EVENTS_CHANNEL
 from inkpress.worker.tasks import (
-    build_and_deliver_edition_task,
-    deliver_book_task,
-    run_build_and_deliver_edition,
-    run_deliver_book,
+    retry_delivery_task,
+    run_retry_delivery_bg,
 )
 
 router = APIRouter(prefix="/api/v1/deliveries", tags=["deliveries"])
@@ -84,23 +82,26 @@ async def retry_delivery(
     d = await session.get(Delivery, delivery_id)
     if d is None:
         raise HTTPException(status_code=404, detail="Delivery not found")
-    if d.book_id:
-        try:
-            await deliver_book_task.kiq(d.book_id, target_email=d.target_email, trigger="retry")
-        except Exception:
-            background_tasks.add_task(
-                run_deliver_book, d.book_id, target_email=d.target_email, trigger="retry"
-            )
-        return {"status": "queued", "book_id": d.book_id}
-    if d.edition_id:
-        try:
-            await build_and_deliver_edition_task.kiq(d.edition_id, trigger="retry", send_email=True)
-        except Exception:
-            background_tasks.add_task(
-                run_build_and_deliver_edition, d.edition_id, trigger="retry", send_email=True
-            )
-        return {"status": "queued", "edition_id": d.edition_id}
-    raise HTTPException(status_code=400, detail="无法重试该记录")
+    if d.status != "failed":
+        raise HTTPException(status_code=400, detail="仅失败状态的投递记录支持重试")
+    if not d.book_id and not d.edition_id:
+        raise HTTPException(status_code=400, detail="无法重试该记录")
+    try:
+        await retry_delivery_task.kiq(d.id, trigger="retry")
+        return {
+            "status": "queued",
+            "delivery_id": d.id,
+            "book_id": d.book_id,
+            "edition_id": d.edition_id,
+        }
+    except Exception:
+        background_tasks.add_task(run_retry_delivery_bg, d.id, trigger="retry")
+        return {
+            "status": "queued_local",
+            "delivery_id": d.id,
+            "book_id": d.book_id,
+            "edition_id": d.edition_id,
+        }
 
 
 @router.get("/stream")

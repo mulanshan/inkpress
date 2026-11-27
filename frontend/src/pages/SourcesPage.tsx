@@ -21,6 +21,7 @@ import {
 } from "lucide-react";
 import { apiRequest, formatRelativeTime, isSafeHttpUrl } from "../lib/api";
 import type {
+  EditorialRole,
   FetchStrategy,
   NewsNowCatalogItem,
   ProxyMode,
@@ -41,31 +42,56 @@ function parseRemoveSelectors(raw: string): string[] {
     .filter(Boolean);
 }
 
+const EDITORIAL_ROLE_LABELS: Record<Exclude<EditorialRole, "">, string> = {
+  anchor: "主刊置顶",
+  digest: "辑要池",
+  deep: "深度长文",
+};
+
 function buildSourceAiOptions(
   base: SourceAiOptions | undefined,
   fields: {
+    editorialRole: EditorialRole;
     titleInclude: string;
     titleExclude: string;
     linkSelector: string;
     contentSelector: string;
     removeSelectors: string;
   },
+  isPatch = false,
 ): SourceAiOptions {
   const next: SourceAiOptions = {
+    ...(base || {}),
     summarize: Boolean(base?.summarize),
     bilingual: Boolean(base?.bilingual),
   };
+  const role = fields.editorialRole;
   const inc = fields.titleInclude.trim();
   const exc = fields.titleExclude.trim();
   const linkSel = fields.linkSelector.trim();
   const contentSel = fields.contentSelector.trim();
   const removeList = parseRemoveSelectors(fields.removeSelectors);
 
-  if (inc) next.title_include_regex = inc;
-  if (exc) next.title_exclude_regex = exc;
-  if (linkSel) next.link_selector = linkSel;
-  if (contentSel) next.content_selector = contentSel;
-  if (removeList.length > 0) next.remove_selectors = removeList;
+  const setOrClear = <K extends keyof SourceAiOptions>(
+    key: K,
+    value: SourceAiOptions[K],
+    empty: boolean,
+  ) => {
+    if (!empty) {
+      next[key] = value;
+    } else if (isPatch) {
+      next[key] = null;
+    } else {
+      delete next[key];
+    }
+  };
+
+  setOrClear("editorial_role", role, !role);
+  setOrClear("title_include_regex", inc, !inc);
+  setOrClear("title_exclude_regex", exc, !exc);
+  setOrClear("link_selector", linkSel, !linkSel);
+  setOrClear("content_selector", contentSel, !contentSel);
+  setOrClear("remove_selectors", removeList, removeList.length === 0);
   return next;
 }
 
@@ -92,6 +118,7 @@ export function SourcesPage() {
   );
   const [rssProxy, setRssProxy] = useState<ProxyMode>("auto");
   const [showAdvancedAdd, setShowAdvancedAdd] = useState(false);
+  const [rssEditorialRole, setRssEditorialRole] = useState<EditorialRole>("");
   const [rssTitleInclude, setRssTitleInclude] = useState("");
   const [rssTitleExclude, setRssTitleExclude] = useState("");
   const [rssLinkSelector, setRssLinkSelector] = useState("");
@@ -107,6 +134,7 @@ export function SourcesPage() {
   const [editProxy, setEditProxy] = useState<ProxyMode>("auto");
   const [editMaxItems, setEditMaxItems] = useState(15);
   const [editEnabled, setEditEnabled] = useState(true);
+  const [editEditorialRole, setEditEditorialRole] = useState<EditorialRole>("");
   const [editTitleInclude, setEditTitleInclude] = useState("");
   const [editTitleExclude, setEditTitleExclude] = useState("");
   const [editLinkSelector, setEditLinkSelector] = useState("");
@@ -151,6 +179,10 @@ export function SourcesPage() {
     setEditProxy(src.use_proxy);
     setEditMaxItems(src.max_items);
     setEditEnabled(src.enabled);
+    const rawRole = src.ai_options?.editorial_role;
+    setEditEditorialRole(
+      rawRole === "anchor" || rawRole === "digest" || rawRole === "deep" ? rawRole : "",
+    );
     setEditTitleInclude(src.ai_options?.title_include_regex ?? "");
     setEditTitleExclude(src.ai_options?.title_exclude_regex ?? "");
     setEditLinkSelector(src.ai_options?.link_selector ?? "");
@@ -163,13 +195,18 @@ export function SourcesPage() {
     if (!editingSource) return;
     setEditSaving(true);
     try {
-      const nextAiOptions = buildSourceAiOptions(editingSource.ai_options, {
-        titleInclude: editTitleInclude,
-        titleExclude: editTitleExclude,
-        linkSelector: editLinkSelector,
-        contentSelector: editContentSelector,
-        removeSelectors: editRemoveSelectors,
-      });
+      const nextAiOptions = buildSourceAiOptions(
+        editingSource.ai_options,
+        {
+          editorialRole: editEditorialRole,
+          titleInclude: editTitleInclude,
+          titleExclude: editTitleExclude,
+          linkSelector: editLinkSelector,
+          contentSelector: editContentSelector,
+          removeSelectors: editRemoveSelectors,
+        },
+        true,
+      );
       await apiRequest(`/api/v1/sources/${editingSource.id}`, {
         method: "PATCH",
         body: JSON.stringify({
@@ -235,6 +272,7 @@ export function SourcesPage() {
     e.preventDefault();
     try {
       const aiOptions = buildSourceAiOptions(undefined, {
+        editorialRole: rssEditorialRole,
         titleInclude: rssTitleInclude,
         titleExclude: rssTitleExclude,
         linkSelector: rssKind === "webpage_list" ? rssLinkSelector : "",
@@ -255,6 +293,7 @@ export function SourcesPage() {
       });
       setRssName("");
       setRssIdentifier("");
+      setRssEditorialRole("");
       setRssTitleInclude("");
       setRssTitleExclude("");
       setRssLinkSelector("");
@@ -672,6 +711,25 @@ export function SourcesPage() {
                     borderColor: "var(--border-hairline)",
                   }}
                 >
+                  <div className="sm:col-span-2">
+                    <label className="block mb-1" style={{ color: "var(--fg-secondary)" }}>
+                      刊物编排角色（三段式晨报分流策略）
+                    </label>
+                    <select
+                      value={rssEditorialRole}
+                      onChange={(e) => setRssEditorialRole(e.target.value as EditorialRole)}
+                      className="w-full rounded-lg border px-3 py-1.5"
+                      style={{
+                        backgroundColor: "var(--bg-surface)",
+                        borderColor: "var(--border-hairline)",
+                      }}
+                    >
+                      <option value="">自动编排（按字数与热榜类型自动分流）</option>
+                      <option value="anchor">主刊全文置顶（如《喷嚏图卦》整期保留并作为去重锚点）</option>
+                      <option value="digest">归入全网辑要池（参与 AI 跨源合并精编）</option>
+                      <option value="deep">深度长文优先（优先进入独立长文精读席位）</option>
+                    </select>
+                  </div>
                   <div>
                     <label className="block mb-1" style={{ color: "var(--fg-secondary)" }}>
                       标题包含正则（仅保留匹配文章）
@@ -856,6 +914,19 @@ export function SourcesPage() {
                           CSS 选择器
                         </span>
                       )}
+                      {src.ai_options?.editorial_role &&
+                        src.ai_options.editorial_role in EDITORIAL_ROLE_LABELS && (
+                          <span
+                            className="text-[11px] px-2 py-0.5 rounded-full"
+                            style={{ backgroundColor: "var(--accent-soft)", color: "var(--accent)" }}
+                          >
+                            {
+                              EDITORIAL_ROLE_LABELS[
+                                src.ai_options.editorial_role as Exclude<EditorialRole, "">
+                              ]
+                            }
+                          </span>
+                        )}
                       <span className="text-xs" style={{ color: "var(--fg-muted)" }}>
                         已收 {src.article_count} 篇 · 上次同步 {formatRelativeTime(src.last_fetched_at)}
                       </span>
@@ -1163,6 +1234,26 @@ export function SourcesPage() {
                     }}
                   />
                 </div>
+              </div>
+
+              <div>
+                <label className="block mb-1" style={{ color: "var(--fg-secondary)" }}>
+                  刊物编排角色（三段式晨报分流策略）
+                </label>
+                <select
+                  value={editEditorialRole}
+                  onChange={(e) => setEditEditorialRole(e.target.value as EditorialRole)}
+                  className="w-full rounded-lg border px-2.5 py-2"
+                  style={{
+                    backgroundColor: "var(--bg-canvas)",
+                    borderColor: "var(--border-hairline)",
+                  }}
+                >
+                  <option value="">自动编排（按字数与热榜类型自动分流）</option>
+                  <option value="anchor">主刊全文置顶（如《喷嚏图卦》整期保留）</option>
+                  <option value="digest">归入全网辑要池（参与 AI 跨源合并精编）</option>
+                  <option value="deep">深度长文优先（优先进入独立长文精读席位）</option>
+                </select>
               </div>
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">

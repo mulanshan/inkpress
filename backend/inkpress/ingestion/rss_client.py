@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 
 import feedparser
 
+from inkpress.ingestion.extractor import clean_author_name
 from inkpress.ingestion.fetcher import smart_fetch_text
 
 
@@ -121,7 +122,7 @@ async def fetch_rss_entries(
             RssEntry(
                 title=title,
                 url=link,
-                author=str(entry.get("author") or "").strip(),
+                author=clean_author_name(str(entry.get("author") or ""), source_name=feed_title),
                 published_at=_parse_entry_date(entry),
                 content_html=content_html,
                 summary_html=summary_html,

@@ -40,6 +40,7 @@ services:
       NODE_ENV: production
       INIT_TABLE: "true"
       ENABLE_CACHE: "true"
+      TZ: ${TZ:-Asia/Shanghai}
       NODE_USE_ENV_PROXY: "1"
       NODE_OPTIONS: "--import /app/proxy-preload.mjs"
       HTTP_PROXY: ${OUTBOUND_PROXY:-}
@@ -67,9 +68,9 @@ services:
       - "${APP_PORT:-8060}:8000"
     env_file: ../.env
     environment:
-      DATABASE_URL: postgresql+psycopg://inkpress:${POSTGRES_PASSWORD:-inkpress-dev-password}@postgres:5432/inkpress
-      REDIS_URL: redis://redis:6379/5
-      NEWSNOW_BASE_URL: http://newsnow:4444
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://inkpress:${POSTGRES_PASSWORD:-inkpress-dev-password}@postgres:5432/inkpress}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/5}
+      NEWSNOW_BASE_URL: ${NEWSNOW_BASE_URL:-http://newsnow:4444}
       LIBRARY_DATA_DIR: /data/library
     volumes:
       - ${HOST_LIBRARY_DIR:-./data/library}:/data/library
@@ -84,16 +85,19 @@ services:
     image: ghcr.io/mulanshan/inkpress-worker:latest
     container_name: inkpress-worker
     restart: unless-stopped
+    stop_grace_period: 90s
     depends_on:
+      app:
+        condition: service_healthy
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
     env_file: ../.env
     environment:
-      DATABASE_URL: postgresql+psycopg://inkpress:${POSTGRES_PASSWORD:-inkpress-dev-password}@postgres:5432/inkpress
-      REDIS_URL: redis://redis:6379/5
-      NEWSNOW_BASE_URL: http://newsnow:4444
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://inkpress:${POSTGRES_PASSWORD:-inkpress-dev-password}@postgres:5432/inkpress}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/5}
+      NEWSNOW_BASE_URL: ${NEWSNOW_BASE_URL:-http://newsnow:4444}
       LIBRARY_DATA_DIR: /data/library
     volumes:
       - ${HOST_LIBRARY_DIR:-./data/library}:/data/library
@@ -104,15 +108,17 @@ services:
     container_name: inkpress-scheduler
     restart: unless-stopped
     depends_on:
+      app:
+        condition: service_healthy
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
     env_file: ../.env
     environment:
-      DATABASE_URL: postgresql+psycopg://inkpress:${POSTGRES_PASSWORD:-inkpress-dev-password}@postgres:5432/inkpress
-      REDIS_URL: redis://redis:6379/5
-      NEWSNOW_BASE_URL: http://newsnow:4444
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://inkpress:${POSTGRES_PASSWORD:-inkpress-dev-password}@postgres:5432/inkpress}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/5}
+      NEWSNOW_BASE_URL: ${NEWSNOW_BASE_URL:-http://newsnow:4444}
       LIBRARY_DATA_DIR: /data/library
     volumes:
       - ${HOST_LIBRARY_DIR:-./data/library}:/data/library

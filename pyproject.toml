@@ -29,6 +29,7 @@ dependencies = [
   "pydantic-settings>=2.8,<3",
   "pyjwt>=2.10,<3",
   "pymupdf>=1.25,<2",
+  "pysocks>=1.7.1,<2",
   "python-docx>=1.1,<2",
   "python-multipart>=0.0.20,<1",
   "qrcode[pil]>=8.0,<9",

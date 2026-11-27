@@ -13,14 +13,22 @@
 - **Editorial Paper Reading Website**: Serene, typography-first web reader with 4 themes (**Paper**, **Sepia**, **Charcoal Dark**, **E-Ink**), keyboard navigation (`j`/`k`/`/`/`Esc`), built-in sanitized EPUB chapter reader, SSRF-hardened anti-hotlink media proxy, and ParadeDB BM25 (`pdb.jieba`) CJK/English full-text search.
 - **NewsNow Sidecar Integration (40+ Live Sources)**: Runs `ghcr.io/ourongxing/newsnow` internally with `undici` `EnvHttpProxyAgent` proxy preload to bypass rate limits and reach overseas sources cleanly, supporting full-text extraction and structured digests.
 - **RSS, RSSHub, Webpage & Webpage List Extraction**: Native `rsshub://` shortcut resolution, automatic full-text RSS detection, `webpage_list` CSS-selector scraping with optional Byparr headless browser fallback, per-source title regex include/exclude filters, direct/proxy split routing, and strict URL + content hash deduplication.
-- **Optional AI Editorial Engine (OpenAI-Compatible)**: Works with any OpenAI-compatible gateway to generate daily frontpage executive briefings, per-article TL;DR cards, and batched paragraph-by-paragraph bilingual translations. Gracefully degrades when disabled.
-- **Zero-E999 Kindle EPUB3 Publishing Engine**:
+- **Optional AI Editorial Engine (3-Tier Illustrated Architecture)**: Works with any OpenAI-compatible gateway to compile daily issues into a **3-tier editorial flow**:
+  1. **Anchor Full-Issue Chapters** (e.g. *喷嚏图卦* preserved intact and extracted as deduplication anchors)
+  2. **AI Curated Illustrated Digest** (cross-source topic clustering, multi-source merging, and candidate-verified inline photo/chart curation)
+  3. **Deep Long-Form Reads** (round-robin non-duplicate long-form essays with AI TL;DR cards and optional stacked bilingual translation)
+  - Gracefully falls back to deterministic local clustering when AI is disabled.
+- **Zero-E999 Kindle EPUB3 & E-Ink Publishing Engine**:
   - Mandatory UTF-8 XML declarations on every XHTML spine document (prevents Amazon Latin-1 mojibake)
-  - Dual navigation: EPUB3 `nav.xhtml` + EPUB2 `toc.ncx` with heading-anchored TOCs
+  - Dual navigation: EPUB3 `nav.xhtml` (with `landmarks` & per-chapter reading time `（X 分钟）`) + EPUB2 `toc.ncx`
+  - **Automatic Tall Infographic Slicing**: Long vertical charts/strips (`height > 2×width` and `> 1600px`) are sliced with `48px` overlap into crisp page-sized sequential plates for effortless Kindle reading
+  - Optional e-ink grayscale conversion with automatic histogram contrast stretching (`autocontrast`) and QR source footers
   - Hyperlink stripping enabled by default (`strip_links = true`) to prevent accidental Kindle browser taps
-  - Rust-powered `nh3` HTML sanitization + Pillow image optimization with per-article Referer headers and per-chapter image quotas
-  - Automatic multi-volume splitting (< 18 MB/vol) with volume-scoped navigation links
-  - Dynamic CJK magazine cover generation, daily retention garbage collection, & built-in structural EPUB validator
+  - Rust-powered `nh3` HTML sanitization + Pillow image optimization with domain-aware anti-hotlink `Referer` headers
+  - Automatic multi-volume splitting (< 18 MB/vol) with volume-scoped navigation links and stateful multi-volume retry
+- **Email-Free Direct E-Ink Ecosystem**:
+  - **OPDS 1.2 Catalog (`/api/v1/opds`)**: Standard Atom OPDS navigation, acquisition, and OpenSearch feeds (HTTP Basic Auth / Token / Session) for KOReader, Onyx Boox, PocketBook, and Foliate
+  - **`/kindle` Minimal Direct-Download Page**: Zero-JS, high-contrast black-on-white HTML bookshelf for one-tap EPUB downloads from Kindle Experimental Browser
 - **Personal Book & Magazine Library**: Upload `EPUB`, `MOBI`, `AZW3`, `TXT`, `Markdown`, `HTML`, `DOCX`, `PDF`, `FB2`, `RTF`, or `CBZ` (streaming upload up to 100 MB) — automatic Kindle EPUB normalization/repair (with in-place `toc.ncx` injection), built-in web reading, immediate push, or scheduled delivery.
 - **AI-Ops Native (MCP Server)**: Built-in Streamable HTTP `POST /api/v1/mcp` JSON-RPC 2.0 server with Bearer Token authentication, `Origin` verification, read-only toggle, and operational tools (`get_health`, `search_articles`, `clip_url`, `update_source`, `update_edition`, `trigger_edition_now`, `retry_delivery`, `validate_book_epub`, etc.).
 

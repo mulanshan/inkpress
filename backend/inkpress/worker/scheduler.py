@@ -4,10 +4,11 @@ import asyncio
 import contextlib
 import signal
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from croniter import croniter
-from sqlalchemy import delete, exists, func, select
+from sqlalchemy import delete, exists, func, or_, select, update
 
 from inkpress.db.base import get_session_factory
 from inkpress.db.models import Article, ArticleDelivery, Book, Delivery, Edition, Source, utcnow
@@ -77,15 +78,37 @@ def is_edition_due(
     return True
 
 
-async def run_retention_gc(now_utc: datetime | None = None) -> int:
-    """Delete unstarred, undelivered articles older than the max edition retention_days."""
+async def run_retention_gc(
+    now_utc: datetime | None = None,
+    *,
+    archive_days: int | None = None,
+) -> int:
+    """Purge unstarred undelivered articles beyond `retention_days`, and reclaim expired dedup
+    ledgers + auto-generated `edition_issue` EPUB files beyond `archive_days`."""
     now = _as_utc(now_utc or utcnow())
     factory = get_session_factory()
     async with factory() as session:
         max_ret = (await session.execute(select(func.max(Edition.retention_days)))).scalar_one()
+        max_dedup = (
+            await session.execute(select(func.max(Edition.dedup_window_days)))
+        ).scalar_one()
         retention_days = max(1, int(max_ret or 30))
+        dedup_days = max(1, int(max_dedup or 14))
         cutoff = now - timedelta(days=retention_days)
 
+        eff_archive_days = max(
+            1,
+            archive_days if archive_days is not None else max(retention_days * 2, dedup_days),
+        )
+        archive_cutoff = now - timedelta(days=eff_archive_days)
+
+        # 1. Reclaim expired ArticleDelivery dedup ledger rows first
+        expired_ledgers_res = await session.execute(
+            delete(ArticleDelivery).where(ArticleDelivery.delivered_at < archive_cutoff)
+        )
+        expired_ledgers = int(expired_ledgers_res.rowcount or 0)  # type: ignore[attr-defined]
+
+        # 2. Delete unstarred articles without active delivery ledger references
         delivered_exists = exists(
             select(ArticleDelivery.id).where(ArticleDelivery.article_id == Article.id)
         )
@@ -95,15 +118,56 @@ async def run_retention_gc(now_utc: datetime | None = None) -> int:
             ~delivered_exists,
         )
         result = await session.execute(stmt)
-        await session.commit()
-        deleted = int(result.rowcount or 0)  # type: ignore[attr-defined]
-        if deleted > 0:
-            logger.info(
-                "retention_gc_deleted_articles",
-                deleted=deleted,
-                retention_days=retention_days,
+        deleted_articles = int(result.rowcount or 0)  # type: ignore[attr-defined]
+
+        # 3. Reclaim expired auto-generated `edition_issue` archives & disk files (never user uploads!)
+        expired_books = (
+            (
+                await session.execute(
+                    select(Book).where(
+                        Book.kind == "edition_issue",
+                        Book.scheduled_push_at.is_(None),
+                        Book.created_at < archive_cutoff,
+                    )
+                )
             )
-        return deleted
+            .scalars()
+            .all()
+        )
+        expired_book_ids = [b.id for b in expired_books]
+        unlinked_files = 0
+        if expired_books:
+            await session.execute(
+                update(Delivery)
+                .where(Delivery.book_id.in_(expired_book_ids))
+                .values(book_id=None)
+            )
+            for b in expired_books:
+                meta = b.metadata_json if isinstance(b.metadata_json, dict) else {}
+                extra_paths = [
+                    str(p) for p in (meta.get("volume_paths") or []) if str(p).strip()
+                ]
+                for p_str in {b.original_path, b.kindle_epub_path, b.cover_path or "", *extra_paths}:
+                    if p_str:
+                        p = Path(p_str)
+                        if p.exists():
+                            with contextlib.suppress(OSError):
+                                p.unlink(missing_ok=True)
+                                unlinked_files += 1
+                await session.delete(b)
+
+        await session.commit()
+        if deleted_articles > 0 or expired_ledgers > 0 or expired_book_ids:
+            logger.info(
+                "retention_gc_completed",
+                deleted_articles=deleted_articles,
+                expired_ledgers=expired_ledgers,
+                expired_issue_books=len(expired_book_ids),
+                unlinked_files=unlinked_files,
+                retention_days=retention_days,
+                archive_days=eff_archive_days,
+            )
+        return deleted_articles
 
 
 async def _tick_once(now_utc: datetime | None = None) -> None:
@@ -125,7 +189,13 @@ async def _tick_once(now_utc: datetime | None = None) -> None:
                     await session.execute(
                         select(func.count(Delivery.id)).where(
                             Delivery.edition_id == ed.id,
-                            Delivery.status.in_(("running", "sent")),
+                            or_(
+                                Delivery.status == "sent",
+                                (
+                                    Delivery.status.in_(("running", "sending_smtp"))
+                                    & (Delivery.target_email != "")
+                                ),
+                            ),
                             Delivery.created_at >= collision_cutoff,
                         )
                     )

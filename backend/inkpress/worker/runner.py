@@ -26,6 +26,7 @@ from inkpress.worker.tasks import (
     run_build_and_deliver_edition,
     run_convert_book,
     run_deliver_book,
+    run_retry_delivery,
     run_sync_source,
 )
 
@@ -35,6 +36,9 @@ STALE_DELIVERY_MINUTES = 15
 HEARTBEAT_INTERVAL_SECONDS = 20.0
 RECLAIM_INTERVAL_SECONDS = 60.0
 RECLAIM_MIN_IDLE_MS = 300_000
+LEASE_RENEW_INTERVAL_SECONDS = 60.0
+MAX_STREAM_DELIVERIES = 3
+DEAD_LETTER_STREAM_KEY = "inkpress:jobs:dlq"
 
 
 async def dispatch_job(job: dict[str, Any]) -> Any:
@@ -44,10 +48,13 @@ async def dispatch_job(job: dict[str, Any]) -> Any:
     if job_type == "sync_source":
         return await run_sync_source(int(kwargs["source_id"]))
     if job_type == "build_and_deliver_edition":
+        deliv_id = kwargs.get("delivery_id")
         return await run_build_and_deliver_edition(
             int(kwargs["edition_id"]),
             trigger=str(kwargs.get("trigger") or "manual"),
             send_email=bool(kwargs.get("send_email", True)),
+            ignore_dedup=bool(kwargs.get("ignore_dedup", False)),
+            delivery_id=int(deliv_id) if deliv_id is not None else None,
         )
     if job_type == "convert_book":
         return await run_convert_book(int(kwargs["book_id"]))
@@ -57,11 +64,16 @@ async def dispatch_job(job: dict[str, Any]) -> Any:
             target_email=str(kwargs.get("target_email") or ""),
             trigger=str(kwargs.get("trigger") or "manual"),
         )
+    if job_type == "retry_delivery":
+        return await run_retry_delivery(
+            int(kwargs["delivery_id"]),
+            trigger=str(kwargs.get("trigger") or "retry"),
+        )
     raise ValueError(f"Unknown job type: {job_type}")
 
 
 async def recover_stale_running_deliveries(stale_minutes: int = STALE_DELIVERY_MINUTES) -> int:
-    """Mark stale 'running' deliveries (> stale_minutes old) as failed on worker startup."""
+    """Mark stale 'running' / 'sending_smtp' deliveries (> stale_minutes old) as failed on startup."""
     factory = get_session_factory()
     now = utcnow()
     cutoff = now - timedelta(minutes=max(1, stale_minutes))
@@ -71,7 +83,7 @@ async def recover_stale_running_deliveries(stale_minutes: int = STALE_DELIVERY_M
             (
                 await session.execute(
                     select(Delivery).where(
-                        Delivery.status == "running",
+                        Delivery.status.in_(("running", "sending_smtp")),
                         Delivery.created_at < cutoff,
                     )
                 )
@@ -99,6 +111,7 @@ async def _process_stream_entry(
     fields: dict[str, Any],
     *,
     worker_label: str,
+    lease_renew_seconds: float = LEASE_RENEW_INTERVAL_SECONDS,
 ) -> None:
     raw = str(fields.get("payload") or "")
     try:
@@ -116,6 +129,22 @@ async def _process_stream_entry(
         job_id=job.get("id"),
         type=job.get("type"),
     )
+
+    async def _renew_lease_loop() -> None:
+        while True:
+            await asyncio.sleep(max(0.01, lease_renew_seconds))
+            if hasattr(client, "xclaim"):
+                with contextlib.suppress(Exception):
+                    await client.xclaim(
+                        JOBS_STREAM_KEY,
+                        JOBS_GROUP_NAME,
+                        worker_label,
+                        min_idle_time=0,
+                        message_ids=[msg_id],
+                        justid=True,
+                    )
+
+    renew_task = asyncio.create_task(_renew_lease_loop())
     try:
         await dispatch_job(job)
         logger.info(
@@ -137,9 +166,79 @@ async def _process_stream_entry(
             type=job.get("type"),
             err=str(exc),
         )
+    finally:
+        renew_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await renew_task
 
     await client.xack(JOBS_STREAM_KEY, JOBS_GROUP_NAME, msg_id)
     await client.xdel(JOBS_STREAM_KEY, msg_id)
+
+
+async def _reclaim_once(
+    client: aioredis.Redis,
+    consumer_name: str,
+    stop_event: asyncio.Event | None = None,
+) -> int:
+    """Evict poison-pill jobs exceeding MAX_STREAM_DELIVERIES to DLQ, then XAUTOCLAIM idle jobs."""
+    evicted = 0
+    if hasattr(client, "xpending_range"):
+        pending_rows = await client.xpending_range(
+            JOBS_STREAM_KEY,
+            JOBS_GROUP_NAME,
+            min="-",
+            max="+",
+            count=50,
+            idle=RECLAIM_MIN_IDLE_MS,
+        )
+        for p in pending_rows or []:
+            if not isinstance(p, dict):
+                continue
+            mid = str(p.get("message_id") or "")
+            times = int(p.get("times_delivered") or 0)
+            if mid and times >= MAX_STREAM_DELIVERIES:
+                dlq_fields: dict[Any, Any] = {
+                    "failed_msg_id": mid,
+                    "times_delivered": str(times),
+                }
+                if hasattr(client, "xrange"):
+                    with contextlib.suppress(Exception):
+                        entries = await client.xrange(JOBS_STREAM_KEY, min=mid, max=mid, count=1)
+                        if entries and len(entries[0]) >= 2 and isinstance(entries[0][1], dict):
+                            for k, v in entries[0][1].items():
+                                dlq_fields[str(k)] = str(v)
+                await client.xadd(
+                    DEAD_LETTER_STREAM_KEY,
+                    dlq_fields,
+                    maxlen=1000,
+                    approximate=True,
+                )
+                await client.xack(JOBS_STREAM_KEY, JOBS_GROUP_NAME, mid)
+                await client.xdel(JOBS_STREAM_KEY, mid)
+                evicted += 1
+                logger.error(
+                    "job_moved_to_dlq",
+                    msg_id=mid,
+                    times_delivered=times,
+                )
+
+    claimed = await client.xautoclaim(
+        JOBS_STREAM_KEY,
+        JOBS_GROUP_NAME,
+        consumer_name,
+        min_idle_time=RECLAIM_MIN_IDLE_MS,
+        start_id="0-0",
+        count=10,
+    )
+    messages = claimed[1] if isinstance(claimed, (list, tuple)) and len(claimed) >= 2 else []
+    for msg_id, fields in messages:
+        if stop_event is not None and stop_event.is_set():
+            break
+        logger.warning("job_reclaimed", msg_id=msg_id, consumer=consumer_name)
+        await _process_stream_entry(
+            client, str(msg_id), dict(fields), worker_label=consumer_name
+        )
+    return evicted
 
 
 async def _heartbeat_loop(stop_event: asyncio.Event) -> None:
@@ -168,22 +267,7 @@ async def _reclaim_loop(stop_event: asyncio.Event, consumer_name: str) -> None:
             if stop_event.is_set():
                 break
             try:
-                claimed = await client.xautoclaim(
-                    JOBS_STREAM_KEY,
-                    JOBS_GROUP_NAME,
-                    consumer_name,
-                    min_idle_time=RECLAIM_MIN_IDLE_MS,
-                    start_id="0-0",
-                    count=10,
-                )
-                messages = claimed[1] if isinstance(claimed, (list, tuple)) and len(claimed) >= 2 else []
-                for msg_id, fields in messages:
-                    if stop_event.is_set():
-                        break
-                    logger.warning("job_reclaimed", msg_id=msg_id, consumer=consumer_name)
-                    await _process_stream_entry(
-                        client, str(msg_id), dict(fields), worker_label=consumer_name
-                    )
+                await _reclaim_once(client, consumer_name, stop_event)
             except ResponseError as exc:
                 if "NOGROUP" in str(exc):
                     await ensure_consumer_group(client)

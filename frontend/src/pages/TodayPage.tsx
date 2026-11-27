@@ -414,7 +414,11 @@ export function TodayPage({ onGoSources }: { onGoSources: () => void }) {
                 className="flex flex-wrap items-center gap-3 text-xs pb-5 border-b"
                 style={{ color: "var(--fg-muted)", borderColor: "var(--border-hairline)" }}
               >
-                {activeArticle.author && <span>作者：{activeArticle.author}</span>}
+                {activeArticle.author &&
+                  activeArticle.author.trim().toLowerCase() !==
+                    (activeArticle.source_name || "").trim().toLowerCase() && (
+                    <span>作者：{activeArticle.author}</span>
+                  )}
                 <span>{new Date(activeArticle.published_at).toLocaleString("zh-CN")}</span>
                 {isSafeHttpUrl(activeArticle.canonical_url) &&
                   !activeArticle.canonical_url.includes("inkpress.local") && (

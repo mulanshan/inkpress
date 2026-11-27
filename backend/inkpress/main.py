@@ -18,6 +18,7 @@ from inkpress.api import (
     editions,
     health,
     media,
+    opds,
     settings,
     sources,
 )
@@ -108,6 +109,7 @@ def create_app() -> FastAPI:
     app.include_router(deliveries.router)
     app.include_router(settings.router)
     app.include_router(media.router)
+    app.include_router(opds.router)
     app.include_router(mcp_server.router)
 
     cfg = get_settings()

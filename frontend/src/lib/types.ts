@@ -21,14 +21,18 @@ export type SourceKind = "newsnow" | "rss" | "rsshub" | "webpage" | "webpage_lis
 export type FetchStrategy = "fulltext_rss" | "extract_web" | "newsnow_digest" | "byparr_browser";
 export type ProxyMode = "auto" | "direct" | "proxy";
 
+export type EditorialRole = "" | "anchor" | "digest" | "deep";
+
 export interface SourceAiOptions {
   summarize?: boolean;
   bilingual?: boolean;
-  title_include_regex?: string;
-  title_exclude_regex?: string;
-  link_selector?: string;
-  content_selector?: string;
-  remove_selectors?: string[];
+  editorial_role?: EditorialRole | null;
+  title_include_regex?: string | null;
+  title_exclude_regex?: string | null;
+  link_selector?: string | null;
+  content_selector?: string | null;
+  remove_selectors?: string[] | null;
+  [key: string]: unknown;
 }
 
 export interface SourceItem {
@@ -160,7 +164,7 @@ export interface DeliveryItem {
   title: string;
   trigger: string;
   target_email: string;
-  status: "pending" | "running" | "sent" | "skipped" | "failed";
+  status: "pending" | "running" | "sending_smtp" | "generated" | "sent" | "skipped" | "failed";
   article_count: number;
   volume_count: number;
   file_size_bytes: number;

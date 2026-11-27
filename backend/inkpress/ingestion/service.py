@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import html as html_escape
+import inspect
 import re
 from datetime import datetime
+from typing import Any
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
@@ -14,6 +16,7 @@ from inkpress.config import get_settings
 from inkpress.db.models import Article, Source, utcnow
 from inkpress.ingestion.extractor import (
     canonicalize_url,
+    clean_author_name,
     compute_content_hash,
     detect_language,
     estimate_word_count_and_time,
@@ -72,6 +75,20 @@ def _matches_title_filters(
     return not (exclude_re is not None and exclude_re.search(title))
 
 
+_USELESS_HINT_RE = re.compile(r"^\s*\[?\s*\d*\s*张?图片\s*\]?\s*$|^\s*\[(视频|音频|图片)\]\s*$")
+
+
+def _clean_summary_hint(hint: str, title: str) -> str:
+    cleaned = re.sub(r"\s+", " ", (hint or "").strip())
+    if not cleaned or _USELESS_HINT_RE.match(cleaned):
+        return ""
+    if cleaned == title.strip():
+        return ""
+    # Strip trailing Sina/wire disclaimers inside digest hints
+    cleaned = re.split(r"新浪声明：所有会议实录", cleaned, maxsplit=1)[0].strip()
+    return cleaned
+
+
 def _parse_remove_selectors(raw: object) -> list[str]:
     if isinstance(raw, list):
         return [str(s).strip() for s in raw if isinstance(s, str) and s.strip()]
@@ -98,6 +115,7 @@ async def _upsert_article(
     update_existing: bool = False,
 ) -> tuple[Article, bool]:
     canon = canonicalize_url(url)
+    cleaned_author = clean_author_name(author, source_name=source_name)
     existing = (
         await session.execute(select(Article).where(Article.canonical_url == canon))
     ).scalar_one_or_none()
@@ -106,8 +124,12 @@ async def _upsert_article(
             new_hash = compute_content_hash(title, plain_text)
             words, mins = estimate_word_count_and_time(plain_text)
             content_changed = existing.content_hash != new_hash
+            prev_meta = existing.extra_meta if isinstance(existing.extra_meta, dict) else {}
+            next_meta: dict[str, object] = dict(extra_meta or {})
+            if "delivered_sigs_by_edition" in prev_meta and "delivered_sigs_by_edition" not in next_meta:
+                next_meta["delivered_sigs_by_edition"] = prev_meta["delivered_sigs_by_edition"]
             existing.title = title[:500]
-            existing.author = author[:250]
+            existing.author = cleaned_author[:250]
             existing.source_name = source_name[:160]
             existing.category = category[:64]
             existing.language = language[:16]
@@ -119,7 +141,7 @@ async def _upsert_article(
             existing.content_hash = new_hash
             existing.word_count = words
             existing.reading_time_min = mins
-            existing.extra_meta = extra_meta or {}
+            existing.extra_meta = next_meta
             if content_changed:
                 existing.ai_summary = None
                 existing.bilingual_html = None
@@ -128,13 +150,20 @@ async def _upsert_article(
 
     content_hash = compute_content_hash(title, plain_text)
     dup_by_hash = (
-        await session.execute(
-            select(Article).where(
-                Article.content_hash == content_hash,
-                Article.source_id == (source.id if source else None),
+        (
+            await session.execute(
+                select(Article)
+                .where(
+                    Article.content_hash == content_hash,
+                    Article.source_id == (source.id if source else None),
+                )
+                .order_by(Article.id.desc())
+                .limit(1)
             )
         )
-    ).scalar_one_or_none()
+        .scalars()
+        .first()
+    )
     if dup_by_hash is not None:
         return dup_by_hash, False
 
@@ -144,7 +173,7 @@ async def _upsert_article(
         canonical_url=canon,
         content_hash=content_hash,
         title=title[:500],
-        author=author[:250],
+        author=cleaned_author[:250],
         source_name=source_name[:160],
         category=category[:64],
         language=language[:16],
@@ -188,10 +217,13 @@ async def sync_source(session: AsyncSession, source: Source) -> dict[str, int]:
 
     try:
         if source.kind == "newsnow":
+            nn_kwargs: dict[str, Any] = {"latest": True}
+            if "outbound_proxy" in inspect.signature(fetch_newsnow_source).parameters:
+                nn_kwargs["outbound_proxy"] = str(net.get("outbound_proxy") or "")
             raw_entries = await fetch_newsnow_source(
                 source.identifier,
                 net["newsnow_base_url"],
-                latest=True,
+                **nn_kwargs,
             )
             if not raw_entries:
                 logger.warning(
@@ -223,19 +255,60 @@ async def sync_source(session: AsyncSession, source: Source) -> dict[str, int]:
                     now_local = datetime.now(tz)
                     date_slot = now_local.strftime("%Y-%m-%d")
                     digest_url = f"https://inkpress.local/newsnow/{source.identifier}/{date_slot}"
+                    items_sig = compute_content_hash(
+                        source.identifier,
+                        "\n".join(f"{e.title}|{e.summary_hint[:120]}" for e in entries),
+                    )
+                    # Guard against unchanged multi-day stale upstream lists creating a new daily article
+                    prev_row = (
+                        (
+                            await session.execute(
+                                select(Article)
+                                .where(
+                                    Article.source_id == source.id,
+                                    Article.canonical_url != canonicalize_url(digest_url),
+                                )
+                                .order_by(Article.id.desc())
+                                .limit(1)
+                            )
+                        )
+                        .scalars()
+                        .first()
+                    )
+                    if (
+                        prev_row is not None
+                        and isinstance(prev_row.extra_meta, dict)
+                        and prev_row.extra_meta.get("items_sig") == items_sig
+                    ):
+                        skipped_count += len(entries)
+                        source.last_fetched_at = utcnow()
+                        await session.commit()
+                        return {"new": 0, "skipped": skipped_count, "failed": 0}
+
                     blocks: list[str] = []
                     plain_parts: list[str] = []
+                    structured_items: list[dict[str, str]] = []
+                    first_lead_img: str | None = None
                     for idx, item in enumerate(entries, start=1):
                         safe_title = html_escape.escape(item.title)
                         safe_url = _safe_http_url(item.url)
+                        safe_img = _safe_http_url(getattr(item, "image_url", ""))
+                        cleaned_hint = _clean_summary_hint(item.summary_hint, item.title)
+                        if safe_img and first_lead_img is None:
+                            first_lead_img = safe_img
                         badge = (
                             f' <span class="meta-tag">[{html_escape.escape(item.info_tag)}]</span>'
                             if item.info_tag
                             else ""
                         )
                         hint_html = (
-                            f"<p>{html_escape.escape(item.summary_hint)}</p>"
-                            if item.summary_hint
+                            f"<p>{html_escape.escape(cleaned_hint)}</p>"
+                            if cleaned_hint
+                            else ""
+                        )
+                        img_html = (
+                            f'<figure><img src="{html_escape.escape(safe_img, quote=True)}" alt="{safe_title}"/></figure>'
+                            if safe_img
                             else ""
                         )
                         link_html = (
@@ -247,12 +320,24 @@ async def sync_source(session: AsyncSession, source: Source) -> dict[str, int]:
                             f'<div class="digest-item">'
                             f"<h3>{idx}. {safe_title}{badge}</h3>"
                             f"{hint_html}"
+                            f"{img_html}"
                             f"{link_html}"
                             f"</div>"
                         )
-                        plain_parts.append(f"{idx}. {item.title} {item.summary_hint}".strip())
+                        plain_parts.append(f"{idx}. {item.title} {cleaned_hint}".strip())
+                        structured_items.append(
+                            {
+                                "title": item.title,
+                                "summary": cleaned_hint,
+                                "info_tag": item.info_tag,
+                                "url": safe_url,
+                                "image_url": safe_img,
+                            }
+                        )
                     raw_digest_html = "\n".join(blocks)
-                    digest_html, sanitized_plain, _ = sanitize_article_html(raw_digest_html)
+                    digest_html, sanitized_plain, extracted_lead = sanitize_article_html(
+                        raw_digest_html
+                    )
                     digest_plain = sanitized_plain or "\n".join(plain_parts)
                     digest_title = f"{source.name} · 热点速览 ({date_slot})"
                     _, created = await _upsert_article(
@@ -264,7 +349,7 @@ async def sync_source(session: AsyncSession, source: Source) -> dict[str, int]:
                         published_at=now_local,
                         clean_html=digest_html,
                         plain_text=digest_plain,
-                        lead_image_url=None,
+                        lead_image_url=extracted_lead or first_lead_img,
                         language=detect_language(digest_plain),
                         category=source.category,
                         source_name=source.name,
@@ -272,6 +357,8 @@ async def sync_source(session: AsyncSession, source: Source) -> dict[str, int]:
                             "newsnow_id": source.identifier,
                             "item_count": len(entries),
                             "date_slot": date_slot,
+                            "items_sig": items_sig,
+                            "digest_items": structured_items,
                         },
                         update_existing=True,
                     )
@@ -283,7 +370,12 @@ async def sync_source(session: AsyncSession, source: Source) -> dict[str, int]:
                 sem = asyncio.Semaphore(1 if source.fetch_strategy == "byparr_browser" else 4)
 
                 async def _extract_one(
-                    url: str, title: str, hint: str, pub_dt: datetime, info_tag: str
+                    url: str,
+                    title: str,
+                    hint: str,
+                    pub_dt: datetime,
+                    info_tag: str,
+                    item_img: str = "",
                 ) -> tuple[str, str, str, datetime, str, str, str | None, str] | None:
                     safe_url = _safe_http_url(url)
                     if not safe_url:
@@ -314,19 +406,31 @@ async def sync_source(session: AsyncSession, source: Source) -> dict[str, int]:
                                     pub_dt,
                                     extracted.clean_html,
                                     extracted.plain_text,
-                                    extracted.lead_image_url,
+                                    extracted.lead_image_url or _safe_http_url(item_img) or None,
                                     extracted.language,
                                 )
                         except Exception:
                             pass
-                        # Graceful fallback to title + summary hint so NewsNow items are never lost
-                        fallback_text = hint or f"{title}（来源：{source.name}）"
-                        raw_fallback_html = (
-                            f"<p>{html_escape.escape(fallback_text)}</p>"
-                            f'<p><a href="{html_escape.escape(safe_url, quote=True)}">阅读原文</a></p>'
+                        # Only fall back if upstream provided a real substantive summary (>= 40 chars);
+                        # never fabricate title-only empty shell chapters!
+                        cleaned_hint = _clean_summary_hint(hint, title)
+                        if len(cleaned_hint) < 40:
+                            return None
+                        safe_img = _safe_http_url(item_img)
+                        img_part = (
+                            f'<figure><img src="{html_escape.escape(safe_img, quote=True)}" alt="{html_escape.escape(title)}"/></figure>'
+                            if safe_img
+                            else ""
                         )
-                        fallback_html, sanitized_plain, _ = sanitize_article_html(raw_fallback_html)
-                        final_plain = sanitized_plain or fallback_text
+                        raw_fallback_html = (
+                            f"<p>{html_escape.escape(cleaned_hint)}</p>"
+                            f"{img_part}"
+                            f'<p class="source-link"><a href="{html_escape.escape(safe_url, quote=True)}">阅读原文</a></p>'
+                        )
+                        fallback_html, sanitized_plain, lead_out = sanitize_article_html(
+                            raw_fallback_html
+                        )
+                        final_plain = sanitized_plain or cleaned_hint
                         return (
                             safe_url,
                             title,
@@ -334,7 +438,7 @@ async def sync_source(session: AsyncSession, source: Source) -> dict[str, int]:
                             pub_dt,
                             fallback_html,
                             final_plain,
-                            None,
+                            lead_out or (safe_img or None),
                             detect_language(f"{title} {final_plain}"),
                         )
 
@@ -362,7 +466,14 @@ async def sync_source(session: AsyncSession, source: Source) -> dict[str, int]:
 
                 extracted_list = await asyncio.gather(
                     *[
-                        _extract_one(e.url, e.title, e.summary_hint, e.pub_date, e.info_tag)
+                        _extract_one(
+                            e.url,
+                            e.title,
+                            e.summary_hint,
+                            e.pub_date,
+                            e.info_tag,
+                            getattr(e, "image_url", ""),
+                        )
                         for e in to_fetch
                     ],
                     return_exceptions=True,
@@ -477,7 +588,15 @@ async def sync_source(session: AsyncSession, source: Source) -> dict[str, int]:
                     except Exception as exc:
                         logger.debug("rss_web_extract_fallback", url=rss_item.url, err=str(exc))
 
-                if not plain_text:
+                has_img = "<img" in clean_html.lower()
+                if not plain_text and not has_img:
+                    failed_items += 1
+                    continue
+                if (
+                    source.fetch_strategy != "fulltext_rss"
+                    and not has_img
+                    and (len(plain_text) < 40 or plain_text.strip() == art_title.strip())
+                ):
                     failed_items += 1
                     continue
 
@@ -553,7 +672,7 @@ async def sync_source(session: AsyncSession, source: Source) -> dict[str, int]:
 
             async def _fetch_list_item(
                 item_url: str, item_text: str
-            ) -> tuple[str, str, str, str, str, str | None, str, bool] | None:
+            ) -> tuple[str, str, str, datetime, str, str, str | None, str, bool] | None:
                 async with sem:
                     raw_art_html, final_url = await smart_fetch_text(
                         item_url,
@@ -572,16 +691,18 @@ async def sync_source(session: AsyncSession, source: Source) -> dict[str, int]:
                         remove_selectors=remove_selectors,
                     )
                     final_title = extracted.title or item_text
+                    pub_dt = extracted.published_at or utcnow()
                     if not item_text and not _matches_title_filters(
                         final_title, include_re, exclude_re
                     ):
-                        return (final_url, final_title, "", "", "", None, "zh-CN", True)
+                        return (final_url, final_title, "", pub_dt, "", "", None, "zh-CN", True)
                     if len(extracted.plain_text) < 40:
                         return None
                     return (
                         final_url,
                         final_title,
-                        extracted.author or source.name,
+                        extracted.author,
+                        pub_dt,
                         extracted.clean_html,
                         extracted.plain_text,
                         extracted.lead_image_url,
@@ -601,6 +722,7 @@ async def sync_source(session: AsyncSession, source: Source) -> dict[str, int]:
                     wl_url,
                     wl_title,
                     wl_author,
+                    wl_pub_dt,
                     wl_html,
                     wl_plain,
                     wl_lead_img,
@@ -616,7 +738,7 @@ async def sync_source(session: AsyncSession, source: Source) -> dict[str, int]:
                     url=wl_url,
                     title=wl_title,
                     author=wl_author,
-                    published_at=utcnow(),
+                    published_at=wl_pub_dt,
                     clean_html=wl_html,
                     plain_text=wl_plain,
                     lead_image_url=wl_lead_img,
@@ -650,8 +772,8 @@ async def sync_source(session: AsyncSession, source: Source) -> dict[str, int]:
                 source=source,
                 url=final_url,
                 title=extracted.title,
-                author=extracted.author or source.name,
-                published_at=utcnow(),
+                author=extracted.author,
+                published_at=extracted.published_at or utcnow(),
                 clean_html=extracted.clean_html,
                 plain_text=extracted.plain_text,
                 lead_image_url=extracted.lead_image_url,

@@ -5,6 +5,8 @@ import {
   Bot,
   Calendar,
   CheckCircle2,
+  ChevronDown,
+  ChevronUp,
   Copy,
   Globe,
   KeyRound,
@@ -35,6 +37,21 @@ import { useToast } from "../components/Toast";
 type StudioTab = "editions" | "deliveries" | "settings";
 type CoverStyle = "editorial" | "dark" | "minimal";
 
+interface EditableSourceLink {
+  source_id: number;
+  max_items_override: number | null;
+}
+
+const DELIVERY_STATUS_LABELS: Record<string, string> = {
+  pending: "排队中",
+  running: "编译中",
+  sending_smtp: "SMTP 发信中",
+  generated: "已生成预览",
+  sent: "已推送",
+  skipped: "已跳过",
+  failed: "失败",
+};
+
 export function StudioPage() {
   const qc = useQueryClient();
   const { notify } = useToast();
@@ -49,8 +66,10 @@ export function StudioPage() {
   const [edLookback, setEdLookback] = useState(24);
   const [edRetentionDays, setEdRetentionDays] = useState(30);
   const [edStripLinks, setEdStripLinks] = useState(true);
+  const [edGrayscale, setEdGrayscale] = useState(false);
+  const [edIncludeQr, setEdIncludeQr] = useState(false);
   const [edAiBrief, setEdAiBrief] = useState(true);
-  const [selectedSourceIds, setSelectedSourceIds] = useState<number[]>([]);
+  const [selectedSources, setSelectedSources] = useState<EditableSourceLink[]>([]);
 
   // Edit edition modal state
   const [editingEdition, setEditingEdition] = useState<EditionItem | null>(null);
@@ -63,10 +82,12 @@ export function StudioPage() {
   const [editEdMaxArticles, setEditEdMaxArticles] = useState(40);
   const [editEdRetentionDays, setEditEdRetentionDays] = useState(30);
   const [editEdStripLinks, setEditEdStripLinks] = useState(true);
+  const [editEdGrayscale, setEditEdGrayscale] = useState(false);
+  const [editEdIncludeQr, setEditEdIncludeQr] = useState(false);
   const [editEdAiBrief, setEditEdAiBrief] = useState(true);
   const [editEdEnabled, setEditEdEnabled] = useState(true);
   const [editEdTargets, setEditEdTargets] = useState("");
-  const [editEdSourceIds, setEditEdSourceIds] = useState<number[]>([]);
+  const [editEdSources, setEditEdSources] = useState<EditableSourceLink[]>([]);
   const [editEdSaving, setEditEdSaving] = useState(false);
 
   // Settings local drafts
@@ -183,10 +204,30 @@ export function StudioPage() {
     setEditEdMaxArticles(ed.max_articles);
     setEditEdRetentionDays(ed.retention_days ?? 30);
     setEditEdStripLinks(ed.strip_links ?? true);
+    setEditEdGrayscale(Boolean(ed.grayscale_images));
+    setEditEdIncludeQr(Boolean(ed.include_qr_links));
     setEditEdAiBrief(ed.ai_briefing_enabled);
     setEditEdEnabled(ed.enabled);
     setEditEdTargets(ed.target_emails);
-    setEditEdSourceIds(ed.sources.map((s) => s.source_id));
+    setEditEdSources(
+      ed.sources.map((s) => ({
+        source_id: s.source_id,
+        max_items_override: s.max_items_override ?? null,
+      })),
+    );
+  };
+
+  const moveSourceLink = (
+    list: EditableSourceLink[],
+    index: number,
+    dir: -1 | 1,
+  ): EditableSourceLink[] => {
+    const nextIdx = index + dir;
+    if (nextIdx < 0 || nextIdx >= list.length) return list;
+    const copy = [...list];
+    const [item] = copy.splice(index, 1);
+    copy.splice(nextIdx, 0, item);
+    return copy;
   };
 
   const toggleEditionEnabled = async (ed: EditionItem) => {
@@ -210,7 +251,7 @@ export function StudioPage() {
   const saveEditedEdition = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!editingEdition) return;
-    if (editEdSourceIds.length === 0) {
+    if (editEdSources.length === 0) {
       notify("请至少保留 1 个订阅源", "error");
       return;
     }
@@ -228,10 +269,16 @@ export function StudioPage() {
           max_articles: editEdMaxArticles,
           retention_days: editEdRetentionDays,
           strip_links: editEdStripLinks,
+          grayscale_images: editEdGrayscale,
+          include_qr_links: editEdIncludeQr,
           ai_briefing_enabled: editEdAiBrief,
           enabled: editEdEnabled,
           target_emails: editEdTargets.trim(),
-          sources: editEdSourceIds.map((id, idx) => ({ source_id: id, sort_order: idx })),
+          sources: editEdSources.map((item, idx) => ({
+            source_id: item.source_id,
+            sort_order: idx,
+            max_items_override: item.max_items_override,
+          })),
         }),
       });
       setEditingEdition(null);
@@ -246,7 +293,7 @@ export function StudioPage() {
 
   const createEdition = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (selectedSourceIds.length === 0) {
+    if (selectedSources.length === 0) {
       notify("请至少勾选 1 个订阅源", "error");
       return;
     }
@@ -261,8 +308,14 @@ export function StudioPage() {
           lookback_hours: edLookback,
           retention_days: edRetentionDays,
           strip_links: edStripLinks,
+          grayscale_images: edGrayscale,
+          include_qr_links: edIncludeQr,
           ai_briefing_enabled: edAiBrief,
-          sources: selectedSourceIds.map((id, idx) => ({ source_id: id, sort_order: idx })),
+          sources: selectedSources.map((item, idx) => ({
+            source_id: item.source_id,
+            sort_order: idx,
+            max_items_override: item.max_items_override,
+          })),
         }),
       });
       await qc.invalidateQueries({ queryKey: ["editions"] });
@@ -274,13 +327,17 @@ export function StudioPage() {
 
   const triggerEdition = async (ed: EditionItem, sendEmail: boolean) => {
     try {
-      await apiRequest(`/api/v1/editions/${ed.id}/deliver?send_email=${sendEmail}`, {
-        method: "POST",
-      });
+      const ignoreDedup = !sendEmail;
+      await apiRequest(
+        `/api/v1/editions/${ed.id}/deliver?send_email=${sendEmail}&ignore_dedup=${ignoreDedup}`,
+        {
+          method: "POST",
+        },
+      );
       notify(
         sendEmail
           ? `已触发《${ed.name}》编译并推送至 Kindle`
-          : `已触发《${ed.name}》仅生成 EPUB 归档`,
+          : `已触发《${ed.name}》重新生成预览 EPUB 归档`,
         "success",
       );
       setTab("deliveries");
@@ -592,6 +649,7 @@ export function StudioPage() {
                         }}
                       >
                         {s.source_name}
+                        {s.max_items_override ? ` · 限${s.max_items_override}` : ""}
                       </span>
                     ))}
                   </div>
@@ -603,8 +661,10 @@ export function StudioPage() {
                       {ed.retention_days ?? 30}天
                     </div>
                     <div>
-                      {ed.ai_briefing_enabled ? "含 AI 头版综述" : "无 AI 综述"} ·{" "}
+                      {ed.ai_briefing_enabled ? "AI 图卦式全网辑要与跨源去重" : "原样分章汇编"} ·{" "}
                       {ed.strip_links !== false ? "剥离正文超链接（防误触）" : "保留正文超链接"}
+                      {ed.grayscale_images ? " · 灰阶高对比" : ""}
+                      {ed.include_qr_links ? " · 文末二维码" : ""}
                     </div>
                     {ed.enabled && ed.next_run_at && (
                       <div>下次发行：{new Date(ed.next_run_at).toLocaleString("zh-CN")}</div>
@@ -748,16 +808,32 @@ export function StudioPage() {
               <label className="flex items-center gap-1.5 cursor-pointer">
                 <input
                   type="checkbox"
+                  checked={edGrayscale}
+                  onChange={(e) => setEdGrayscale(e.target.checked)}
+                />
+                <span>墨水屏灰阶与对比度增强</span>
+              </label>
+              <label className="flex items-center gap-1.5 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={edIncludeQr}
+                  onChange={(e) => setEdIncludeQr(e.target.checked)}
+                />
+                <span>文末附原文二维码</span>
+              </label>
+              <label className="flex items-center gap-1.5 cursor-pointer">
+                <input
+                  type="checkbox"
                   checked={edAiBrief}
                   onChange={(e) => setEdAiBrief(e.target.checked)}
                 />
-                <span>生成 AI 今日头版综述</span>
+                <span>启用 AI 图卦式全网辑要与跨源去重</span>
               </label>
             </div>
 
             <div>
               <div className="text-xs font-medium mb-2" style={{ color: "var(--fg-secondary)" }}>
-                勾选收录的订阅源：
+                勾选收录的订阅源（按点击顺序编排，已选 {selectedSources.length} 个）：
               </div>
               {sources.length === 0 ? (
                 <p className="text-xs" style={{ color: "var(--fg-muted)" }}>
@@ -766,14 +842,16 @@ export function StudioPage() {
               ) : (
                 <div className="flex flex-wrap gap-2">
                   {sources.map((src) => {
-                    const checked = selectedSourceIds.includes(src.id);
+                    const checked = selectedSources.some((s) => s.source_id === src.id);
                     return (
                       <button
                         key={src.id}
                         type="button"
                         onClick={() =>
-                          setSelectedSourceIds((prev) =>
-                            checked ? prev.filter((id) => id !== src.id) : [...prev, src.id],
+                          setSelectedSources((prev) =>
+                            checked
+                              ? prev.filter((s) => s.source_id !== src.id)
+                              : [...prev, { source_id: src.id, max_items_override: null }],
                           )
                         }
                         className="text-xs px-3 py-1.5 rounded-full border cursor-pointer"
@@ -839,20 +917,24 @@ export function StudioPage() {
                         backgroundColor:
                           d.status === "sent"
                             ? "var(--fg-primary)"
-                            : d.status === "failed"
-                              ? "var(--bg-danger-soft)"
-                              : "var(--bg-subtle)",
+                            : d.status === "generated"
+                              ? "var(--accent-soft)"
+                              : d.status === "failed"
+                                ? "var(--bg-danger-soft)"
+                                : "var(--bg-subtle)",
                         color:
                           d.status === "sent"
                             ? "var(--bg-canvas)"
-                            : d.status === "failed"
-                              ? "var(--fg-danger)"
-                              : "var(--fg-secondary)",
+                            : d.status === "generated"
+                              ? "var(--accent)"
+                              : d.status === "failed"
+                                ? "var(--fg-danger)"
+                                : "var(--fg-secondary)",
                         borderColor:
                           d.status === "failed" ? "var(--border-danger)" : "transparent",
                       }}
                     >
-                      {d.status}
+                      {DELIVERY_STATUS_LABELS[d.status] ?? d.status}
                     </span>
                     <span className="text-xs" style={{ color: "var(--fg-muted)" }}>
                       {d.trigger} · {formatRelativeTime(d.created_at)}
@@ -1600,42 +1682,179 @@ export function StudioPage() {
                 <label className="flex items-center gap-2 cursor-pointer">
                   <input
                     type="checkbox"
+                    checked={editEdGrayscale}
+                    onChange={(e) => setEditEdGrayscale(e.target.checked)}
+                  />
+                  <span>墨水屏灰阶与对比度增强</span>
+                </label>
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={editEdIncludeQr}
+                    onChange={(e) => setEditEdIncludeQr(e.target.checked)}
+                  />
+                  <span>文末附原文二维码</span>
+                </label>
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
                     checked={editEdAiBrief}
                     onChange={(e) => setEditEdAiBrief(e.target.checked)}
                   />
-                  <span>生成 AI 今日头版综述</span>
+                  <span>启用 AI 图卦式全网辑要与跨源去重</span>
                 </label>
               </div>
 
-              <div>
-                <div className="font-medium mb-2" style={{ color: "var(--fg-secondary)" }}>
-                  绑定订阅源（已选 {editEdSourceIds.length} 个）：
+              <div className="space-y-3">
+                <div className="font-medium" style={{ color: "var(--fg-secondary)" }}>
+                  已绑定订阅源顺序与每源篇数配额（已选 {editEdSources.length} 个，顶部优先置顶）：
                 </div>
-                <div className="flex flex-wrap gap-2">
-                  {sources.map((src) => {
-                    const checked = editEdSourceIds.includes(src.id);
-                    return (
-                      <button
-                        key={src.id}
-                        type="button"
-                        onClick={() =>
-                          setEditEdSourceIds((prev) =>
-                            checked ? prev.filter((id) => id !== src.id) : [...prev, src.id],
-                          )
-                        }
-                        className="text-xs px-3 py-1.5 rounded-full border cursor-pointer"
-                        style={{
-                          backgroundColor: checked ? "var(--accent)" : "var(--bg-canvas)",
-                          color: checked ? "var(--accent-fg)" : "var(--fg-secondary)",
-                          borderColor: "var(--border-hairline)",
-                        }}
-                      >
-                        {checked ? "✓ " : "+ "}
-                        {src.name}
-                      </button>
-                    );
-                  })}
-                </div>
+                {editEdSources.length > 0 && (
+                  <div className="space-y-1.5">
+                    {editEdSources.map((link, idx) => {
+                      const srcMeta = sources.find((s) => s.id === link.source_id);
+                      const fallbackLink = editingEdition.sources.find(
+                        (s) => s.source_id === link.source_id,
+                      );
+                      const label =
+                        srcMeta?.name || fallbackLink?.source_name || `Source #${link.source_id}`;
+                      const cat = srcMeta?.category || fallbackLink?.source_category || "";
+                      return (
+                        <div
+                          key={link.source_id}
+                          className="flex flex-wrap items-center justify-between gap-2 rounded-lg border px-3 py-1.5"
+                          style={{
+                            backgroundColor: "var(--bg-canvas)",
+                            borderColor: "var(--border-hairline)",
+                          }}
+                        >
+                          <div className="flex items-center gap-2 min-w-0">
+                            <span
+                              className="text-[11px] font-mono w-5 text-center"
+                              style={{ color: "var(--fg-muted)" }}
+                            >
+                              {idx + 1}
+                            </span>
+                            <span className="font-medium truncate">{label}</span>
+                            {cat && (
+                              <span
+                                className="text-[11px] px-1.5 py-0.5 rounded"
+                                style={{
+                                  backgroundColor: "var(--bg-subtle)",
+                                  color: "var(--fg-muted)",
+                                }}
+                              >
+                                {cat}
+                              </span>
+                            )}
+                          </div>
+                          <div className="flex items-center gap-1.5">
+                            <label className="flex items-center gap-1 text-[11px]">
+                              <span style={{ color: "var(--fg-muted)" }}>篇数配额:</span>
+                              <input
+                                type="number"
+                                min={1}
+                                max={60}
+                                placeholder="默认"
+                                value={link.max_items_override ?? ""}
+                                onChange={(e) => {
+                                  const raw = e.target.value.trim();
+                                  const parsed = raw ? Math.min(60, Math.max(1, Number(raw))) : null;
+                                  setEditEdSources((prev) =>
+                                    prev.map((item, i) =>
+                                      i === idx
+                                        ? {
+                                            ...item,
+                                            max_items_override:
+                                              parsed !== null && !Number.isNaN(parsed)
+                                                ? parsed
+                                                : null,
+                                          }
+                                        : item,
+                                    ),
+                                  );
+                                }}
+                                className="w-16 rounded border px-1.5 py-0.5 text-center"
+                                style={{
+                                  backgroundColor: "var(--bg-surface)",
+                                  borderColor: "var(--border-hairline)",
+                                }}
+                              />
+                            </label>
+                            <button
+                              type="button"
+                              disabled={idx === 0}
+                              onClick={() => setEditEdSources((p) => moveSourceLink(p, idx, -1))}
+                              className="p-1 rounded border cursor-pointer disabled:opacity-35"
+                              style={{ borderColor: "var(--border-hairline)" }}
+                              title="上移"
+                            >
+                              <ChevronUp className="w-3 h-3" />
+                            </button>
+                            <button
+                              type="button"
+                              disabled={idx === editEdSources.length - 1}
+                              onClick={() => setEditEdSources((p) => moveSourceLink(p, idx, 1))}
+                              className="p-1 rounded border cursor-pointer disabled:opacity-35"
+                              style={{ borderColor: "var(--border-hairline)" }}
+                              title="下移"
+                            >
+                              <ChevronDown className="w-3 h-3" />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setEditEdSources((p) =>
+                                  p.filter((item) => item.source_id !== link.source_id),
+                                )
+                              }
+                              className="p-1 rounded border cursor-pointer"
+                              style={{
+                                borderColor: "var(--border-hairline)",
+                                color: "var(--fg-muted)",
+                              }}
+                              title="移除该源"
+                            >
+                              <X className="w-3 h-3" />
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+
+                {sources.some((src) => !editEdSources.some((l) => l.source_id === src.id)) && (
+                  <div>
+                    <div className="text-[11px] mb-1.5" style={{ color: "var(--fg-muted)" }}>
+                      点击添加未绑定的订阅源：
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      {sources
+                        .filter((src) => !editEdSources.some((l) => l.source_id === src.id))
+                        .map((src) => (
+                          <button
+                            key={src.id}
+                            type="button"
+                            onClick={() =>
+                              setEditEdSources((prev) => [
+                                ...prev,
+                                { source_id: src.id, max_items_override: null },
+                              ])
+                            }
+                            className="text-xs px-3 py-1 rounded-full border cursor-pointer"
+                            style={{
+                              backgroundColor: "var(--bg-canvas)",
+                              color: "var(--fg-secondary)",
+                              borderColor: "var(--border-hairline)",
+                            }}
+                          >
+                            + {src.name}
+                          </button>
+                        ))}
+                    </div>
+                  </div>
+                )}
               </div>
             </div>
 

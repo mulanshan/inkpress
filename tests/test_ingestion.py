@@ -13,6 +13,8 @@ from inkpress.db.base import Base, get_engine, get_session_factory, reset_db_glo
 from inkpress.db.models import Article, Source
 from inkpress.ingestion.extractor import (
     canonicalize_url,
+    clean_author_name,
+    compute_content_hash,
     detect_language,
     extract_from_webpage,
     extract_links_from_list_page,
@@ -22,13 +24,14 @@ from inkpress.ingestion.fetcher import (
     assert_safe_public_url,
     decode_response_bytes,
     fetch_via_byparr,
+    infer_default_image_referer,
     is_safe_public_url,
     should_use_proxy,
     smart_fetch_bytes,
     smart_fetch_text,
 )
 from inkpress.ingestion.newsnow_catalog import CURATED_RSS_PRESETS, NEWSNOW_BY_ID, NEWSNOW_CATALOG
-from inkpress.ingestion.newsnow_client import NewsNowEntry, fetch_newsnow_source
+from inkpress.ingestion.newsnow_client import NewsNowEntry, _parse_pub_date, fetch_newsnow_source
 from inkpress.ingestion.rss_client import RssEntry, resolve_feed_url
 from inkpress.ingestion.service import sync_source
 from sqlalchemy import select
@@ -498,6 +501,24 @@ async def test_sync_source_newsnow_digest_daily_update_empty_error_and_xss(
     assert arts2[0].id == arts1[0].id
     assert "新增热点三" in arts2[0].plain_text
 
+    # 4. UI chrome images & portal boilerplate are stripped; extract_web drops hollow title-only failures
+    noisy_html = (
+        "<div><ul><li>+1</li></ul>"
+        '<img src="https://www.thepaper.cn/_next/static/media/logo_rebang.0c68301c.png" alt="澎湃热榜"/>'
+        '<img src="https://imgpai.thepaper.cn/newpai/image/real_news.jpg" alt="新闻现场"/>'
+        '<img src="https://cdn.example.com/dl.png" alt="扫码下载澎湃新闻客户端"/>'
+        "<p>这是一段真实新闻正文内容。</p>"
+        "<p>沪ICP备14003370号</p><p>喷嚏网官方App :【安卓】下载</p></div>"
+    )
+    cleaned_h, cleaned_p, cleaned_lead = sanitize_article_html(noisy_html)
+    assert "real_news.jpg" in cleaned_h
+    assert "logo_rebang" not in cleaned_h
+    assert "dl.png" not in cleaned_h
+    assert "沪ICP备" not in cleaned_p
+    assert "喷嚏网官方App" not in cleaned_p
+    assert "+1" not in cleaned_p
+    assert cleaned_lead == "https://imgpai.thepaper.cn/newpai/image/real_news.jpg"
+
 
 async def test_sync_source_rss_regex_filter_and_webpage_list(
     db_session: Any,
@@ -742,3 +763,180 @@ async def test_fetch_via_byparr_serializes_concurrent_calls(
     stats = await sync_source(db_session, wl_src)
     assert stats["new"] == 3
     assert svc_max_in_flight == 1
+
+
+async def test_timezone_direct_newsnow_handlers_author_cleaning_v2ex_and_dup_hash(
+    db_session: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 1. P1-1: Naive CST string '2026-11-27 12:00:19' -> 04:00:19 UTC (NOT +8h future!) + RFC-2822
+    monkeypatch.setenv("TZ", "Asia/Shanghai")
+    get_settings.cache_clear()
+    dt_naive = _parse_pub_date("2026-11-27 12:00:19")
+    assert dt_naive == datetime(2026, 11, 27, 4, 0, 19, tzinfo=UTC)
+    dt_rfc = _parse_pub_date("Fri, 27 Nov 2026 12:30:00 +0800")
+    assert dt_rfc == datetime(2026, 11, 27, 4, 30, 0, tzinfo=UTC)
+
+    # 2. P2-1: Dirty author string cleanup & V2EX reply stripping & webpage published_at extraction
+    assert clean_author_name("发布：; 国际时政 来源： 联合早报中文网") == ""
+    assert clean_author_name("作者： 故渊") == "故渊"
+    assert clean_author_name("吳麗雪（") == "吳麗雪"
+    assert clean_author_name("财联社热门", source_name="财联社热门") == ""
+
+    v2ex_html = (
+        '<html><head><meta property="article:published_time" content="2026-11-26T10:00:00+08:00"/></head>'
+        "<body>"
+        '<div class="topic_content"><p>我开源了一个轻量级电子纸排版命令行工具，欢迎体验交流。</p></div>'
+        '<div class="subtle"><p>附言：已更新 Docker 镜像构建脚本。</p></div>'
+        '<div id="r_101" class="cell"><div class="reply_content">一楼前排灌水支持一下</div></div>'
+        "</body></html>"
+    )
+    ex_v2 = extract_from_webpage(v2ex_html, "https://www.v2ex.com/t/1099999", fallback_title="开源工具")
+    assert "轻量级电子纸排版" in ex_v2.plain_text
+    assert "附言：已更新" in ex_v2.plain_text
+    assert "一楼前排灌水" not in ex_v2.plain_text
+    assert ex_v2.published_at == datetime(2026, 11, 26, 2, 0, 0, tzinfo=UTC)
+
+    # 3. P1-3: Direct handlers for aihot, douban (with Referer), toutiao, and mktnews + domain Referer map
+    assert infer_default_image_referer("https://img2.doubanio.com/view/photo/p1.jpg") == "https://movie.douban.com/"
+    assert infer_default_image_referer("https://wx1.sinaimg.cn/large/a.jpg") == "https://weibo.com/"
+
+    seen_douban_ref = ""
+
+    def direct_mock_handler(req: httpx.Request) -> httpx.Response:
+        nonlocal seen_douban_ref
+        host = req.url.host
+        if "aihot.news" in host:
+            return httpx.Response(
+                200,
+                json={
+                    "items": [
+                        {
+                            "id": "ai1",
+                            "title": "实测本地量化推理框架",
+                            "summary": "详细对比了多种 4-bit 量化方案的吞吐表现。",
+                            "source": {"name": "机器之心"},
+                            "links": {"original": "https://example.com/ai1"},
+                            "publishedAt": "2026-11-27T01:00:00Z",
+                            "score": 88,
+                        }
+                    ]
+                },
+            )
+        if "m.douban.com" in host:
+            seen_douban_ref = req.headers.get("Referer", "")
+            return httpx.Response(
+                200,
+                json={
+                    "subject_collection_items": [
+                        {
+                            "id": "37001",
+                            "title": "好东西",
+                            "type_name": "电影",
+                            "card_subtitle": "2026 / 剧情 喜剧",
+                            "rating": {"value": 9.1},
+                            "cover": {"url": "https://img2.doubanio.com/view/photo/p37001.jpg"},
+                            "comments": [{"comment": "轻松犀利的都市叙事"}],
+                        }
+                    ]
+                },
+            )
+        if "toutiao.com" in host:
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "ClusterIdStr": "77123",
+                            "Title": "央行开展逆回购操作",
+                            "HotValue": "18500000",
+                            "Image": {"url": "https://p3-sign.toutiaoimg.com/cover.jpeg"},
+                        }
+                    ]
+                },
+            )
+        if "mktnews.net" in host:
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "id": "m1",
+                            "type": 1,
+                            "time": "2026-11-27T01:30:00Z",
+                            "important": 1,
+                            "data": {
+                                "title": "规模以上工业企业利润同比",
+                                "country": "中国",
+                                "unit": "%",
+                                "actual": 20.1,
+                                "consensus": 16.0,
+                                "previous": "14.4",
+                            },
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(404)
+
+    real_client = httpx.AsyncClient
+    mock_transport = httpx.MockTransport(direct_mock_handler)
+    monkeypatch.setattr(
+        "inkpress.ingestion.newsnow_client.httpx.AsyncClient",
+        lambda **kw: real_client(transport=mock_transport),
+    )
+
+    ai_entries = await fetch_newsnow_source("aihot", "http://newsnow:4444")
+    assert len(ai_entries) == 1
+    assert "机器之心" in ai_entries[0].summary_hint and ai_entries[0].info_tag == "88分"
+
+    db_entries = await fetch_newsnow_source("douban", "http://newsnow:4444")
+    assert seen_douban_ref == "https://m.douban.com/movie/"
+    assert db_entries[0].title == "《好东西》"
+    assert db_entries[0].info_tag == "豆瓣 9.1"
+    assert "doubanio.com" in db_entries[0].image_url
+
+    tt_entries = await fetch_newsnow_source("toutiao", "http://newsnow:4444")
+    assert tt_entries[0].url == "https://www.toutiao.com/trending/77123/"
+    assert tt_entries[0].info_tag == "1850万热度"
+
+    mkt_entries = await fetch_newsnow_source("mktnews-flash", "http://newsnow:4444")
+    assert "今值: 20.1%" in mkt_entries[0].summary_hint
+    assert "预期: 16.0%" in mkt_entries[0].summary_hint
+
+    # 4. P1-7: Duplicate content_hash rows in same source must not raise MultipleResultsFound
+    dup_src = Source(name="DupTest", kind="webpage", identifier="https://example.com/dup3")
+    db_session.add(dup_src)
+    await db_session.flush()
+    shared_body = "完全相同的测试正文内容用于验证哈希查重不会因为多行记录崩溃。" * 5
+    dup_page_html = f"<html><head><title>Dup Title</title></head><body><article><p>{shared_body}</p></article></body></html>"
+    dup_ex = extract_from_webpage(dup_page_html, "https://example.com/dup3", fallback_title="DupTest")
+    shared_hash = compute_content_hash(dup_ex.title, dup_ex.plain_text)
+    db_session.add_all(
+        [
+            Article(
+                source_id=dup_src.id,
+                canonical_url="https://example.com/dup1",
+                content_hash=shared_hash,
+                title=dup_ex.title,
+                plain_text=dup_ex.plain_text,
+                clean_html=dup_ex.clean_html,
+            ),
+            Article(
+                source_id=dup_src.id,
+                canonical_url="https://example.com/dup2",
+                content_hash=shared_hash,
+                title=dup_ex.title,
+                plain_text=dup_ex.plain_text,
+                clean_html=dup_ex.clean_html,
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    async def fake_dup_page(url: str, **_kw: Any) -> tuple[str, str]:
+        return dup_page_html, url
+
+    monkeypatch.setattr("inkpress.ingestion.service.smart_fetch_text", fake_dup_page)
+    dup_stats = await sync_source(db_session, dup_src)
+    assert dup_stats["new"] == 0 and dup_stats["skipped"] == 1

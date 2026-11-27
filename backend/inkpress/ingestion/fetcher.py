@@ -76,15 +76,49 @@ DOMESTIC_HINTS = (
     "ruanyifeng.com",
     "juejin.cn",
     "douban.com",
+    "doubanio.com",
+    "toutiaoimg.com",
+    "byteimg.com",
+    "hdslb.com",
+    "zhimg.com",
     "hupu.com",
     "weibo.com",
     "sina.com",
     "qq.com",
+    "qpic.cn",
     "163.com",
     "ifeng.com",
     "solidot.org",
     "freebuf.com",
 )
+
+# Anti-hotlink CDNs returning 403/418 when fetched without an expected origin Referer
+IMAGE_DOMAIN_DEFAULT_REFERERS: tuple[tuple[str, str], ...] = (
+    ("doubanio.com", "https://movie.douban.com/"),
+    ("sinaimg.cn", "https://weibo.com/"),
+    ("zhimg.com", "https://www.zhihu.com/"),
+    ("hdslb.com", "https://www.bilibili.com/"),
+    ("sspai.com", "https://sspai.com/"),
+    ("ithome.com", "https://www.ithome.com/"),
+    ("thepaper.cn", "https://www.thepaper.cn/"),
+    ("36krcdn.com", "https://36kr.com/"),
+    ("toutiaoimg.com", "https://www.toutiao.com/"),
+    ("byteimg.com", "https://www.toutiao.com/"),
+    ("qpic.cn", "https://mp.weixin.qq.com/"),
+    ("dapenti.com", "https://www.dapenti.com/"),
+    ("penti.org", "https://www.dapenti.com/"),
+)
+
+
+def infer_default_image_referer(url: str) -> str:
+    """Return a known anti-hotlink Referer for well-known image CDNs, or empty string."""
+    host = (urlparse((url or "").strip()).hostname or "").strip().lower().rstrip(".")
+    if not host:
+        return ""
+    for domain, ref in IMAGE_DOMAIN_DEFAULT_REFERERS:
+        if _host_matches_domain(host, domain):
+            return ref
+    return ""
 
 
 def _host_matches_domain(host: str, domain: str) -> bool:

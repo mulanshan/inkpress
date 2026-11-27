@@ -8,8 +8,13 @@ import pytest
 from bs4 import BeautifulSoup, Tag
 from inkpress.ai.client import AIClient
 from inkpress.ai.editorial import (
+    DigestCandidate,
     _clean_llm_output,
     _parse_numbered_translations,
+    cluster_and_filter_candidates,
+    curate_illustrated_digest,
+    extract_candidates_from_articles,
+    extract_tugua_topics,
     generate_frontpage_briefing,
     summarize_article,
     translate_article_bilingual,
@@ -294,3 +299,225 @@ async def test_bilingual_rejects_low_coverage_to_prevent_cache_poisoning() -> No
     tr_title2, bi_html2 = await translate_article_bilingual(ai_bad, art)
     assert tr_title2 is None
     assert bi_html2 is None
+
+
+async def test_curate_illustrated_digest_deduplicates_merges_and_embeds_images() -> None:
+    tugua_text = (
+        "每天一图卦，让我们更清楚地了解这个世界\n"
+        "【1】商务部：坚决反对美对中国等经济体加征301关税\n"
+        "【2】神舟二十四号巴基斯坦航天员准备进驻天宫空间站\n"
+    )
+    excluded = extract_tugua_topics(tugua_text, "【喷嚏图卦20261126】关税与航天")
+    assert len(excluded) == 3
+
+    zhihu_digest = Article(
+        id=10,
+        canonical_url="https://inkpress.local/newsnow/zhihu/2026-11-27",
+        content_hash="h10",
+        title="知乎热榜 · 热点速览 (2026-11-27)",
+        source_name="知乎热榜",
+        category="综合",
+        extra_meta={
+            "digest_items": [
+                {
+                    "title": "为什么神舟二十四号外籍航天员名额给了巴基斯坦？",
+                    "summary": "巴基斯坦航天员随神舟二十四号进驻天宫引发关注。",
+                    "info_tag": "850万热度",
+                    "url": "https://www.zhihu.com/question/1",
+                    "image_url": "https://picx.zhimg.com/space.jpg",
+                },
+                {
+                    "title": "魏建军直言很多车企靠国家补贴生存，拿到的补贴比盈利还多，如何评价？",
+                    "summary": "长城汽车董事长魏建军表示部分车企过度依赖地方补贴维持运转。",
+                    "info_tag": "320万热度",
+                    "url": "https://www.zhihu.com/question/2",
+                    "image_url": "",
+                },
+                {
+                    "title": "如何看待今天某明星机场穿搭？",
+                    "summary": "",
+                    "info_tag": "100万热度",
+                    "url": "https://www.zhihu.com/question/3",
+                    "image_url": "",
+                },
+            ]
+        },
+    )
+    ithome_art = Article(
+        id=11,
+        canonical_url="https://www.ithome.com/0/900/111.htm",
+        content_hash="h11",
+        title="长城汽车魏建军到访格力：痛斥部分车企靠补贴生存与恶性挖人",
+        source_name="IT之家",
+        category="科技",
+        lead_image_url="https://img.ithome.com/auto_wei.jpg",
+        clean_html='<p>魏建军与董明珠会谈时指出汽车行业补贴乱象。</p><img src="https://img.ithome.com/auto_wei.jpg"/>',
+        plain_text="魏建军与董明珠会谈时指出汽车行业补贴乱象，呼吁回归健康盈利。",
+    )
+    wscn_art = Article(
+        id=12,
+        canonical_url="https://wallstreetcn.com/articles/222",
+        content_hash="h12",
+        title="央行开展5000亿元MLF操作，中标利率维持2.0%不变",
+        source_name="华尔街见闻",
+        category="财经",
+        lead_image_url="https://wpimg-wscn.awtmt.com/mlf_chart.png",
+        clean_html='<p>央行今日开展中期借贷便利操作释放中长期流动性。</p><img src="https://wpimg-wscn.awtmt.com/mlf_chart.png"/>',
+        plain_text="央行今日开展中期借贷便利操作释放中长期流动性，保持银行体系充裕。",
+    )
+
+    cands = extract_candidates_from_articles([zhihu_digest, ithome_art, wscn_art])
+    assert len(cands) == 5
+
+    llm_reply = (
+        "<think>Deduplicating space story, merging Wei Jianjun...</think>\n"
+        "===ITEM===\n"
+        "TITLE: 魏建军直言部分车企靠补贴续命，与格力共议行业乱象\n"
+        "SOURCES: 知乎热榜 · IT之家\n"
+        "IMAGES: IMG_01\n"
+        "BODY:\n"
+        "长城汽车董事长魏建军到访格力交流时表示，部分地方过度保护亏损车企，补贴金额甚至超过企业盈利。\n"
+        "===END===\n"
+        "===ITEM===\n"
+        "TITLE: 央行开展5000亿元MLF操作，维持流动性充裕\n"
+        "SOURCES: 华尔街见闻\n"
+        "IMAGES: IMG_02, IMG_99\n"
+        "BODY:\n"
+        "央行今日开展5000亿元中期借贷便利操作，利率维持2.0%不变。\n"
+        "===END==="
+    )
+    ai = _StubAI([llm_reply])
+    res = await curate_illustrated_digest(ai, cands, excluded_topics=excluded, max_items=10)
+    assert res.used_ai is True
+    assert res.item_count == 2
+    # Space topic from 喷嚏图卦 and bare-title celebrity question were excluded before prompt!
+    sent_prompt = ai.calls[0]["user"]
+    cand_section = sent_prompt.split("候选资讯：", 1)[1]
+    assert "为什么神舟二十四号" not in cand_section
+    assert "明星机场穿搭" not in cand_section
+    # Merged cluster combined 知乎热榜 + IT之家 and pooled IT之家's image!
+    assert "知乎热榜 · IT之家" in sent_prompt
+    assert "【1】魏建军直言部分车企靠补贴续命" in res.body_html
+    assert "https://img.ithome.com/auto_wei.jpg" in res.body_html
+    assert "https://wpimg-wscn.awtmt.com/mlf_chart.png" in res.body_html
+    assert "IMG_99" not in res.body_html
+    assert res.image_referers.get("https://wpimg-wscn.awtmt.com/mlf_chart.png") == "https://wallstreetcn.com/articles/222"
+
+    # Also verify deterministic non-AI fallback
+    fallback = await curate_illustrated_digest(None, cands, excluded_topics=excluded, max_items=10)
+    assert fallback.used_ai is False
+    assert fallback.item_count == 2
+    assert "【1】" in fallback.body_html
+    assert 'class="tugua-figure"' in res.body_html
+
+
+async def test_curate_digest_blocks_mismatched_cross_item_images_and_balances_hotlists() -> None:
+    # 1. Verify P0-1: off-by-one / cross-item image mismatch is dropped both with and without REFS
+    cands = [
+        DigestCandidate(
+            title="广州车展继续堆叠800伏、智驾与超长续航",
+            summary="广州车展新能源车型密集发布，多家车企主打高压快充。",
+            source_name="财联社热门",
+            category="财经",
+            canonical_url="https://cls.cn/auto",
+            images=[],
+        ),
+        DigestCandidate(
+            title="40歲離職去日本讀書：人生下半場的重新選擇",
+            summary="一位台灣職場人辭職赴日留學的親身經歷與財務規劃。",
+            source_name="今日最新－天下雜誌",
+            category="文化",
+            canonical_url="https://www.cw.com.tw/article/5140001",
+            images=["https://storage.googleapis.com/cw-com-tw/japan_study.jpg"],
+        ),
+        DigestCandidate(
+            title="苹果发布新一代 M5 Ultra 工作站芯片",
+            summary="苹果正式推出面向本地大模型推理的高带宽统一内存芯片。",
+            source_name="IT之家",
+            category="科技",
+            canonical_url="https://www.ithome.com/m5",
+            images=["https://img.ithome.com/m5_chip.jpg"],
+        ),
+        DigestCandidate(
+            title="比亚迪海豹新款车型续航突破一千公里",
+            summary="新款混动技术降低亏电油耗。",
+            source_name="IT之家",
+            category="科技",
+            canonical_url="https://www.ithome.com/byd",
+            images=["https://img.ithome.com/byd_car.jpg"],
+        ),
+    ]
+
+    # LLM shifts image IDs: attaches C02's Japan photo (IMG_01) to C01 Guangzhou Auto Show,
+    # and attaches C04's BYD car photo (IMG_03) to C03 Apple M5 chip (same source IT之家!)
+    drifted_llm = (
+        "===ITEM===\n"
+        "TITLE: 广州车展继续堆叠800伏、智驾与超长续航\n"
+        "SOURCES: 财联社热门\n"
+        "REFS: C01\n"
+        "IMAGES: IMG_01\n"
+        "BODY:\n"
+        "广州车展新能源车型密集发布，重点聚焦800伏高压平台与高阶智驾。\n"
+        "===END===\n"
+        "===ITEM===\n"
+        "TITLE: 苹果发布新一代 M5 Ultra 工作站芯片\n"
+        "SOURCES: IT之家\n"
+        "IMAGES: IMG_03\n"
+        "BODY:\n"
+        "苹果推出面向大模型工作站的高带宽统一内存处理器。\n"
+        "===END===\n"
+        "===ITEM===\n"
+        "TITLE: 40歲離職去日本讀書的財務規劃\n"
+        "SOURCES: 今日最新－天下雜誌\n"
+        "REFS: C02\n"
+        "IMAGES: IMG_01\n"
+        "BODY:\n"
+        "台灣職場人分享40歲赴日留學的準備與心路歷程。\n"
+        "===END==="
+    )
+    ai = _StubAI([drifted_llm])
+    res = await curate_illustrated_digest(ai, cands, max_items=10)
+    assert res.used_ai is True
+    assert res.item_count == 3
+    soup = BeautifulSoup(res.body_html, "lxml")
+    tugua_divs = soup.find_all("div", class_="tugua-item")
+    assert len(tugua_divs) == 3
+    # Item 1 (Guangzhou Auto Show) MUST NOT contain Japan study image!
+    assert "japan_study.jpg" not in str(tugua_divs[0])
+    # Item 2 (Apple M5 chip from IT之家) MUST NOT contain BYD car image from IT之家!
+    assert "byd_car.jpg" not in str(tugua_divs[1])
+    # Item 3 (Japan study) legitimately owns IMG_01 and embeds it!
+    assert "japan_study.jpg" in str(tugua_divs[2])
+
+    # 2. Verify P1-2: 10-20 char Chinese declarative hotlist & English HN headlines survive,
+    #    while gossip/questions are dropped and per-digest bundle is capped at 6
+    big_weibo = Article(
+        id=99,
+        canonical_url="https://inkpress.local/newsnow/weibo/2026-11-27",
+        content_hash="wb99",
+        title="微博热搜",
+        source_name="微博热搜",
+        category="热点",
+        extra_meta={
+            "digest_items": [
+                {"title": f"商务部回应第{i}轮经贸磋商进展", "summary": "", "url": f"https://s.weibo.com/{i}"}
+                for i in range(1, 15)
+            ]
+        },
+    )
+    extracted = extract_candidates_from_articles([big_weibo])
+    assert len(extracted) == 6  # Capped per digest source for balance!
+
+    filtered = cluster_and_filter_candidates(
+        [
+            DigestCandidate("商务部回应经贸磋商最新进展", "", "微博热搜", "热点"),  # 13 chars CJK declarative -> keep
+            DigestCandidate("SQLite 3.50 introduces native SIMD page compression", "", "Hacker News", "科技"),  # English declarative -> keep
+            DigestCandidate("某明星红毯生图曝光", "", "微博热搜", "热点"),  # Gossip -> drop
+            DigestCandidate("如何评价今年秋招行情？", "", "知乎热榜", "综合"),  # Bare question -> drop
+        ]
+    )
+    kept_titles = {c.title for c in filtered}
+    assert "商务部回应经贸磋商最新进展" in kept_titles
+    assert "SQLite 3.50 introduces native SIMD page compression" in kept_titles
+    assert "某明星红毯生图曝光" not in kept_titles
+    assert "如何评价今年秋招行情？" not in kept_titles

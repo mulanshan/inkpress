@@ -87,7 +87,12 @@ async def preview_newsnow(
 ) -> dict[str, Any]:
     net = await get_network_config(session)
     try:
-        entries = await fetch_newsnow_source(source_id, net["newsnow_base_url"], latest=True)
+        entries = await fetch_newsnow_source(
+            source_id,
+            net["newsnow_base_url"],
+            latest=True,
+            outbound_proxy=str(net.get("outbound_proxy") or ""),
+        )
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
@@ -238,13 +243,20 @@ async def update_source(
     for field in (
         "fetch_strategy",
         "use_proxy",
-        "ai_options",
         "max_items",
         "enabled",
     ):
         val = getattr(payload, field)
         if val is not None:
             setattr(src, field, val)
+    if payload.ai_options is not None:
+        merged_opts = dict(src.ai_options or {})
+        for k, v in payload.ai_options.items():
+            if v is None or v == "" or v == []:
+                merged_opts.pop(k, None)
+            else:
+                merged_opts[k] = v
+        src.ai_options = merged_opts
     await session.commit()
     await session.refresh(src)
 

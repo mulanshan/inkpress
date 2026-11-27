@@ -78,7 +78,7 @@ async def get_ai_config(session: AsyncSession) -> dict[str, Any]:
         "model": stored.get("model") or env.ai_model,
         "use_proxy": bool(stored.get("use_proxy", False)),
         "max_concurrency": int(stored.get("max_concurrency") or 3),
-        "timeout_seconds": int(stored.get("timeout_seconds") or 60),
+        "timeout_seconds": int(stored.get("timeout_seconds") or 120),
     }
 
 

@@ -85,7 +85,7 @@ class ClipTextRequest(BaseModel):
 
 class EditionSourceLinkIn(BaseModel):
     source_id: int
-    sort_order: int = 0
+    sort_order: int | None = None
     max_items_override: int | None = Field(default=None, ge=1, le=60)
 
 
@@ -158,7 +158,7 @@ class AiSettingsUpdate(BaseModel):
     model: str | None = None
     use_proxy: bool | None = None
     max_concurrency: int | None = Field(default=None, ge=1, le=10)
-    timeout_seconds: int | None = Field(default=None, ge=10, le=180)
+    timeout_seconds: int | None = Field(default=None, ge=10, le=300)
 
 
 class NetworkSettingsUpdate(BaseModel):

@@ -3,13 +3,17 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
+from zoneinfo import ZoneInfo
 
 import nh3
 import trafilatura
 from bs4 import BeautifulSoup, Tag
 from readability import Document
 
+from inkpress.config import get_settings
 from inkpress.logging import get_logger
 
 logger = get_logger(__name__)
@@ -55,7 +59,9 @@ ALLOWED_TAGS: set[str] = {
 
 ALLOWED_ATTRIBUTES: dict[str, set[str]] = {
     "a": {"href", "title"},
-    "img": {"src", "alt", "title"},
+    "img": {"src", "alt", "title", "class"},
+    "figure": {"class"},
+    "figcaption": {"class"},
     "td": {"colspan", "rowspan"},
     "th": {"colspan", "rowspan"},
     "div": {"class"},
@@ -91,14 +97,109 @@ SPACER_IMAGE_PATTERNS = (
     "transparent.gif",
     "grey.gif",
     "loading.gif",
+    "/_next/static/media/",
+    "logo_rebang",
+    "pp_report",
+    "logo_kuaixun",
+    "tianzi_white",
+    "logo_bjjx",
+    "scalecode.",
+    "wuzhangai.",
+    "label_sm_",
+    "wx_qrcode",
+    "app_download",
 )
 
 PLACEHOLDER_LEAD_IMAGE_PATTERNS = (
     *SPACER_IMAGE_PATTERNS,
-    "logo_rebang",
+    "qrcode",
+    "avatar",
+)
+
+UI_CHROME_ALT_KEYWORDS = (
+    "扫码下载",
+    "客户端下载",
+    "微信公众号",
+    "官方微信",
+    "澎湃热榜",
+    "澎湃早晚报",
+    "澎湃财讯",
+    "填字游戏",
+    "要闻精选",
+    "可信网站验证",
+    "无障碍阅读",
+    "小程序码",
+)
+
+_BOILERPLATE_EXACT_LINES = frozenset(
+    {
+        "+1",
+        "收藏",
+        "我要举报",
+        "查看更多",
+        "扫码下载",
+        "澎湃新闻客户端",
+        "澎湃矩阵",
+        "澎湃新闻微博",
+        "澎湃新闻公众号",
+        "澎湃新闻抖音号",
+        "派生万物开放平台",
+        "IP SHANGHAI",
+        "SIXTH TONE",
+        "新闻报料",
+        "反馈",
+        "登录",
+        "喷嚏网官方新浪围脖",
+    }
+)
+
+_BOILERPLATE_SUBSTRINGS = (
+    "报料热线:",
+    "报料热线：",
+    "报料邮箱:",
+    "报料邮箱：",
+    "互联网新闻信息服务许可证",
+    "增值电信业务经营许可证",
+    "沪ICP备",
+    "沪公网安备",
+    "上海东方报业有限公司",
+    "Android版 iPhone版 iPad版",
+    "喷嚏网官方App",
+    "喷嚏网官方网站",
+    "每天网络精华尽在",
+    "新浪声明：所有会议实录均为现场速记整理",
 )
 
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_EMPTY_PUBLISH_SECTION_RE = re.compile(r"^(?:发布|發布|作者|编辑|編輯)\s*[:：]\s*[;；|｜]")
+_AUTHOR_TRAILING_CLAUSE_RE = re.compile(
+    r"\s*(?:来源|來源|出处|出處|责任编辑|責任編輯|责编|責編|编辑|編輯|微信公众号|微信公眾號)\s*[:：].*$"
+)
+_AUTHOR_PREFIX_RE = re.compile(
+    r"^(?:作者|撰文|撰稿|记者|記者|发布|發布|编译|編譯|整理|编辑|編輯|文|by)\s*[:：/｜|;；\-—]+\s*"
+    r"|^(?:作者|撰文|撰稿|记者|記者|编译|編譯)\s+"
+    r"|^by\s+",
+    re.IGNORECASE,
+)
+_NON_AUTHOR_LABELS = frozenset(
+    {
+        "国际时政",
+        "即时",
+        "财经",
+        "科技",
+        "国际",
+        "新闻",
+        "综合",
+        "社论",
+        "快讯",
+        "匿名",
+        "佚名",
+        "未知",
+        "null",
+        "none",
+        "admin",
+    }
+)
 
 
 @dataclass
@@ -111,6 +212,92 @@ class ExtractedArticle:
     language: str
     word_count: int
     reading_time_min: int
+    published_at: datetime | None = None
+
+
+def clean_author_name(raw_author: str, source_name: str = "") -> str:
+    """Sanitize scraped author metadata (prefixes, trailing 来源 clauses, unclosed brackets)."""
+    s = re.sub(r"\s+", " ", _strip_control_chars(raw_author or "")).strip()
+    if not s:
+        return ""
+    if _EMPTY_PUBLISH_SECTION_RE.match(s):
+        return ""
+    s = _AUTHOR_TRAILING_CLAUSE_RE.sub("", s).strip()
+    for _ in range(2):
+        next_s = _AUTHOR_PREFIX_RE.sub("", s).strip()
+        if next_s == s:
+            break
+        s = next_s
+    # Strip unclosed trailing brackets/parentheses (e.g. "吳麗雪（")
+    for open_ch, close_ch in (("（", "）"), ("(", ")"), ("【", "】"), ("[", "]")):
+        if open_ch in s and close_ch not in s:
+            s = s.split(open_ch, 1)[0].strip()
+    s = s.strip(" \t\r\n:：;；,，、/｜|-—（(【[")
+    if not s or len(s) > 64:
+        return ""
+    if s.lower() in _NON_AUTHOR_LABELS:
+        return ""
+    if source_name and s.strip().lower() == source_name.strip().lower():
+        return ""
+    return s
+
+
+def _parse_webpage_published_at(soup: BeautifulSoup, meta_date: str | None = None) -> datetime | None:
+    """Extract timezone-aware publication timestamp from HTML meta/time tags or Trafilatura date."""
+    try:
+        local_tz = ZoneInfo(get_settings().tz)
+    except Exception:
+        local_tz = ZoneInfo("Asia/Shanghai")
+
+    candidates: list[str] = []
+    for prop in (
+        ("property", "article:published_time"),
+        ("property", "og:published_time"),
+        ("name", "pubdate"),
+        ("name", "publishdate"),
+        ("name", "date"),
+        ("itemprop", "datePublished"),
+    ):
+        tag = soup.find("meta", attrs={prop[0]: prop[1]})
+        if isinstance(tag, Tag):
+            val = str(tag.get("content") or "").strip()
+            if val:
+                candidates.append(val)
+    time_tag = soup.find("time", attrs={"datetime": True})
+    if isinstance(time_tag, Tag):
+        tval = str(time_tag.get("datetime") or "").strip()
+        if tval:
+            candidates.append(tval)
+    if meta_date and meta_date.strip():
+        candidates.append(meta_date.strip())
+
+    for raw in candidates:
+        s = raw.strip()
+        if not s:
+            continue
+        # Date-only YYYY-MM-DD
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+            try:
+                d_local = datetime.fromisoformat(s).replace(hour=12, minute=0, tzinfo=local_tz)
+                today_local = datetime.now(local_tz).date()
+                if d_local.date() == today_local:
+                    return datetime.now(UTC)
+                return d_local.astimezone(UTC)
+            except ValueError:
+                continue
+        try:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            aware = dt if dt.tzinfo is not None else dt.replace(tzinfo=local_tz)
+            return aware.astimezone(UTC)
+        except ValueError:
+            pass
+        try:
+            dt_rfc = parsedate_to_datetime(s)
+            aware_rfc = dt_rfc if dt_rfc.tzinfo is not None else dt_rfc.replace(tzinfo=local_tz)
+            return aware_rfc.astimezone(UTC)
+        except (TypeError, ValueError):
+            pass
+    return None
 
 
 def _strip_control_chars(text: str) -> str:
@@ -222,6 +409,35 @@ def estimate_word_count_and_time(plain_text: str) -> tuple[int, int]:
     return total, minutes
 
 
+def _is_ui_chrome_alt(alt: str) -> bool:
+    cleaned = alt.strip()
+    if not cleaned:
+        return False
+    return any(kw in cleaned for kw in UI_CHROME_ALT_KEYWORDS)
+
+
+def _strip_portal_boilerplate_nodes(soup: BeautifulSoup) -> None:
+    """Remove trailing/leading portal chrome, ICP footers, and app download prompts."""
+    for node in list(soup.find_all(["p", "li", "div", "span"])):
+        if not isinstance(node, Tag) or node.parent is None:
+            continue
+        if node.find(["img", "table", "pre", "blockquote"]):
+            continue
+        # Only inspect leaf-like text blocks so container divs wrapping whole articles are safe
+        if node.name == "div" and node.find(["p", "h1", "h2", "h3", "ul", "ol"]):
+            continue
+        txt = re.sub(r"\s+", " ", node.get_text(" ", strip=True)).strip()
+        if not txt:
+            continue
+        if txt in _BOILERPLATE_EXACT_LINES or (
+            len(txt) <= 180 and any(sub in txt for sub in _BOILERPLATE_SUBSTRINGS)
+        ):
+            node.decompose()
+    for list_tag in list(soup.find_all(["ul", "ol"])):
+        if isinstance(list_tag, Tag) and not list_tag.get_text(strip=True) and not list_tag.find("img"):
+            list_tag.decompose()
+
+
 def sanitize_article_html(html: str, base_url: str = "") -> tuple[str, str, str | None]:
     """Normalize lazy images, enforce http/https URLs, strip control chars, and sanitize via nh3."""
     if not html or not html.strip():
@@ -235,6 +451,11 @@ def sanitize_article_html(html: str, base_url: str = "") -> tuple[str, str, str 
 
     lead_img: str | None = None
     for img in soup.find_all("img"):
+        alt_raw = str(img.get("alt") or "").strip()
+        if _is_ui_chrome_alt(alt_raw):
+            img.decompose()
+            continue
+
         src_str = ""
         for attr in (*LAZY_IMAGE_ATTRS, "src"):
             raw_val = img.get(attr)
@@ -253,9 +474,8 @@ def sanitize_article_html(html: str, base_url: str = "") -> tuple[str, str, str 
             img.attrs.pop(attr, None)
         img["src"] = src_str
 
-        alt = str(img.get("alt") or "").strip()
         # Clean problematic control characters from alt (Kindle Send-to-Kindle E999 trigger)
-        alt = re.sub(r"[\x00-\x1f\x7f<>\"']", " ", alt).strip()
+        alt = re.sub(r"[\x00-\x1f\x7f<>\"']", " ", alt_raw).strip()
         img["alt"] = alt[:120]
 
         if (
@@ -264,6 +484,8 @@ def sanitize_article_html(html: str, base_url: str = "") -> tuple[str, str, str 
             and not _is_placeholder_lead_image(src_str)
         ):
             lead_img = src_str
+
+    _strip_portal_boilerplate_nodes(soup)
 
     for a in soup.find_all("a"):
         href = str(a.get("href") or "").strip()
@@ -395,6 +617,7 @@ def extract_from_webpage(
 
     # Extract metadata before stripping user-specified selectors
     prepared_for_meta = str(soup)
+    meta_date_str: str | None = None
     try:
         meta = trafilatura.extract_metadata(prepared_for_meta, default_url=url)
         if meta:
@@ -402,22 +625,34 @@ def extract_from_webpage(
                 title = meta.title.strip()
             if meta.author:
                 author = meta.author.strip()
+            if getattr(meta, "date", None):
+                meta_date_str = str(meta.date).strip()
     except Exception:
         pass
 
-    if remove_selectors:
-        for sel in remove_selectors:
-            cleaned_sel = (sel or "").strip()
-            if not cleaned_sel:
-                continue
-            try:
-                for node in soup.select(cleaned_sel):
-                    node.decompose()
-            except Exception as exc:
-                logger.warning("invalid_remove_selector", selector=cleaned_sel, err=str(exc))
+    published_at = _parse_webpage_published_at(soup, meta_date_str)
 
-    # Optional explicit CSS content selector (e.g. webpage_list / custom editorial sites)
+    host = (urlparse(url).hostname or "").strip().lower()
+    is_v2ex = host == "v2ex.com" or host.endswith(".v2ex.com")
+
+    effective_removes = list(remove_selectors or [])
+    if is_v2ex:
+        effective_removes.extend([".reply_content", "div[id^='r_']", "#Rightbar"])
+
+    for sel in effective_removes:
+        cleaned_sel = (sel or "").strip()
+        if not cleaned_sel:
+            continue
+        try:
+            for node in soup.select(cleaned_sel):
+                node.decompose()
+        except Exception as exc:
+            logger.warning("invalid_remove_selector", selector=cleaned_sel, err=str(exc))
+
+    # Optional explicit CSS content selector (plus default V2EX topic selector to exclude floor noise)
     cleaned_content_sel = (content_selector or "").strip()
+    if not cleaned_content_sel and is_v2ex:
+        cleaned_content_sel = "div.topic_content, div.subtle"
     if cleaned_content_sel:
         selected_nodes: list[Tag] = []
         try:
@@ -469,7 +704,7 @@ def extract_from_webpage(
         title = soup.title.string.strip() if soup.title and soup.title.string else url
 
     title = _strip_control_chars(title).strip()
-    author = _strip_control_chars(author).strip()
+    author = clean_author_name(author)
     lang = detect_language(f"{title} {plain_text}")
     words, mins = estimate_word_count_and_time(plain_text)
     return ExtractedArticle(
@@ -481,4 +716,5 @@ def extract_from_webpage(
         language=lang,
         word_count=words,
         reading_time_min=mins,
+        published_at=published_at,
     )

@@ -142,10 +142,14 @@ body {
   text-align: justify;
 }
 
+.editorial-prose p.no-indent {
+  text-indent: 0;
+}
+
 .editorial-prose p.bilingual-tr {
   color: var(--fg-secondary);
   font-style: normal;
-  margin-top: -0.65em;
+  margin-top: 0.25em;
   margin-bottom: 1.4em;
   padding-left: 0.9em;
   border-left: 2px solid var(--border-hairline);
@@ -170,6 +174,10 @@ body {
   border-radius: 6px;
   margin: 1.4em auto;
   display: block;
+}
+
+.editorial-prose img.sliced-img {
+  margin-top: 0.25em;
 }
 
 .editorial-prose figure {
@@ -346,6 +354,24 @@ body {
 .editorial-prose .digest-item {
   padding: 0.9em 0;
   border-bottom: 1px solid var(--border-hairline);
+}
+
+.editorial-prose .tugua-item {
+  padding: 1.05em 0;
+  margin-bottom: 0.5em;
+  border-bottom: 1px dotted var(--border-hairline);
+}
+
+.editorial-prose .tugua-title {
+  font-size: 1.06em;
+  line-height: 1.5;
+  margin-bottom: 0.55em;
+  text-align: left;
+}
+
+.editorial-prose .tugua-figure {
+  margin: 0.85em 0 0.45em;
+  text-align: center;
 }
 
 .editorial-prose .meta-tag {

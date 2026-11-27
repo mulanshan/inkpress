@@ -7,15 +7,18 @@ import {
   CalendarClock,
   ChevronLeft,
   ChevronRight,
+  Copy,
   Download,
+  ExternalLink,
   List,
+  Rss,
   RotateCw,
   Send,
   Trash2,
   Upload,
   X,
 } from "lucide-react";
-import { apiRequest, formatBytes, formatRelativeTime } from "../lib/api";
+import { apiRequest, copyToClipboard, formatBytes, formatRelativeTime } from "../lib/api";
 import { useReaderAppearance } from "../lib/theme";
 import type { BookItem } from "../lib/types";
 import { ReaderSettingsBar } from "../components/ReaderSettingsBar";
@@ -583,6 +586,42 @@ export function LibraryPage() {
         <p className="text-sm mt-2" style={{ color: "var(--fg-secondary)" }}>
           自动归档每期生成的日报与杂志，也支持上传个人电子书（EPUB / MOBI / AZW3 / TXT / MD / DOCX / PDF / FB2 / CBZ / RTF）自动修复转码并定时推送至 Kindle。
         </p>
+        <div className="flex flex-wrap items-center gap-2 mt-4 text-xs">
+          <button
+            type="button"
+            onClick={async () => {
+              const url = `${window.location.origin}/api/v1/opds`;
+              const ok = await copyToClipboard(url);
+              notify(ok ? `已复制 OPDS 1.2 订阅地址：${url}` : `OPDS 地址：${url}`, ok ? "success" : "info");
+            }}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border cursor-pointer"
+            style={{
+              backgroundColor: "var(--bg-surface)",
+              borderColor: "var(--border-hairline)",
+              color: "var(--fg-secondary)",
+            }}
+            title="供 KOReader、文石 Boox、Foliate 等墨水屏阅读器直连订阅"
+          >
+            <Rss className="w-3.5 h-3.5" style={{ color: "var(--accent)" }} />
+            <span>复制 OPDS 1.2 书库源</span>
+            <Copy className="w-3 h-3 opacity-70" />
+          </button>
+          <a
+            href="/kindle"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border"
+            style={{
+              backgroundColor: "var(--bg-surface)",
+              borderColor: "var(--border-hairline)",
+              color: "var(--fg-secondary)",
+            }}
+            title="无 JS 极简高对比 HTML 页，适合 Kindle 内置浏览器直连下载"
+          >
+            <span>/kindle 墨水屏极简直下页</span>
+            <ExternalLink className="w-3 h-3 opacity-70" />
+          </a>
+        </div>
 
         <div className="flex flex-wrap items-center gap-2 mt-5">
           {[
