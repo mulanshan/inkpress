@@ -5,7 +5,7 @@ import contextlib
 import json
 import os
 import signal
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 import redis.asyncio as aioredis
@@ -23,6 +23,8 @@ from inkpress.worker.broker import (
     publish_worker_heartbeat,
 )
 from inkpress.worker.tasks import (
+    fetch_book_for_update,
+    get_local_book_meta_lock,
     make_export_key,
     run_build_and_deliver_edition,
     run_convert_book,
@@ -130,6 +132,40 @@ async def recover_stale_running_deliveries(stale_minutes: int = STALE_DELIVERY_M
             )
             recovered += 1
 
+        ready_books = (
+            (await session.execute(select(Book).where(Book.conversion_status == "ready")))
+            .scalars()
+            .all()
+        )
+        for rbook in ready_books:
+            rmeta = dict(rbook.metadata_json or {})
+            rexps = rmeta.get("exports")
+            if not isinstance(rexps, dict):
+                continue
+            next_exps = dict(rexps)
+            mutated = False
+            for ekey, eval_obj in rexps.items():
+                if not isinstance(eval_obj, dict) or eval_obj.get("status") != "converting":
+                    continue
+                raw_ts = str(eval_obj.get("updated_at") or "").strip()
+                is_stale = True
+                if raw_ts:
+                    with contextlib.suppress(Exception):
+                        is_stale = datetime.fromisoformat(raw_ts) < cutoff
+                if is_stale:
+                    next_exps[ekey] = {
+                        **eval_obj,
+                        "status": "failed",
+                        "error": eval_obj.get("error")
+                        or "Worker restarted while export was still in progress (stale recovery)",
+                        "updated_at": now.isoformat(),
+                    }
+                    mutated = True
+                    recovered += 1
+            if mutated:
+                rmeta["exports"] = next_exps
+                rbook.metadata_json = rmeta
+
         if recovered:
             await session.commit()
             logger.warning("recovered_stale_running_deliveries", count=recovered)
@@ -179,26 +215,28 @@ async def _mark_evicted_job_failed_in_db(raw_payload: str, times: int) -> None:
                     )
                     dirty = True
             if export_book_id is not None:
-                exp_book = await session.get(Book, int(export_book_id))
-                if exp_book is not None:
-                    t_fmt = str(kw.get("target_format") or "epub")
-                    raw_mb = kw.get("max_mb")
-                    exp_key = make_export_key(
-                        t_fmt, float(raw_mb) if raw_mb is not None else None
-                    )
-                    bmeta = dict(exp_book.metadata_json or {})
-                    exps = dict(bmeta.get("exports") or {})
-                    cur_exp = exps.get(exp_key)
-                    if isinstance(cur_exp, dict) and cur_exp.get("status") == "converting":
-                        exps[exp_key] = {
-                            **cur_exp,
-                            "status": "failed",
-                            "error": f"格式转换连续异常中断 {times} 次，已移入死信队列 (DLQ)",
-                            "updated_at": now.isoformat(),
-                        }
-                        bmeta["exports"] = exps
-                        exp_book.metadata_json = bmeta
-                        dirty = True
+                ebid = int(export_book_id)
+                async with get_local_book_meta_lock(ebid):
+                    exp_book = await fetch_book_for_update(session, ebid)
+                    if exp_book is not None:
+                        t_fmt = str(kw.get("target_format") or "epub")
+                        raw_mb = kw.get("max_mb")
+                        exp_key = make_export_key(
+                            t_fmt, float(raw_mb) if raw_mb is not None else None
+                        )
+                        bmeta = dict(exp_book.metadata_json or {})
+                        exps = dict(bmeta.get("exports") or {})
+                        cur_exp = exps.get(exp_key)
+                        if isinstance(cur_exp, dict) and cur_exp.get("status") == "converting":
+                            exps[exp_key] = {
+                                **cur_exp,
+                                "status": "failed",
+                                "error": f"格式转换连续异常中断 {times} 次，已移入死信队列 (DLQ)",
+                                "updated_at": now.isoformat(),
+                            }
+                            bmeta["exports"] = exps
+                            exp_book.metadata_json = bmeta
+                            dirty = True
             if dirty:
                 await session.commit()
     except Exception as exc:

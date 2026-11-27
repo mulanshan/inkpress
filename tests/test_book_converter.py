@@ -12,12 +12,14 @@ import pymupdf
 import pytest
 from inkpress.publishing.book_converter import (
     SUPPORTED_BOOK_FORMATS,
+    _prepare_epub_for_calibre_mobi,
     _render_scanned_page_1bit,
     _run_calibre_convert,
     compress_pdf_file,
     convert_book_to_kindle_epub,
     convert_epub_to_pdf,
     convert_pdf_to_epub_with_budget,
+    export_book_format,
     extract_book_to_txt,
     list_epub_chapters,
     normalize_epub_for_kindle,
@@ -591,7 +593,7 @@ def _make_noisy_scan_png(seed: int, size: tuple[int, int] = (900, 1260)) -> byte
 
 
 async def test_scanned_and_text_pdf_compression_and_scanned_pdf_to_epub(tmp_path: Path) -> None:
-    # 1. Multi-page noisy scanned PDF (with RGB cover + 30 pages across 2 malformed-level bookmarks)
+    # 1. Multi-page noisy scanned PDF (with RGB covers on p1 & p28 + dark photo plate on p15)
     scanned_pdf = tmp_path / "magazine_scan.pdf"
     sdoc = pymupdf.open()
     cov_page = sdoc.new_page(width=540, height=745)
@@ -600,7 +602,15 @@ async def test_scanned_and_text_pdf_compression_and_scanned_pdf_to_epub(tmp_path
     page_jpg_b = _make_noisy_scan_png(2)
     for idx in range(29):
         pg = sdoc.new_page(width=540, height=745)
-        pg.insert_image(pg.rect, stream=page_jpg_a if idx % 2 == 0 else page_jpg_b)
+        if idx == 26:  # Page 28 (1-based): inner issue #2 color cover!
+            pg.draw_rect(pymupdf.Rect(0, 0, 540, 745), color=(0.85, 0.15, 0.1), fill=(0.85, 0.15, 0.1))
+        elif idx == 13:  # Page 15 (1-based): dark halftone photo plate
+            dark_im = Image.effect_noise((900, 1260), 55.0).convert("L")
+            d_buf = BytesIO()
+            dark_im.save(d_buf, format="JPEG", quality=90)
+            pg.insert_image(pg.rect, stream=d_buf.getvalue())
+        else:
+            pg.insert_image(pg.rect, stream=page_jpg_a if idx % 2 == 0 else page_jpg_b)
     sdoc.set_metadata({"title": "1991合订本", "author": "编辑部"})
     sdoc.set_toc([[1, "第一期", 1], [1, "第二期", 28]])
     sdoc.save(str(scanned_pdf))
@@ -609,17 +619,37 @@ async def test_scanned_and_text_pdf_compression_and_scanned_pdf_to_epub(tmp_path
     orig_size = scanned_pdf.stat().st_size
     assert orig_size > 400_000
 
-    # Compress scanned PDF strictly under 1.0 MB while preserving page count & TOC bookmarks
+    # Compress scanned PDF strictly under 1.0 decimal MB (1,000,000 B) while preserving inner RGB covers & TOC
     compact_pdf = tmp_path / "compact.pdf"
     comp_res = compress_pdf_file(scanned_pdf, compact_pdf, max_mb=1.0)
     assert compact_pdf.exists()
-    assert comp_res.file_size_bytes <= 1 * 1024 * 1024
+    assert comp_res.file_size_bytes <= 1_000_000
     assert comp_res.file_size_bytes < orig_size
     with pymupdf.open(str(compact_pdf)) as out_doc:
         assert len(out_doc) == 30
         toc = out_doc.get_toc()
         assert len(toc) == 2
         assert toc[0][1] == "第一期"
+        # Inner issue #2 cover (page 28 -> index 27) MUST preserve RGB red color instead of 1-bit black/white!
+        p28_pix = out_doc[27].get_pixmap(dpi=36, colorspace=pymupdf.csRGB)
+        mid_off = ((p28_pix.height // 2) * p28_pix.width + (p28_pix.width // 2)) * 3
+        r28, g28, b28 = p28_pix.samples[mid_off], p28_pix.samples[mid_off + 1], p28_pix.samples[mid_off + 2]
+        assert r28 > g28 + 80 and r28 > b28 + 80
+
+    # Pure photographic / Gaussian noise PDF (regression guard for CCITT blowup) shrinks cleanly
+    noise_pdf = tmp_path / "pure_noise.pdf"
+    ndoc = pymupdf.open()
+    n_buf = BytesIO()
+    Image.effect_noise((950, 1300), 60.0).convert("RGB").save(n_buf, format="JPEG", quality=94)
+    for _ in range(5):
+        npg = ndoc.new_page(width=540, height=745)
+        npg.insert_image(npg.rect, stream=n_buf.getvalue())
+    ndoc.save(str(noise_pdf))
+    ndoc.close()
+    noise_out = tmp_path / "pure_noise_out.pdf"
+    noise_res = compress_pdf_file(noise_pdf, noise_out, max_mb=1.0)
+    assert noise_res.file_size_bytes <= 1_000_000
+    assert noise_res.file_size_bytes < noise_pdf.stat().st_size
 
     # Convert 30-page 0-text scanned PDF into Kindle-valid EPUB3 (with automatic <=25p TOC chunking)
     scanned_epub = tmp_path / "scan_out.epub"
@@ -631,7 +661,7 @@ async def test_scanned_and_text_pdf_compression_and_scanned_pdf_to_epub(tmp_path
         max_mb=1.0,
     )
     assert scanned_epub.exists()
-    assert epub_res.file_size_bytes <= 1 * 1024 * 1024
+    assert epub_res.file_size_bytes <= 1_000_000
     val = validate_epub(scanned_epub)
     assert val.valid, f"Scanned PDF -> EPUB failed validation: {val.errors}"
     # 27 pages in bookmark 1 (>25 -> split into 2 chapters) + 3 pages in bookmark 2 = 3 chapters
@@ -639,11 +669,53 @@ async def test_scanned_and_text_pdf_compression_and_scanned_pdf_to_epub(tmp_path
     assert len(chapters) == 3
     assert "第一期 (1/2)" in str(chapters[0]["title"])
     ch0_html = str(read_epub_chapter_html(scanned_epub, 0, book_id=9)["html"])
-    assert "/api/v1/books/9/asset/OEBPS/images/page_0001.png" in ch0_html
+    # Page 1 is a color cover (.jpg) and page 2 is crisp bi-level text (.png)
+    assert "/api/v1/books/9/asset/OEBPS/images/page_0001.jpg" in ch0_html
+    assert "/api/v1/books/9/asset/OEBPS/images/page_0002.png" in ch0_html
 
-    # 0-text scanned PDF -> TXT must raise friendly ValueError instead of writing empty file
+    # 0-text scanned PDF AND 0-text scanned EPUB -> TXT must BOTH raise friendly ValueError!
     with pytest.raises(ValueError, match="文字层"):
         extract_book_to_txt(scanned_pdf, tmp_path / "should_fail.txt")
+    with pytest.raises(ValueError, match="文字层"):
+        extract_book_to_txt(scanned_epub, tmp_path / "should_fail_from_scan_epub.txt")
+
+    # Preparing scanned EPUB for Calibre MOBI rewrites 1-bit mode='1' PNGs into indexed mode='P' PNGs
+    prep_mobi_epub = _prepare_epub_for_calibre_mobi(scanned_epub)
+    assert prep_mobi_epub is not None and prep_mobi_epub.exists()
+    try:
+        with (
+            zipfile.ZipFile(prep_mobi_epub, "r") as pzf,
+            Image.open(BytesIO(pzf.read("OEBPS/images/page_0002.png"))) as pim,
+        ):
+            assert pim.mode == "P"
+    finally:
+        prep_mobi_epub.unlink(missing_ok=True)
+
+    # Verify MOBI export passes --mobi-keep-original-images and falls back to KF8 when dual exceeds max_mb
+    calibre_calls: list[tuple[Any, ...]] = []
+
+    async def fake_mobi_calibre(src_p: Path, dst_p: Path, extra_args: list[str] | None = None) -> None:
+        calibre_calls.append(tuple(extra_args or []))
+        if extra_args and "--mobi-file-type=both" in extra_args:
+            dst_p.write_bytes(b"M" * 1_200_000)  # Simulate dual MOBI exceeding 1.0 MB cap
+        else:
+            dst_p.write_bytes(b"M" * 650_000)
+
+    with (
+        patch("inkpress.publishing.book_converter._has_binary", return_value=True),
+        patch("inkpress.publishing.book_converter._run_calibre_convert", side_effect=fake_mobi_calibre),
+    ):
+        mobi_art = await export_book_format(
+            primary_path=scanned_epub,
+            original_path=scanned_pdf,
+            output_path=tmp_path / "out_budget.mobi",
+            cover_dir=tmp_path / "covers",
+            target_format="mobi",
+            max_mb=1.0,
+        )
+    assert mobi_art.file_size_bytes <= 1_000_000
+    assert "--mobi-keep-original-images" in calibre_calls[0]
+    assert len(calibre_calls) == 2 and "--mobi-file-type=new" in calibre_calls[1]
 
     # 2. Vector text PDF with bloated embedded photo -> preserves selectable text while shrinking
     bloated_text_pdf = tmp_path / "bloated_text.pdf"

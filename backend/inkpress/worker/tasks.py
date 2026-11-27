@@ -1102,6 +1102,7 @@ async def run_convert_book(book_id: int) -> dict[str, Any]:
             updated_meta = dict(book.metadata_json or {})
             updated_meta.pop("chapters_cache", None)
             updated_meta.pop("chapters_cache_sig", None)
+            updated_meta.pop("default_export_max_mb", None)
             updated_meta["chapter_count"] = res.chapter_count
             updated_meta["conversion_notes"] = res.notes
             if mobi_out is not None:
@@ -1486,6 +1487,31 @@ def make_export_key(target_format: str, max_mb: float | None) -> str:
     return f"{fmt}_{mb_tag}mb"
 
 
+_LOCAL_BOOK_META_LOCKS: WeakKeyDictionary[asyncio.AbstractEventLoop, dict[int, asyncio.Lock]] = (
+    WeakKeyDictionary()
+)
+
+
+def get_local_book_meta_lock(book_id: int) -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    per_loop = _LOCAL_BOOK_META_LOCKS.get(loop)
+    if per_loop is None:
+        per_loop = {}
+        _LOCAL_BOOK_META_LOCKS[loop] = per_loop
+    lock = per_loop.get(book_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        per_loop[book_id] = lock
+    return lock
+
+
+async def fetch_book_for_update(session: AsyncSession, book_id: int) -> Book | None:
+    """Fetch a `Book` row with row-level `FOR UPDATE` lock (PostgreSQL) to prevent JSON lost updates."""
+    return (
+        await session.execute(select(Book).where(Book.id == book_id).with_for_update())
+    ).scalar_one_or_none()
+
+
 def _locate_existing_book_mobi(book: Book, lib_root: Path) -> Path | None:
     meta = book.metadata_json if isinstance(book.metadata_json, dict) else {}
     candidates: list[str] = []
@@ -1524,8 +1550,8 @@ async def run_export_book(
     norm_mb = normalize_export_max_mb(fmt, max_mb)
     export_key = make_export_key(fmt, norm_mb)
 
-    async with factory() as session:
-        book = await session.get(Book, book_id)
+    async with get_local_book_meta_lock(book_id), factory() as session:
+        book = await fetch_book_for_update(session, book_id)
         if book is None:
             return {"error": "book_not_found", "book_id": book_id}
         if book.conversion_status != "ready":
@@ -1538,13 +1564,19 @@ async def run_export_book(
         book_author = book.author
 
         meta = dict(book.metadata_json or {})
+        raw_lossy_mb = meta.get("default_export_max_mb")
+        primary_lossy_max_mb = (
+            float(raw_lossy_mb) if isinstance(raw_lossy_mb, (int, float)) else None
+        )
         exports_map = dict(meta.get("exports") or {})
+        raw_prev = exports_map.get(export_key)
+        prev_exp: dict[str, Any] = raw_prev if isinstance(raw_prev, dict) else {}
         exports_map[export_key] = {
             "target_format": fmt,
             "max_mb": norm_mb,
             "status": "converting",
-            "path": str(exports_map.get(export_key, {}).get("path") or ""),
-            "size_bytes": int(exports_map.get(export_key, {}).get("size_bytes") or 0),
+            "path": str(prev_exp.get("path") or ""),
+            "size_bytes": int(prev_exp.get("size_bytes") or 0),
             "notes": "",
             "error": None,
             "updated_at": utcnow().isoformat(),
@@ -1570,6 +1602,7 @@ async def run_export_book(
             author=book_author,
             max_mb=norm_mb,
             existing_mobi_path=existing_mobi,
+            primary_lossy_max_mb=primary_lossy_max_mb,
         )
 
         promoted_epub_or_pdf: Path | None = None
@@ -1585,12 +1618,16 @@ async def run_export_book(
             if fmt == "epub":
                 promoted_mobi = await build_companion_kindle_mobi(promoted_epub_or_pdf)
 
-        async with factory() as save_session:
-            book = await save_session.get(Book, book_id)
+        async with get_local_book_meta_lock(book_id), factory() as save_session:
+            book = await fetch_book_for_update(save_session, book_id)
             if book is None:
                 artifact.path.unlink(missing_ok=True)
+                if artifact.cover_path is not None:
+                    artifact.cover_path.unlink(missing_ok=True)
                 if promoted_epub_or_pdf is not None:
                     promoted_epub_or_pdf.unlink(missing_ok=True)
+                if promoted_mobi is not None:
+                    promoted_mobi.unlink(missing_ok=True)
                 return {"error": "book_not_found", "book_id": book_id}
 
             updated_meta = dict(book.metadata_json or {})
@@ -1623,6 +1660,10 @@ async def run_export_book(
                 book.file_size_bytes = promoted_epub_or_pdf.stat().st_size
                 updated_meta.pop("chapters_cache", None)
                 updated_meta.pop("chapters_cache_sig", None)
+                if norm_mb is not None:
+                    updated_meta["default_export_max_mb"] = norm_mb
+                else:
+                    updated_meta.pop("default_export_max_mb", None)
                 if artifact.chapter_count > 0:
                     updated_meta["chapter_count"] = artifact.chapter_count
                 updated_meta["conversion_notes"] = artifact.notes
@@ -1661,9 +1702,9 @@ async def run_export_book(
             "notes": artifact.notes,
         }
     except Exception as exc:
-        async with factory() as err_session:
+        async with get_local_book_meta_lock(book_id), factory() as err_session:
             try:
-                book = await err_session.get(Book, book_id)
+                book = await fetch_book_for_update(err_session, book_id)
                 if book is not None:
                     err_meta = dict(book.metadata_json or {})
                     exports_map = dict(err_meta.get("exports") or {})

@@ -37,6 +37,7 @@ from inkpress.publishing.book_converter import (
     SUPPORTED_BOOK_FORMATS,
     build_companion_kindle_mobi,
     list_epub_chapters,
+    max_mb_to_bytes,
     read_epub_chapter_html,
 )
 from inkpress.worker.broker import has_live_worker
@@ -45,6 +46,8 @@ from inkpress.worker.tasks import (
     convert_book_task,
     deliver_book_task,
     export_book_task,
+    fetch_book_for_update,
+    get_local_book_meta_lock,
     make_export_key,
     normalize_export_max_mb,
     run_convert_book_bg,
@@ -92,6 +95,20 @@ DOWNLOAD_MIME_BY_EXT: dict[str, str] = {
 }
 
 
+def _is_recent_converting_export(entry: dict[str, Any], max_age_seconds: float = 600.0) -> bool:
+    if entry.get("status") != "converting":
+        return False
+    raw_ts = str(entry.get("updated_at") or "").strip()
+    if not raw_ts:
+        return False
+    try:
+        parsed = datetime.fromisoformat(raw_ts)
+        age = (utcnow() - parsed).total_seconds()
+        return age < max_age_seconds
+    except Exception:
+        return False
+
+
 def _sanitize_public_exports(raw_exports: Any) -> dict[str, dict[str, Any]]:
     public_exports: dict[str, dict[str, Any]] = {}
     if not isinstance(raw_exports, dict):
@@ -101,8 +118,12 @@ def _sanitize_public_exports(raw_exports: Any) -> dict[str, dict[str, Any]]:
             continue
         p_str = str(exp_val.get("path") or "")
         st = str(exp_val.get("status") or "")
+        err_val = exp_val.get("error")
         if st == "ready" and (not p_str or not Path(p_str).exists()):
             continue
+        if st == "converting" and not _is_recent_converting_export(exp_val):
+            st = "failed"
+            err_val = err_val or "转换任务超时或已中断，请重试"
         public_exports[str(exp_key)] = {
             "key": str(exp_key),
             "target_format": str(exp_val.get("target_format") or ""),
@@ -110,7 +131,7 @@ def _sanitize_public_exports(raw_exports: Any) -> dict[str, dict[str, Any]]:
             "status": st,
             "size_bytes": int(exp_val.get("size_bytes") or 0),
             "notes": str(exp_val.get("notes") or ""),
-            "error": exp_val.get("error"),
+            "error": err_val,
             "updated_at": exp_val.get("updated_at"),
         }
     return public_exports
@@ -275,37 +296,39 @@ async def reconvert_book(
     _user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    book = await session.get(Book, book_id)
-    if book is None:
-        raise HTTPException(status_code=404, detail="Book not found")
-    if not book.original_path or not Path(book.original_path).exists():
-        raise HTTPException(status_code=400, detail="原始图书文件不存在，无法重新转码")
+    async with get_local_book_meta_lock(book_id):
+        book = await fetch_book_for_update(session, book_id)
+        if book is None:
+            raise HTTPException(status_code=404, detail="Book not found")
+        if not book.original_path or not Path(book.original_path).exists():
+            raise HTTPException(status_code=400, detail="原始图书文件不存在，无法重新转码")
 
-    lib_root = get_settings().library_data_dir.resolve()
-    meta = dict(book.metadata_json or {})
-    old_exports = meta.pop("exports", None)
-    if isinstance(old_exports, dict):
-        orig_resolved = Path(book.original_path).resolve()
-        for exp_val in old_exports.values():
-            if not isinstance(exp_val, dict):
-                continue
-            p_str = str(exp_val.get("path") or "").strip()
-            if p_str:
-                exp_p = Path(p_str)
-                if (
-                    exp_p.exists()
-                    and exp_p.resolve() != orig_resolved
-                    and exp_p.resolve().is_relative_to(lib_root)
-                ):
-                    exp_p.unlink(missing_ok=True)
+        lib_root = get_settings().library_data_dir.resolve()
+        meta = dict(book.metadata_json or {})
+        old_exports = meta.pop("exports", None)
+        if isinstance(old_exports, dict):
+            orig_resolved = Path(book.original_path).resolve()
+            for exp_val in old_exports.values():
+                if not isinstance(exp_val, dict):
+                    continue
+                p_str = str(exp_val.get("path") or "").strip()
+                if p_str:
+                    exp_p = Path(p_str)
+                    if (
+                        exp_p.exists()
+                        and exp_p.resolve() != orig_resolved
+                        and exp_p.resolve().is_relative_to(lib_root)
+                    ):
+                        exp_p.unlink(missing_ok=True)
 
-    book.conversion_status = "converting"
-    book.conversion_error = None
-    meta.pop("chapters_cache", None)
-    meta.pop("chapters_cache_sig", None)
-    book.metadata_json = meta
-    await session.commit()
-    await session.refresh(book)
+        book.conversion_status = "converting"
+        book.conversion_error = None
+        meta.pop("chapters_cache", None)
+        meta.pop("chapters_cache_sig", None)
+        meta.pop("default_export_max_mb", None)
+        book.metadata_json = meta
+        await session.commit()
+        await session.refresh(book)
 
     try:
         await convert_book_task.kiq(book.id)
@@ -368,20 +391,6 @@ async def download_book(
     )
 
 
-def _is_recent_converting_export(entry: dict[str, Any], max_age_seconds: float = 600.0) -> bool:
-    if entry.get("status") != "converting":
-        return False
-    raw_ts = str(entry.get("updated_at") or "").strip()
-    if not raw_ts:
-        return False
-    try:
-        parsed = datetime.fromisoformat(raw_ts)
-        age = (utcnow() - parsed).total_seconds()
-        return age < max_age_seconds
-    except Exception:
-        return False
-
-
 @router.post("/{book_id}/export")
 async def create_book_export(
     book_id: int,
@@ -399,6 +408,7 @@ async def create_book_export(
 
     fmt = payload.target_format.strip().lower()
     norm_mb = normalize_export_max_mb(fmt, payload.max_mb)
+    max_b = max_mb_to_bytes(norm_mb)
     export_key = make_export_key(fmt, norm_mb)
     download_url = f"/api/v1/books/{book.id}/exports/{export_key}/download"
     settings = get_settings()
@@ -406,6 +416,16 @@ async def create_book_export(
     lib_root = settings.library_data_dir.resolve()
 
     meta = dict(book.metadata_json or {})
+    raw_lossy_mb = meta.get("default_export_max_mb")
+    primary_lossy_mb = (
+        float(raw_lossy_mb) if isinstance(raw_lossy_mb, (int, float)) else None
+    )
+    has_orig = bool(book.original_path and Path(book.original_path).exists())
+    primary_exceeded_by_request = (
+        has_orig
+        and primary_lossy_mb is not None
+        and (norm_mb is None or norm_mb > primary_lossy_mb)
+    )
     exports_map = dict(meta.get("exports") or {})
     existing_entry = exports_map.get(export_key)
 
@@ -421,19 +441,32 @@ async def create_book_export(
                 await asyncio.to_thread(shutil.copy2, cached_p, promoted)
                 mobi_out = await build_companion_kindle_mobi(promoted) if fmt == "epub" else None
 
-                old_primary = Path(book.kindle_epub_path) if book.kindle_epub_path else None
-                old_orig = Path(book.original_path).resolve() if book.original_path else None
-                book.kindle_epub_path = str(promoted)
-                book.file_size_bytes = promoted.stat().st_size
-                meta.pop("chapters_cache", None)
-                meta.pop("chapters_cache_sig", None)
-                if mobi_out is not None:
-                    meta["kindle_mobi_path"] = str(mobi_out)
-                elif fmt == "pdf":
-                    meta.pop("kindle_mobi_path", None)
-                book.metadata_json = meta
-                await session.commit()
-                await session.refresh(book)
+                async with get_local_book_meta_lock(book_id):
+                    locked_book = await fetch_book_for_update(session, book_id)
+                    if locked_book is None:
+                        promoted.unlink(missing_ok=True)
+                        if mobi_out is not None:
+                            mobi_out.unlink(missing_ok=True)
+                        raise HTTPException(status_code=404, detail="Book not found")
+                    book = locked_book
+                    fresh_meta = dict(book.metadata_json or {})
+                    old_primary = Path(book.kindle_epub_path) if book.kindle_epub_path else None
+                    old_orig = Path(book.original_path).resolve() if book.original_path else None
+                    book.kindle_epub_path = str(promoted)
+                    book.file_size_bytes = promoted.stat().st_size
+                    fresh_meta.pop("chapters_cache", None)
+                    fresh_meta.pop("chapters_cache_sig", None)
+                    if norm_mb is not None:
+                        fresh_meta["default_export_max_mb"] = norm_mb
+                    else:
+                        fresh_meta.pop("default_export_max_mb", None)
+                    if mobi_out is not None:
+                        fresh_meta["kindle_mobi_path"] = str(mobi_out)
+                    elif fmt == "pdf":
+                        fresh_meta.pop("kindle_mobi_path", None)
+                    book.metadata_json = fresh_meta
+                    await session.commit()
+                    await session.refresh(book)
 
                 if (
                     old_primary is not None
@@ -468,9 +501,9 @@ async def create_book_export(
     # 3. Validate Calibre availability upfront when exporting uncached MOBI
     if fmt == "mobi":
         existing_mobi = _locate_existing_book_mobi(book, lib_root)
-        max_b = int(norm_mb * 1024 * 1024) if norm_mb is not None else None
         can_reuse_mobi = (
-            existing_mobi is not None
+            not primary_exceeded_by_request
+            and existing_mobi is not None
             and existing_mobi.stat().st_size > 0
             and (max_b is None or existing_mobi.stat().st_size <= max_b)
         )
@@ -483,13 +516,14 @@ async def create_book_export(
                     detail="当前运行环境未启用 Calibre (ebook-convert) 组件，暂不支持生成 MOBI 格式；请选择转换为 EPUB 或轻量化 PDF。",
                 )
 
-    # 4. Inline execution (also fast-paths existing EPUB/MOBI copies)
+    # 4. Inline execution (also fast-paths existing lossless EPUB copies)
     primary_p = Path(book.kindle_epub_path) if book.kindle_epub_path else Path("")
     is_instant_copy = (
         fmt == "epub"
+        and not primary_exceeded_by_request
         and primary_p.suffix.lower() == ".epub"
         and primary_p.exists()
-        and (norm_mb is None or primary_p.stat().st_size <= int(norm_mb * 1024 * 1024))
+        and (max_b is None or primary_p.stat().st_size <= max_b)
     )
     if inline or is_instant_copy:
         try:
@@ -512,20 +546,27 @@ async def create_book_export(
         }
 
     # 5. Async worker execution (with automatic fallback to local BackgroundTasks when no worker is live)
-    exports_map[export_key] = {
-        "target_format": fmt,
-        "max_mb": norm_mb,
-        "status": "converting",
-        "path": "",
-        "size_bytes": 0,
-        "notes": "",
-        "error": None,
-        "updated_at": utcnow().isoformat(),
-    }
-    meta["exports"] = exports_map
-    book.metadata_json = meta
-    await session.commit()
-    await session.refresh(book)
+    async with get_local_book_meta_lock(book_id):
+        locked_book = await fetch_book_for_update(session, book_id)
+        if locked_book is None:
+            raise HTTPException(status_code=404, detail="Book not found")
+        book = locked_book
+        fresh_meta = dict(book.metadata_json or {})
+        fresh_exports = dict(fresh_meta.get("exports") or {})
+        fresh_exports[export_key] = {
+            "target_format": fmt,
+            "max_mb": norm_mb,
+            "status": "converting",
+            "path": "",
+            "size_bytes": 0,
+            "notes": "",
+            "error": None,
+            "updated_at": utcnow().isoformat(),
+        }
+        fresh_meta["exports"] = fresh_exports
+        book.metadata_json = fresh_meta
+        await session.commit()
+        await session.refresh(book)
 
     dispatched_to_worker = False
     if await has_live_worker(require_calibre=(fmt == "mobi")):
@@ -578,8 +619,13 @@ async def get_book_export_status(
 
     st = str(raw_entry.get("status") or "")
     p_str = str(raw_entry.get("path") or "")
+    err_val = raw_entry.get("error")
     if st == "ready" and (not p_str or not Path(p_str).exists()):
         st = "failed"
+        err_val = err_val or "转换文件已不存在，请重新转换"
+    elif st == "converting" and not _is_recent_converting_export(raw_entry):
+        st = "failed"
+        err_val = err_val or "转换任务超时或已中断，请重试"
     item_dict = _book_dict(book)
     return {
         "status": st,
@@ -591,7 +637,7 @@ async def get_book_export_status(
             "status": st,
             "size_bytes": int(raw_entry.get("size_bytes") or 0),
             "notes": str(raw_entry.get("notes") or ""),
-            "error": raw_entry.get("error"),
+            "error": err_val,
             "updated_at": raw_entry.get("updated_at"),
         },
         "download_url": f"/api/v1/books/{book.id}/exports/{export_key}/download",
@@ -626,9 +672,11 @@ async def download_book_export(
     media_type = DOWNLOAD_MIME_BY_EXT.get(ext, "application/octet-stream")
     max_mb = entry.get("max_mb")
     tag = ""
-    if isinstance(max_mb, (int, float)) and ext in (".pdf", ".epub"):
-        mb_str = str(int(max_mb)) if float(max_mb).is_integer() else str(max_mb)
-        tag = f"_{mb_str}MB"
+    if isinstance(max_mb, (int, float)) and ext in (".pdf", ".epub", ".mobi"):
+        cap_bytes = max_mb_to_bytes(float(max_mb))
+        if cap_bytes is None or exp_path.stat().st_size <= cap_bytes:
+            mb_str = str(int(max_mb)) if float(max_mb).is_integer() else str(max_mb)
+            tag = f"_{mb_str}MB"
     return FileResponse(
         exp_path,
         media_type=media_type,
@@ -664,10 +712,15 @@ async def get_book_chapters(
             raise HTTPException(status_code=404, detail="Book file missing on disk") from exc
         except (ValueError, zipfile.BadZipFile) as exc:
             raise HTTPException(status_code=400, detail=f"无效的 EPUB 文件: {exc}") from exc
-        meta["chapters_cache"] = chapters
-        meta["chapters_cache_sig"] = stat_sig
-        book.metadata_json = meta
-        await session.commit()
+        async with get_local_book_meta_lock(book_id):
+            locked_book = await fetch_book_for_update(session, book_id)
+            if locked_book is not None:
+                fresh_meta = dict(locked_book.metadata_json or {})
+                fresh_meta["chapters_cache"] = chapters
+                fresh_meta["chapters_cache_sig"] = stat_sig
+                locked_book.metadata_json = fresh_meta
+                await session.commit()
+                book = locked_book
 
     return {"book": _book_dict(book), "chapters": chapters}
 

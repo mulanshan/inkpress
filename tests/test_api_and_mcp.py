@@ -1205,20 +1205,57 @@ async def test_book_export_other_formats_compress_pdf_promote_and_cleanup(
     assert r_txt_scan.status_code == 400
     assert "文字层" in r_txt_scan.json()["detail"]
 
-    # 3. Export >1MB scanned PDF -> Compact PDF (<= 1 MB and <= 10 MB)
-    r_exp_pdf = await test_client.post(
-        f"/api/v1/books/{book_id}/export?inline=true",
-        headers=headers,
-        json={"target_format": "pdf", "max_mb": 1},
+    # 3. Concurrent exports (pdf_1mb + epub_1mb) must preserve BOTH keys without JSON lost updates!
+    import asyncio
+
+    r_exp_pdf, r_exp_epub_low = await asyncio.gather(
+        test_client.post(
+            f"/api/v1/books/{book_id}/export?inline=true",
+            headers=headers,
+            json={"target_format": "pdf", "max_mb": 1},
+        ),
+        test_client.post(
+            f"/api/v1/books/{book_id}/export?inline=true",
+            headers=headers,
+            json={"target_format": "epub", "max_mb": 1, "set_as_default": True},
+        ),
     )
     assert r_exp_pdf.status_code == 200
+    assert r_exp_epub_low.status_code == 200
     pdf_data = r_exp_pdf.json()
     assert pdf_data["status"] == "ready"
     assert pdf_data["export_key"] == "pdf_1mb"
-    # Public API must NEVER expose server filesystem `path` inside item.exports
     assert "path" not in pdf_data["item"]["exports"]["pdf_1mb"]
     assert pdf_data["export"]["size_bytes"] < orig_bytes_len
-    assert pdf_data["export"]["size_bytes"] <= 1 * 1024 * 1024
+    assert pdf_data["export"]["size_bytes"] <= 1_000_000  # Strictly <= 1.0 decimal MB
+
+    r_books_check = await test_client.get("/api/v1/books", headers=headers)
+    b_item = next(x for x in r_books_check.json()["items"] if x["id"] == book_id)
+    assert "pdf_1mb" in b_item["exports"] and "epub_1mb" in b_item["exports"]
+    assert b_item["can_read_online"] is True
+    assert b_item["active_format"] == "epub"
+    low_epub_bytes = b_item["exports"]["epub_1mb"]["size_bytes"]
+    assert low_epub_bytes <= 1_000_000
+
+    # Exporting promoted 0-text scanned EPUB -> TXT MUST STILL return 400 (no fake heading-only TXT!)
+    r_txt_after_promote = await test_client.post(
+        f"/api/v1/books/{book_id}/export?inline=true",
+        headers=headers,
+        json={"target_format": "txt"},
+    )
+    assert r_txt_after_promote.status_code == 400
+    assert "文字层" in r_txt_after_promote.json()["detail"]
+
+    # 4. Requesting a HIGHER budget (max_mb=10) after promoting 1MB default rebuilds from original PDF!
+    r_exp_epub = await test_client.post(
+        f"/api/v1/books/{book_id}/export?inline=true",
+        headers=headers,
+        json={"target_format": "epub", "max_mb": 10},
+    )
+    assert r_exp_epub.status_code == 200
+    epub_payload = r_exp_epub.json()
+    assert epub_payload["status"] == "ready"
+    assert epub_payload["export"]["size_bytes"] > low_epub_bytes
 
     r_dl_pdf = await test_client.get(pdf_data["download_url"], headers=headers)
     assert r_dl_pdf.status_code == 200
@@ -1226,24 +1263,43 @@ async def test_book_export_other_formats_compress_pdf_promote_and_cleanup(
     assert "1MB.pdf" in unquote_header(r_dl_pdf.headers.get("content-disposition", ""))
     assert r_dl_pdf.content.startswith(b"%PDF")
 
-    # Status polling endpoint returns ready
+    # Status polling endpoint returns ready; stale 'converting' entry reports failed and is recovered
     r_poll = await test_client.get(
         f"/api/v1/books/{book_id}/exports/pdf_1mb", headers=headers
     )
     assert r_poll.status_code == 200
     assert r_poll.json()["status"] == "ready"
 
-    # 4. Export scanned PDF -> Kindle EPUB3 (<= 10 MB) with set_as_default=True
-    r_exp_epub = await test_client.post(
-        f"/api/v1/books/{book_id}/export?inline=true",
-        headers=headers,
-        json={"target_format": "epub", "max_mb": 10, "set_as_default": True},
+    from datetime import timedelta
+
+    from inkpress.db.models import utcnow
+    from inkpress.worker.runner import recover_stale_running_deliveries
+
+    async with factory() as session:
+        b_stale = await session.get(Book, book_id)
+        assert b_stale is not None
+        smeta = dict(b_stale.metadata_json or {})
+        sexps = dict(smeta.get("exports") or {})
+        sexps["pdf_25mb"] = {
+            "target_format": "pdf",
+            "max_mb": 25.0,
+            "status": "converting",
+            "path": "",
+            "size_bytes": 0,
+            "notes": "",
+            "error": None,
+            "updated_at": (utcnow() - timedelta(minutes=25)).isoformat(),
+        }
+        smeta["exports"] = sexps
+        b_stale.metadata_json = smeta
+        await session.commit()
+
+    r_stale_poll = await test_client.get(
+        f"/api/v1/books/{book_id}/exports/pdf_25mb", headers=headers
     )
-    assert r_exp_epub.status_code == 200
-    epub_payload = r_exp_epub.json()
-    assert epub_payload["status"] == "ready"
-    assert epub_payload["item"]["can_read_online"] is True
-    assert epub_payload["item"]["active_format"] == "epub"
+    assert r_stale_poll.status_code == 200
+    assert r_stale_poll.json()["status"] == "failed"
+    assert await recover_stale_running_deliveries(stale_minutes=15) >= 1
 
     r_dl_epub = await test_client.get(epub_payload["download_url"], headers=headers)
     assert r_dl_epub.status_code == 200
@@ -1266,7 +1322,7 @@ async def test_book_export_other_formats_compress_pdf_promote_and_cleanup(
 
     # 5. Deleting book removes all cached export artifacts from disk
     export_files_before = list((settings.library_data_dir / "exports").glob(f"book_{book_id}_*"))
-    assert len(export_files_before) == 2
+    assert len(export_files_before) == 3
     r_del = await test_client.delete(f"/api/v1/books/{book_id}", headers=headers)
     assert r_del.status_code == 200
     export_files_after = list((settings.library_data_dir / "exports").glob(f"book_{book_id}_*"))

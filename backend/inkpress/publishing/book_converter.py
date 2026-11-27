@@ -15,7 +15,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import quote, unquote
 
 import docx
@@ -24,7 +24,7 @@ import nh3
 import pymupdf
 from bs4 import BeautifulSoup, Tag
 from lxml import etree
-from PIL import Image, ImageFilter, ImageOps
+from PIL import Image, ImageChops, ImageFilter, ImageOps
 
 from inkpress.ingestion.extractor import detect_language, sanitize_article_html
 from inkpress.logging import get_logger
@@ -499,6 +499,52 @@ async def _run_calibre_convert(src: Path, dst: Path, extra_args: list[str] | Non
         raise RuntimeError(f"ebook-convert failed (rc={proc.returncode}): {err}")
 
 
+def max_mb_to_bytes(max_mb: float | None) -> int | None:
+    """Convert a user-facing MB cap to decimal SI bytes (1 MB = 1,000,000 B).
+
+    Using 1,000,000 B per MB ensures an exported `<= 10 MB` file is strictly <= 10.0 MB
+    in macOS Finder / iOS Files / email attachments as well as <= 9.54 MiB in binary units.
+    """
+    if max_mb is None or max_mb <= 0:
+        return None
+    return int(max_mb * 1_000_000)
+
+
+def _prepare_epub_for_calibre_mobi(src_epub: Path) -> Path | None:
+    """Rewrite 1-bit `mode='1'` PNGs into indexed `mode='P'` PNGs if present in `src_epub`.
+
+    Calibre's MOBI output plugin either re-encodes 1-bit PNGs into huge RGB JPEGs (~250 KB/page)
+    or rejects `bit_depth=1` PNGs under `--mobi-keep-original-images`. Indexed `mode='P'` PNGs
+    convert in <0.1s/page with zero image loss and compact file size.
+    """
+    needs_rewrite = False
+    with zipfile.ZipFile(src_epub, "r") as zin:
+        for name in zin.namelist():
+            if name.lower().endswith(".png"):
+                with contextlib.suppress(Exception), Image.open(io.BytesIO(zin.read(name))) as im:
+                    if im.mode == "1":
+                        needs_rewrite = True
+                        break
+        if not needs_rewrite:
+            return None
+
+        tmp_epub = src_epub.parent / f".mobi_prep_{uuid.uuid4().hex[:10]}.epub"
+        with zipfile.ZipFile(tmp_epub, "w") as zout:
+            zout.writestr("mimetype", b"application/epub+zip", compress_type=zipfile.ZIP_STORED)
+            for info in zin.infolist():
+                if info.filename == "mimetype":
+                    continue
+                data = zin.read(info.filename)
+                if info.filename.lower().endswith(".png"):
+                    with contextlib.suppress(Exception), Image.open(io.BytesIO(data)) as im:
+                        if im.mode == "1":
+                            buf = io.BytesIO()
+                            im.convert("L").quantize(colors=2).save(buf, format="PNG", optimize=True)
+                            data = buf.getvalue()
+                zout.writestr(info.filename, data, compress_type=zipfile.ZIP_DEFLATED)
+        return tmp_epub
+
+
 async def build_companion_kindle_mobi(epub_path: Path, *, timeout: float = 120.0) -> Path | None:
     """Build a dual KF8+MOBI7 `.mobi` companion alongside an `.epub` when Calibre CLI is available.
 
@@ -512,15 +558,20 @@ async def build_companion_kindle_mobi(epub_path: Path, *, timeout: float = 120.0
     ):
         return None
     mobi_path = epub_path.with_suffix(".mobi")
-    cmd = [
-        "ebook-convert",
-        str(epub_path),
-        str(mobi_path),
-        "--mobi-file-type=both",
-    ]
+    prep_epub: Path | None = None
     try:
+        prep_epub = await asyncio.to_thread(_prepare_epub_for_calibre_mobi, epub_path)
+        src_for_mobi = prep_epub if prep_epub is not None else epub_path
+        extra = (
+            ["--mobi-file-type=both", "--mobi-keep-original-images", "--output-profile=tablet"]
+            if prep_epub is not None
+            else ["--mobi-file-type=both"]
+        )
         proc = await asyncio.create_subprocess_exec(
-            *cmd,
+            "ebook-convert",
+            str(src_for_mobi),
+            str(mobi_path),
+            *extra,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -538,6 +589,9 @@ async def build_companion_kindle_mobi(epub_path: Path, *, timeout: float = 120.0
     except Exception as exc:
         mobi_path.unlink(missing_ok=True)
         logger.warning("companion_mobi_failed", epub=epub_path.name, err=str(exc))
+    finally:
+        if prep_epub is not None:
+            prep_epub.unlink(missing_ok=True)
     return None
 
 
@@ -1465,17 +1519,19 @@ async def convert_book_to_kindle_epub(
     )
 
 
-_SCAN_PROFILES: tuple[tuple[int, int, float], ...] = (
-    # (target_long_edge_px, ink_threshold, median_blend)
-    (1550, 146, 0.35),  # ~150 DPI on B5/A4
-    (1396, 145, 0.40),  # ~135 DPI
-    (1282, 145, 0.40),  # ~124 DPI
-    (1179, 143, 0.42),  # ~114 DPI
-    (1065, 140, 0.45),  # ~103 DPI
-    (960, 138, 0.48),   # ~93 DPI
-    (850, 135, 0.50),   # ~82 DPI
-    (740, 132, 0.50),   # ~72 DPI
-    (620, 128, 0.50),   # ~60 DPI legibility floor
+_PageVisualKind = Literal["color", "photo", "text"]
+
+# (text_long_edge_px, local_diff_thr, photo_long_edge_px, photo_jpg_q, color_long_edge_px, color_jpg_q)
+_HYBRID_SCAN_PROFILES: tuple[tuple[int, int, int, int, int, int], ...] = (
+    (1560, 34, 1080, 44, 880, 56),  # ~150 DPI crisp archival
+    (1400, 36,  980, 40, 800, 52),  # ~135 DPI default unlimited
+    (1260, 40,  880, 37, 720, 48),  # ~122 DPI
+    (1140, 44,  800, 34, 660, 44),  # ~110 DPI
+    (1020, 47,  720, 31, 580, 40),  # ~99 DPI
+    ( 900, 50,  640, 28, 520, 36),  # ~87 DPI
+    ( 780, 52,  560, 25, 460, 32),  # ~75 DPI
+    ( 660, 54,  480, 23, 400, 30),  # ~64 DPI
+    ( 540, 56,  420, 22, 360, 28),  # ~52 DPI extreme budget floor
 )
 
 _MAX_SCANNED_EPUB_PAGES_PER_CHAPTER = 25
@@ -1775,13 +1831,42 @@ def _pick_sample_indices(indices: list[int], max_samples: int = 12) -> list[int]
     return picked
 
 
+def _classify_scanned_page_visual(page: Any) -> _PageVisualKind:
+    """Classify a scanned page into 'color' (covers/plates), 'photo' (halftones/dark bg), or 'text'."""
+    rect = page.rect
+    long_pt = max(float(rect.width), float(rect.height), 1.0)
+    sc = min(1.0, 220.0 / long_pt)
+    pix = page.get_pixmap(
+        matrix=pymupdf.Matrix(sc, sc),
+        colorspace=pymupdf.csRGB,
+        alpha=False,
+    )
+    raw = pix.samples
+    n_px = max(1, pix.width * pix.height)
+    sat_sum = 0
+    dark_cnt = 0
+    for i in range(0, len(raw), 3):
+        r, g, b = raw[i], raw[i + 1], raw[i + 2]
+        sat_sum += max(r, g, b) - min(r, g, b)
+        if ((r * 77 + g * 150 + b * 29) >> 8) < 172:
+            dark_cnt += 1
+    if (sat_sum / float(n_px)) >= 16.0:
+        return "color"
+    if (dark_cnt / float(n_px)) >= 0.27:
+        return "photo"
+    return "text"
+
+
 def _render_scanned_page_1bit(
     page: Any,
     *,
     target_long_edge_px: int,
-    threshold: int,
-    median_blend: float,
+    threshold: int = 145,
+    median_blend: float = 0.0,
+    local_diff_thr: int = 40,
 ) -> Image.Image:
+    """Render a scanned text page to crisp 1-bit using local illumination subtraction (no stroke melting)."""
+    _ = (threshold, median_blend)
     rect = page.rect
     w_pt = max(float(rect.width), 1.0)
     h_pt = max(float(rect.height), 1.0)
@@ -1794,47 +1879,75 @@ def _render_scanned_page_1bit(
         alpha=False,
     )
     im = Image.frombytes("L", (max(1, pix.width), max(1, pix.height)), pix.samples)
-    if median_blend > 0.0 and im.width >= 8 and im.height >= 8:
-        im = Image.blend(im, im.filter(ImageFilter.MedianFilter(3)), median_blend)
-    return im.point([255 if v >= threshold else 0 for v in range(256)], mode="1")
+    radius = max(12, im.width // 36)
+    bg = im.filter(ImageFilter.BoxBlur(radius))
+    diff = ImageChops.subtract(bg, im)
+    bw_diff = diff.point([255 if v <= local_diff_thr else 0 for v in range(256)], mode="L")
+    bw_dark = im.point([0 if v < 82 else 255 for v in range(256)], mode="L")
+    return ImageChops.darker(bw_diff, bw_dark).convert("1")
 
 
-def _scanned_page_to_ccitt_pdf_bytes(
+def _encode_scanned_page_hybrid(
     page: Any,
+    visual_kind: _PageVisualKind,
+    profile: tuple[int, int, int, int, int, int],
     *,
-    target_long_edge_px: int,
-    threshold: int,
-    median_blend: float,
-) -> bytes:
+    for_epub: bool,
+) -> tuple[str, bytes]:
+    """Encode one scanned page as ('jpg'|'png'|'ccitt_pdf', bytes) preserving color/photos & crisp text."""
+    text_px, diff_thr, photo_px, photo_q, color_px, color_q = profile
+    rect = page.rect
+    long_pt = max(float(rect.width), float(rect.height), 1.0)
+
+    if visual_kind == "color":
+        sc = max(300, min(1800, color_px)) / long_pt
+        pix = page.get_pixmap(
+            matrix=pymupdf.Matrix(sc, sc),
+            colorspace=pymupdf.csRGB,
+            alpha=False,
+        )
+        im_rgb = Image.frombytes("RGB", (max(1, pix.width), max(1, pix.height)), pix.samples)
+        buf = io.BytesIO()
+        im_rgb.save(buf, format="JPEG", quality=color_q, optimize=True)
+        return "jpg", buf.getvalue()
+
+    def _encode_gray_jpg() -> bytes:
+        sc_g = max(340, min(1800, photo_px)) / long_pt
+        pix_g = page.get_pixmap(
+            matrix=pymupdf.Matrix(sc_g, sc_g),
+            colorspace=pymupdf.csGRAY,
+            alpha=False,
+        )
+        im_g = Image.frombytes("L", (max(1, pix_g.width), max(1, pix_g.height)), pix_g.samples)
+        im_g = ImageOps.autocontrast(im_g, cutoff=0.4)
+        g_buf = io.BytesIO()
+        im_g.save(g_buf, format="JPEG", quality=photo_q, optimize=True)
+        return g_buf.getvalue()
+
+    if visual_kind == "photo":
+        return "jpg", _encode_gray_jpg()
+
     bw = _render_scanned_page_1bit(
         page,
-        target_long_edge_px=target_long_edge_px,
-        threshold=threshold,
-        median_blend=median_blend,
-    )
-    w_pt = max(float(page.rect.width), 1.0)
-    eff_res = max(18.0, bw.width * 72.0 / w_pt)
-    buf = io.BytesIO()
-    bw.save(buf, format="PDF", resolution=eff_res)
-    return buf.getvalue()
-
-
-def _scanned_page_to_1bit_png_bytes(
-    page: Any,
-    *,
-    target_long_edge_px: int,
-    threshold: int,
-    median_blend: float,
-) -> bytes:
-    bw = _render_scanned_page_1bit(
-        page,
-        target_long_edge_px=target_long_edge_px,
-        threshold=threshold,
-        median_blend=median_blend,
+        target_long_edge_px=text_px,
+        local_diff_thr=diff_thr,
     )
     buf = io.BytesIO()
-    bw.save(buf, format="PNG", optimize=True)
-    return buf.getvalue()
+    if for_epub:
+        bw.save(buf, format="PNG", optimize=True)
+        out_kind = "png"
+    else:
+        eff_res = max(18.0, bw.width * 72.0 / max(float(rect.width), 1.0))
+        bw.save(buf, format="PDF", resolution=eff_res)
+        out_kind = "ccitt_pdf"
+    bilevel_bytes = buf.getvalue()
+
+    # Guard against fine halftone/noise pages that stayed bright overall yet defeat 1-bit RLE
+    if len(bilevel_bytes) > 72_000:
+        cand_jpg = _encode_gray_jpg()
+        if len(cand_jpg) < int(len(bilevel_bytes) * 0.82):
+            return "jpg", cand_jpg
+    return out_kind, bilevel_bytes
 
 
 def _render_pdf_cover_jpeg(
@@ -1862,63 +1975,69 @@ def _render_pdf_cover_jpeg(
     return buf.getvalue()
 
 
-def _select_scan_profile(
+def _select_hybrid_scan_profile_idx(
     pdf_doc: Any,
-    body_indices: list[int],
+    page_indices: list[int],
+    kind_cache: dict[int, _PageVisualKind],
     *,
     per_page_budget: float | None,
-    use_png: bool,
-) -> tuple[int, int, float]:
+    for_epub: bool,
+) -> int:
     if per_page_budget is None:
-        return _SCAN_PROFILES[1]  # Crisp ~135 DPI default when unlimited
+        return 1  # Crisp ~135 DPI default when unlimited
 
-    samples = _pick_sample_indices(body_indices, max_samples=12)
+    samples = _pick_sample_indices(page_indices, max_samples=14)
     if not samples:
-        return _SCAN_PROFILES[1]
+        return 1
 
-    cache: dict[int, float] = {}
+    for p_i in samples:
+        if p_i not in kind_cache:
+            kind_cache[p_i] = _classify_scanned_page_visual(pdf_doc[p_i])
+
+    eval_cache: dict[int, float] = {}
 
     def _eval_profile(idx: int) -> float:
-        if idx in cache:
-            return cache[idx]
-        long_px, thr, blend = _SCAN_PROFILES[idx]
+        if idx in eval_cache:
+            return eval_cache[idx]
+        prof = _HYBRID_SCAN_PROFILES[idx]
         total = 0
         for p_i in samples:
-            if use_png:
-                b = _scanned_page_to_1bit_png_bytes(
-                    pdf_doc[p_i],
-                    target_long_edge_px=long_px,
-                    threshold=thr,
-                    median_blend=blend,
-                )
-            else:
-                b = _scanned_page_to_ccitt_pdf_bytes(
-                    pdf_doc[p_i],
-                    target_long_edge_px=long_px,
-                    threshold=thr,
-                    median_blend=blend,
-                )
-            total += len(b)
+            _k, data = _encode_scanned_page_hybrid(
+                pdf_doc[p_i], kind_cache[p_i], prof, for_epub=for_epub
+            )
+            total += len(data)
         avg = total / float(len(samples))
-        cache[idx] = avg
+        eval_cache[idx] = avg
         return avg
 
-    # Start near middle (~114 DPI) and walk up or down to find highest-quality profile <= budget
     mid_idx = 3
-    mid_avg = _eval_profile(mid_idx)
-    if mid_avg <= per_page_budget:
+    if _eval_profile(mid_idx) <= per_page_budget:
         best = mid_idx
         for cand_idx in range(mid_idx - 1, -1, -1):
             if _eval_profile(cand_idx) <= per_page_budget:
                 best = cand_idx
             else:
                 break
-        return _SCAN_PROFILES[best]
+        return best
 
-    for cand_idx in range(mid_idx + 1, len(_SCAN_PROFILES)):
+    for cand_idx in range(mid_idx + 1, len(_HYBRID_SCAN_PROFILES)):
         if _eval_profile(cand_idx) <= per_page_budget:
-            return _SCAN_PROFILES[cand_idx]
-    return _SCAN_PROFILES[-1]
+            return cand_idx
+    return len(_HYBRID_SCAN_PROFILES) - 1
+
+
+def _scale_hybrid_profile(
+    prof: tuple[int, int, int, int, int, int], factor: float
+) -> tuple[int, int, int, int, int, int]:
+    text_px, diff_thr, photo_px, photo_q, color_px, color_q = prof
+    return (
+        max(460, int(text_px * factor)),
+        min(60, diff_thr + 4),
+        max(360, int(photo_px * factor)),
+        max(20, photo_q - 4),
+        max(320, int(color_px * factor)),
+        max(24, color_q - 5),
+    )
 
 
 def _build_scanned_compact_pdf(
@@ -1927,50 +2046,46 @@ def _build_scanned_compact_pdf(
     *,
     max_bytes: int | None,
 ) -> tuple[int, int]:
-    """Stream a scanned/layout PDF into a compact CCITTFaxDecode PDF preserving cover & TOC."""
+    """Stream a scanned/layout PDF into a compact hybrid (CCITT + color/photo JPEG) PDF with TOC."""
     page_count = len(pdf_doc)
     meta = pdf_doc.metadata or {}
     clean_toc = _sanitize_pdf_toc(pdf_doc.get_toc(simple=True) or [], page_count)
+    kind_cache: dict[int, _PageVisualKind] = {}
+    all_indices = list(range(page_count))
 
-    cover_jpg: bytes | None = None
-    if page_count >= 2 and (max_bytes is None or max_bytes >= 1_200_000):
-        cov_w = 760 if (max_bytes is None or max_bytes >= 8 * 1024 * 1024) else 560
-        cov_q = 58 if (max_bytes is None or max_bytes >= 8 * 1024 * 1024) else 45
-        cand_cov = _render_pdf_cover_jpeg(pdf_doc[0], max_width=cov_w, quality=cov_q)
-        max_cov_allowance = 120_000 if max_bytes is None else min(110_000, int(max_bytes * 0.04))
-        if cand_cov and len(cand_cov) <= max_cov_allowance:
-            cover_jpg = cand_cov
-
-    body_indices = list(range(1 if cover_jpg is not None else 0, page_count))
     per_page_budget: float | None = None
-    if max_bytes is not None and body_indices:
-        overhead = len(cover_jpg or b"") + page_count * 380 + 28_672
-        usable = max(float(len(body_indices) * 2048), max_bytes * 0.90 - overhead)
-        per_page_budget = usable / float(len(body_indices))
+    if max_bytes is not None and page_count > 0:
+        overhead = page_count * 380 + 28_672
+        usable = max(float(page_count * 1800), max_bytes * 0.90 - overhead)
+        per_page_budget = usable / float(page_count)
 
-    long_px, thr, blend = _select_scan_profile(
-        pdf_doc, body_indices, per_page_budget=per_page_budget, use_png=False
+    prof_idx = _select_hybrid_scan_profile_idx(
+        pdf_doc,
+        all_indices,
+        kind_cache,
+        per_page_budget=per_page_budget,
+        for_epub=False,
     )
+    active_prof = _HYBRID_SCAN_PROFILES[prof_idx]
 
-    def _assemble(cur_long_px: int, cur_thr: int, cur_blend: float, keep_rgb_cover: bool) -> int:
+    def _assemble(cur_prof: tuple[int, int, int, int, int, int]) -> int:
         out_doc = pymupdf.open()
         try:
             for p_idx in range(page_count):
+                if p_idx not in kind_cache:
+                    kind_cache[p_idx] = _classify_scanned_page_visual(pdf_doc[p_idx])
                 rect = pdf_doc[p_idx].rect
-                if p_idx == 0 and keep_rgb_cover and cover_jpg is not None:
+                enc_kind, payload = _encode_scanned_page_hybrid(
+                    pdf_doc[p_idx], kind_cache[p_idx], cur_prof, for_epub=False
+                )
+                if enc_kind == "jpg":
                     np = out_doc.new_page(
                         width=max(float(rect.width), 1.0),
                         height=max(float(rect.height), 1.0),
                     )
-                    np.insert_image(np.rect, stream=cover_jpg)
+                    np.insert_image(np.rect, stream=payload)
                 else:
-                    one_pdf = _scanned_page_to_ccitt_pdf_bytes(
-                        pdf_doc[p_idx],
-                        target_long_edge_px=cur_long_px,
-                        threshold=cur_thr,
-                        median_blend=cur_blend,
-                    )
-                    pdoc = pymupdf.open("pdf", one_pdf)
+                    pdoc = pymupdf.open("pdf", payload)
                     try:
                         out_doc.insert_pdf(pdoc)
                     finally:
@@ -1992,20 +2107,18 @@ def _build_scanned_compact_pdf(
             out_doc.close()
         return dst.stat().st_size
 
-    size_bytes = _assemble(long_px, thr, blend, cover_jpg is not None)
-    used_long_px = long_px
+    size_bytes = _assemble(active_prof)
+    used_prof = active_prof
 
-    # Corrective pass if un-sampled dense pages pushed size slightly past max_bytes
-    if max_bytes is not None and size_bytes > max_bytes and used_long_px > 540:
-        ratio = (max_bytes / float(size_bytes)) * 0.90
-        next_long_px = max(540, int(used_long_px * (ratio**0.72)))
-        size_bytes = _assemble(next_long_px, min(thr, 134), 0.50, max_bytes >= 3_000_000)
-        used_long_px = next_long_px
-        if size_bytes > max_bytes and used_long_px > 480:
-            size_bytes = _assemble(480, 128, 0.50, False)
-            used_long_px = 480
+    # Corrective pass if un-sampled photo/color clusters pushed total bytes past max_bytes
+    for _attempt in range(2):
+        if max_bytes is None or size_bytes <= max_bytes or used_prof[0] <= 470:
+            break
+        ratio = (max_bytes / float(size_bytes)) * 0.88
+        used_prof = _scale_hybrid_profile(used_prof, max(0.55, ratio**0.68))
+        size_bytes = _assemble(used_prof)
 
-    approx_dpi = max(50, round(used_long_px / 10.3))
+    approx_dpi = max(50, round(used_prof[0] / 10.3))
     return size_bytes, approx_dpi
 
 
@@ -2016,7 +2129,7 @@ def compress_pdf_file(
     max_mb: float | None = 10.0,
 ) -> ExportedBookArtifact:
     """Compress a text or scanned PDF into a smaller PDF (targeting <= max_mb when specified)."""
-    max_bytes = int(max_mb * 1024 * 1024) if (max_mb is not None and max_mb > 0) else None
+    max_bytes = max_mb_to_bytes(max_mb)
     src_size = src.stat().st_size if src.exists() else 0
 
     pdf_doc = _open_pdf_checked(src)
@@ -2103,7 +2216,7 @@ def compress_pdf_file(
         note_prefix = (
             f"已按可读性下限压缩至 {out_size / 1048576:.2f} MB"
             if (max_bytes is not None and out_size > max_bytes)
-            else f"已生成墨水屏级轻量化 PDF（约 {approx_dpi} DPI，{src_size / 1048576:.2f} MB → {out_size / 1048576:.2f} MB）"
+            else f"已生成自适应图文轻量化 PDF（约 {approx_dpi} DPI，{src_size / 1048576:.2f} MB → {out_size / 1048576:.2f} MB）"
         )
         return ExportedBookArtifact(
             path=dst,
@@ -2319,7 +2432,7 @@ def convert_pdf_to_epub_with_budget(
     max_mb: float | None = 10.0,
 ) -> ConvertedBookResult:
     """Convert ANY PDF (both text PDFs and 0-text scanned PDFs) into a Kindle-valid EPUB3."""
-    max_bytes = int(max_mb * 1024 * 1024) if (max_mb is not None and max_mb > 0) else None
+    max_bytes = max_mb_to_bytes(max_mb)
     pdf_doc = _open_pdf_checked(src)
     try:
         meta = pdf_doc.metadata or {}
@@ -2331,8 +2444,8 @@ def convert_pdf_to_epub_with_budget(
         # Render first page cover thumbnail
         cov_bytes = _render_pdf_cover_jpeg(
             pdf_doc[0],
-            max_width=720 if (max_bytes is None or max_bytes >= 5 * 1024 * 1024) else 520,
-            quality=65 if (max_bytes is None or max_bytes >= 5 * 1024 * 1024) else 48,
+            max_width=720 if (max_bytes is None or max_bytes >= 5_000_000) else 520,
+            quality=65 if (max_bytes is None or max_bytes >= 5_000_000) else 48,
         )
         if cov_bytes:
             cover_out.parent.mkdir(parents=True, exist_ok=True)
@@ -2340,7 +2453,7 @@ def convert_pdf_to_epub_with_budget(
 
         is_scanned, sample_texts, _total_chars = _classify_pdf_document(pdf_doc)
         if not is_scanned:
-            tight = max_bytes is not None and max_bytes <= 8 * 1024 * 1024
+            tight = max_bytes is not None and max_bytes <= 8_000_000
             res = _reflow_text_pdf_to_epub(
                 pdf_doc,
                 pdf_title=pdf_title,
@@ -2363,40 +2476,52 @@ def convert_pdf_to_epub_with_budget(
                     tmp_recomp.unlink(missing_ok=True)
             return res
 
-        # Scanned / image-only PDF -> E-Ink optimized 1-bit PNG EPUB3 with TOC chapters
+        # Scanned / image-only PDF -> Hybrid E-Ink EPUB3 (crisp 1-bit text PNGs + color/photo JPEGs)
         all_indices = list(range(page_count))
+        kind_cache: dict[int, _PageVisualKind] = {}
         per_page_budget: float | None = None
         if max_bytes is not None and page_count > 0:
             zip_overhead = len(cov_bytes or b"") + page_count * 260 + 49_152
-            usable = max(float(page_count * 2048), max_bytes * 0.90 - zip_overhead)
+            usable = max(float(page_count * 1800), max_bytes * 0.90 - zip_overhead)
             per_page_budget = usable / float(page_count)
 
-        long_px, thr, blend = _select_scan_profile(
-            pdf_doc, all_indices, per_page_budget=per_page_budget, use_png=True
+        prof_idx = _select_hybrid_scan_profile_idx(
+            pdf_doc,
+            all_indices,
+            kind_cache,
+            per_page_budget=per_page_budget,
+            for_epub=True,
         )
+        active_prof = _HYBRID_SCAN_PROFILES[prof_idx]
         page_ranges = _group_scanned_pdf_page_ranges(pdf_doc, page_count)
         lang = detect_language("\n".join(sample_texts)) if sample_texts else "zh-CN"
 
-        def _build_scanned_epub(cur_long_px: int, cur_thr: int, cur_blend: float) -> ConvertedBookResult:
+        def _build_scanned_epub(
+            cur_prof: tuple[int, int, int, int, int, int],
+        ) -> ConvertedBookResult:
             sections: list[tuple[str, str]] = []
             section_images: list[list[ProcessedImage]] = []
             for ch_title, s_p, e_p in page_ranges:
                 ch_parts: list[str] = []
                 ch_imgs: list[ProcessedImage] = []
                 for p_idx in range(s_p, e_p):
-                    png_data = _scanned_page_to_1bit_png_bytes(
-                        pdf_doc[p_idx],
-                        target_long_edge_px=cur_long_px,
-                        threshold=cur_thr,
-                        median_blend=cur_blend,
+                    if p_idx not in kind_cache:
+                        kind_cache[p_idx] = _classify_scanned_page_visual(pdf_doc[p_idx])
+                    enc_kind, img_data = _encode_scanned_page_hybrid(
+                        pdf_doc[p_idx], kind_cache[p_idx], cur_prof, for_epub=True
                     )
-                    fname = f"images/page_{p_idx + 1:04d}.png"
+                    if enc_kind == "jpg":
+                        fname = f"images/page_{p_idx + 1:04d}.jpg"
+                        mtype = "image/jpeg"
+                    else:
+                        fname = f"images/page_{p_idx + 1:04d}.png"
+                        mtype = "image/png"
                     ch_imgs.append(
                         ProcessedImage(
                             original_url=f"pdf://page/{p_idx + 1}",
                             filename=fname,
-                            media_type="image/png",
-                            data=png_data,
+                            media_type=mtype,
+                            data=img_data,
                         )
                     )
                     ch_parts.append(
@@ -2405,7 +2530,7 @@ def convert_pdf_to_epub_with_budget(
                 sections.append((ch_title, "\n".join(ch_parts)))
                 section_images.append(ch_imgs)
 
-            approx_dpi = max(50, round(cur_long_px / 10.3))
+            approx_dpi = max(50, round(cur_prof[0] / 10.3))
             built = _build_epub_from_sections(
                 sections=sections,
                 title=pdf_title,
@@ -2421,13 +2546,14 @@ def convert_pdf_to_epub_with_budget(
                 raise RuntimeError(f"生成的扫描版 EPUB 校验失败: {'; '.join(val.errors)}")
             return built
 
-        result = _build_scanned_epub(long_px, thr, blend)
-        if max_bytes is not None and result.file_size_bytes > max_bytes and long_px > 520:
-            ratio = (max_bytes / float(result.file_size_bytes)) * 0.90
-            next_long_px = max(500, int(long_px * (ratio**0.72)))
-            result = _build_scanned_epub(next_long_px, min(thr, 134), 0.50)
-            if result.file_size_bytes > max_bytes and next_long_px > 460:
-                result = _build_scanned_epub(460, 128, 0.50)
+        result = _build_scanned_epub(active_prof)
+        used_prof = active_prof
+        for _attempt in range(2):
+            if max_bytes is None or result.file_size_bytes <= max_bytes or used_prof[0] <= 470:
+                break
+            ratio = (max_bytes / float(result.file_size_bytes)) * 0.88
+            used_prof = _scale_hybrid_profile(used_prof, max(0.55, ratio**0.68))
+            result = _build_scanned_epub(used_prof)
         return result
     finally:
         pdf_doc.close()
@@ -2453,7 +2579,7 @@ def convert_epub_to_pdf(
     where = pymupdf.Rect(
         mediabox.x0 + 28, mediabox.y0 + 32, mediabox.x1 - 28, mediabox.y1 - 32
     )
-    max_bytes = int(max_mb * 1024 * 1024) if (max_mb is not None and max_mb > 0) else None
+    max_bytes = max_mb_to_bytes(max_mb)
 
     out_doc = pymupdf.open()
     toc_entries: list[list[Any]] = []
@@ -2477,8 +2603,8 @@ def convert_epub_to_pdf(
 
             # Register raster images into PyMuPDF Archive under normalized zip paths
             arch = pymupdf.Archive()
-            img_max_w = 760 if (max_bytes is not None and max_bytes <= 8 * 1024 * 1024) else 1000
-            img_qual = 60 if (max_bytes is not None and max_bytes <= 8 * 1024 * 1024) else 76
+            img_max_w = 760 if (max_bytes is not None and max_bytes <= 8_000_000) else 1000
+            img_qual = 60 if (max_bytes is not None and max_bytes <= 8_000_000) else 76
             registered_imgs: set[str] = set()
             for norm_path, orig_name in zf_names.items():
                 ext = Path(norm_path).suffix.lower()
@@ -2502,7 +2628,9 @@ def convert_epub_to_pdf(
                 "p { margin-top: 0; margin-bottom: 7pt; } "
                 "blockquote { margin-left: 12pt; color: #333; } "
                 "img { max-width: 348pt; max-height: 495pt; display: block; margin: 6pt auto; } "
-                "pre, code { font-family: monospace; font-size: 9pt; } "
+                "table { width: 100%; border-collapse: collapse; font-size: 9pt; margin: 6pt 0; } "
+                "td, th { padding: 3pt; border: 0.5pt solid #ccc; word-break: break-all; } "
+                "pre, code { font-family: monospace; font-size: 9pt; white-space: pre-wrap; word-break: break-all; } "
             )
 
             for ch in chapters:
@@ -2551,13 +2679,20 @@ def convert_epub_to_pdf(
                 story = pymupdf.Story(html=doc_html, archive=arch)
                 more = 1
                 page_guard = 0
+                empty_streak = 0
                 max_ch_pages = max(120, len(body_inner) // 80)
                 while more and page_guard < max_ch_pages:
                     page_guard += 1
                     dev = writer.begin_page(mediabox)
-                    more, _filled = story.place(where)
+                    more, filled = story.place(where)
                     story.draw(dev)
                     writer.end_page()
+                    if pymupdf.Rect(filled).is_empty:
+                        empty_streak += 1
+                        if empty_streak >= 2:
+                            break
+                    else:
+                        empty_streak = 0
                 writer.close()
 
                 ch_pdf = pymupdf.open("pdf", ch_buf.getvalue())
@@ -2632,6 +2767,7 @@ def extract_book_to_txt(
     blocks.append("=" * 40)
 
     extracted_chars = 0
+    non_heading_body_chars = 0
     chapter_count = 0
 
     if ext == ".epub":
@@ -2643,6 +2779,11 @@ def extract_book_to_txt(
                 soup = _parse_xhtml_soup(_decode_html_bytes(zf.read(fname)))
                 for bad in soup.find_all(["script", "style", "noscript"]):
                     bad.decompose()
+                for fig in list(soup.find_all("figure")):
+                    f_cls = fig.get("class")
+                    f_tokens = f_cls if isinstance(f_cls, list) else str(f_cls or "").split()
+                    if "pdf-page" in f_tokens:
+                        fig.decompose()
                 for div in list(soup.find_all("div")):
                     cls_attr = div.get("class")
                     cls_tokens = (
@@ -2651,20 +2792,32 @@ def extract_book_to_txt(
                     if "chapter-nav" in cls_tokens or "qr-footer" in cls_tokens:
                         div.decompose()
                 body = soup.body if soup.body else soup
-                paras = [
-                    re.sub(r"\s+", " ", elem.get_text(" ", strip=True)).strip()
-                    for elem in body.find_all(["h1", "h2", "h3", "h4", "p", "li", "blockquote", "pre"])
-                ]
-                paras = [p for p in paras if p]
+                elems = body.find_all(
+                    ["h1", "h2", "h3", "h4", "p", "li", "blockquote", "pre", "td", "th"]
+                )
+                paras: list[str] = []
+                ch_body_chars = 0
+                for elem in elems:
+                    txt = re.sub(r"\s+", " ", elem.get_text(" ", strip=True)).strip()
+                    if not txt:
+                        continue
+                    paras.append(txt)
+                    if elem.name not in ("h1", "h2", "h3", "h4"):
+                        ch_body_chars += len(re.sub(r"\s+", "", txt))
                 if not paras:
-                    raw_body_txt = body.get_text("\n", strip=True)
+                    body_clone = _parse_xhtml_soup(str(body))
+                    for h_tag in body_clone.find_all(["h1", "h2", "h3", "h4", "h5", "h6"]):
+                        h_tag.decompose()
+                    raw_body_txt = body_clone.get_text("\n", strip=True)
                     if raw_body_txt:
                         paras = [ln.strip() for ln in raw_body_txt.splitlines() if ln.strip()]
-                if not paras:
+                        ch_body_chars += len(re.sub(r"\s+", "", raw_body_txt))
+                if not paras or ch_body_chars == 0:
                     continue
                 chapter_count += 1
                 ch_text = "\n\n".join(paras)
                 extracted_chars += len(re.sub(r"\s+", "", ch_text))
+                non_heading_body_chars += ch_body_chars
                 if ch_title and (not paras or paras[0] != ch_title):
                     blocks.append(f"\n## {ch_title}\n\n{ch_text}")
                 else:
@@ -2677,14 +2830,16 @@ def extract_book_to_txt(
                 if not page_txt:
                     continue
                 chapter_count += 1
-                extracted_chars += len(re.sub(r"\s+", "", page_txt))
+                n_chars = len(re.sub(r"\s+", "", page_txt))
+                extracted_chars += n_chars
+                non_heading_body_chars += n_chars
                 blocks.append(f"\n--- 第 {p_idx + 1} 页 ---\n\n{page_txt}")
         finally:
             pdf_doc.close()
     else:
         raise ValueError(f"不支持从 {ext} 提取纯文本")
 
-    if extracted_chars < 20:
+    if non_heading_body_chars < 20:
         raise ValueError(
             "该文件为扫描图片排版（不含可提取的文字层），无法导出纯文本 TXT；请选择转换为「EPUB 电子书」或「轻量化 PDF」下载。"
         )
@@ -2713,6 +2868,7 @@ async def export_book_format(
     author: str = "",
     max_mb: float | None = 10.0,
     existing_mobi_path: Path | None = None,
+    primary_lossy_max_mb: float | None = None,
 ) -> ExportedBookArtifact:
     """Convert/compress a library book into `target_format` ('epub'|'pdf'|'mobi'|'txt') atomically."""
     fmt = target_format.strip().lower()
@@ -2723,19 +2879,60 @@ async def export_book_format(
     tmp_uid = uuid.uuid4().hex[:10]
     tmp_out = output_path.parent / f".tmp_export_{tmp_uid}.{fmt}"
     tmp_aux_epub = output_path.parent / f".tmp_aux_{tmp_uid}.epub"
+    tmp_mobi_prep: Path | None = None
     tmp_cov = cover_dir / f".tmp_cov_{tmp_uid}.jpg"
 
-    max_bytes = int(max_mb * 1024 * 1024) if (max_mb is not None and max_mb > 0) else None
+    max_bytes = max_mb_to_bytes(max_mb)
     primary_ext = primary_path.suffix.lower()
-    orig_pdf = (
-        original_path
-        if (original_path is not None and original_path.exists() and original_path.suffix.lower() == ".pdf")
-        else None
+    has_orig = original_path is not None and original_path.exists()
+    orig_ext = original_path.suffix.lower() if has_orig and original_path is not None else ""
+    orig_pdf = original_path if (has_orig and orig_ext == ".pdf") else None
+    primary_exceeded_by_request = primary_lossy_max_mb is not None and (
+        max_mb is None or max_mb > primary_lossy_max_mb
     )
 
     try:
         if fmt == "epub":
-            if primary_ext == ".epub" and primary_path.exists():
+            # Rebuild from higher-fidelity original_path when primary_path was promoted from a smaller budget
+            if primary_exceeded_by_request and orig_pdf is not None:
+                conv = await asyncio.to_thread(
+                    convert_pdf_to_epub_with_budget,
+                    orig_pdf,
+                    tmp_out,
+                    tmp_cov,
+                    title_override=title,
+                    author_override=author,
+                    max_mb=max_mb,
+                )
+                art = ExportedBookArtifact(
+                    path=output_path,
+                    target_format="epub",
+                    file_size_bytes=conv.file_size_bytes,
+                    chapter_count=conv.chapter_count,
+                    notes=conv.notes,
+                )
+            elif (
+                primary_exceeded_by_request
+                and has_orig
+                and original_path is not None
+                and orig_ext == ".epub"
+            ):
+                if max_bytes is None:
+                    norm_res = await asyncio.to_thread(
+                        normalize_epub_for_kindle, original_path, tmp_out, tmp_cov
+                    )
+                    art = ExportedBookArtifact(
+                        path=output_path,
+                        target_format="epub",
+                        file_size_bytes=norm_res.file_size_bytes,
+                        chapter_count=norm_res.chapter_count,
+                        notes=norm_res.notes,
+                    )
+                else:
+                    art = await asyncio.to_thread(
+                        recompress_epub_to_budget, original_path, tmp_out, max_bytes=max_bytes
+                    )
+            elif primary_ext == ".epub" and primary_path.exists():
                 if max_bytes is None or primary_path.stat().st_size <= max_bytes:
                     await asyncio.to_thread(shutil.copy2, primary_path, tmp_out)
                     val = await asyncio.to_thread(validate_epub, tmp_out)
@@ -2785,9 +2982,19 @@ async def export_book_format(
                     compress_pdf_file, src_pdf, tmp_out, max_mb=max_mb
                 )
             elif primary_ext == ".epub" and primary_path.exists():
+                epub_src_for_pdf = (
+                    original_path
+                    if (
+                        primary_exceeded_by_request
+                        and has_orig
+                        and original_path is not None
+                        and orig_ext == ".epub"
+                    )
+                    else primary_path
+                )
                 art = await asyncio.to_thread(
                     convert_epub_to_pdf,
-                    primary_path,
+                    epub_src_for_pdf,
                     tmp_out,
                     title=title,
                     author=author,
@@ -2798,7 +3005,8 @@ async def export_book_format(
 
         elif fmt == "mobi":
             if (
-                existing_mobi_path is not None
+                not primary_exceeded_by_request
+                and existing_mobi_path is not None
                 and existing_mobi_path.exists()
                 and existing_mobi_path.stat().st_size > 0
                 and (max_bytes is None or existing_mobi_path.stat().st_size <= max_bytes)
@@ -2815,17 +3023,42 @@ async def export_book_format(
                     raise RuntimeError(
                         "当前运行容器未安装 Calibre (ebook-convert)，请确保 inkpress-worker 正常运行后再导出 MOBI"
                     )
-                if primary_ext == ".epub" and primary_path.exists():
-                    if max_bytes is not None and primary_path.stat().st_size > max_bytes:
+                # Dual KF8+MOBI7 container adds ~30% overhead over EPUB; budget input EPUB accordingly
+                epub_mobi_mb = round(max_mb * 0.68, 2) if max_mb is not None else 18.0
+                epub_mobi_bytes = max_mb_to_bytes(epub_mobi_mb)
+
+                if primary_exceeded_by_request and orig_pdf is not None:
+                    await asyncio.to_thread(
+                        convert_pdf_to_epub_with_budget,
+                        orig_pdf,
+                        tmp_aux_epub,
+                        tmp_cov,
+                        title_override=title,
+                        author_override=author,
+                        max_mb=epub_mobi_mb,
+                    )
+                    epub_for_mobi = tmp_aux_epub
+                elif primary_ext == ".epub" and primary_path.exists():
+                    base_epub = (
+                        original_path
+                        if (
+                            primary_exceeded_by_request
+                            and has_orig
+                            and original_path is not None
+                            and orig_ext == ".epub"
+                        )
+                        else primary_path
+                    )
+                    if epub_mobi_bytes is not None and base_epub.stat().st_size > epub_mobi_bytes:
                         await asyncio.to_thread(
                             recompress_epub_to_budget,
-                            primary_path,
+                            base_epub,
                             tmp_aux_epub,
-                            max_bytes=max_bytes,
+                            max_bytes=epub_mobi_bytes,
                         )
                         epub_for_mobi = tmp_aux_epub
                     else:
-                        epub_for_mobi = primary_path
+                        epub_for_mobi = base_epub
                 else:
                     src_pdf = orig_pdf or primary_path
                     await asyncio.to_thread(
@@ -2835,18 +3068,59 @@ async def export_book_format(
                         tmp_cov,
                         title_override=title,
                         author_override=author,
-                        max_mb=max_mb or 15.0,
+                        max_mb=epub_mobi_mb,
                     )
                     epub_for_mobi = tmp_aux_epub
 
-                await _run_calibre_convert(
-                    epub_for_mobi, tmp_out, extra_args=["--mobi-file-type=both"]
+                tmp_mobi_prep = await asyncio.to_thread(_prepare_epub_for_calibre_mobi, epub_for_mobi)
+                calibre_src = tmp_mobi_prep if tmp_mobi_prep is not None else epub_for_mobi
+                calibre_flags = (
+                    ["--mobi-file-type=both", "--mobi-keep-original-images", "--output-profile=tablet"]
+                    if tmp_mobi_prep is not None
+                    else ["--mobi-file-type=both"]
                 )
+                await _run_calibre_convert(calibre_src, tmp_out, extra_args=calibre_flags)
+
+                # If dual MOBI7+KF8 container still exceeded max_bytes, rebuild single-stream KF8 under budget
+                if max_bytes is not None and tmp_out.stat().st_size > max_bytes:
+                    tighter_bytes = max(350_000, int(max_bytes * 0.62))
+                    if orig_pdf is not None or primary_ext == ".pdf":
+                        src_pdf = orig_pdf or primary_path
+                        await asyncio.to_thread(
+                            convert_pdf_to_epub_with_budget,
+                            src_pdf,
+                            tmp_aux_epub,
+                            tmp_cov,
+                            title_override=title,
+                            author_override=author,
+                            max_mb=round(tighter_bytes / 1_000_000, 2),
+                        )
+                    else:
+                        await asyncio.to_thread(
+                            recompress_epub_to_budget,
+                            epub_for_mobi,
+                            tmp_aux_epub,
+                            max_bytes=tighter_bytes,
+                        )
+                    if tmp_mobi_prep is not None:
+                        tmp_mobi_prep.unlink(missing_ok=True)
+                    tmp_mobi_prep = await asyncio.to_thread(
+                        _prepare_epub_for_calibre_mobi, tmp_aux_epub
+                    )
+                    calibre_src = tmp_mobi_prep if tmp_mobi_prep is not None else tmp_aux_epub
+                    kf8_flags = (
+                        ["--mobi-file-type=new", "--mobi-keep-original-images", "--output-profile=tablet"]
+                        if tmp_mobi_prep is not None
+                        else ["--mobi-file-type=new"]
+                    )
+                    tmp_out.unlink(missing_ok=True)
+                    await _run_calibre_convert(calibre_src, tmp_out, extra_args=kf8_flags)
+
                 art = ExportedBookArtifact(
                     path=output_path,
                     target_format="mobi",
                     file_size_bytes=tmp_out.stat().st_size,
-                    notes=f"已通过 Calibre 生成 KF8+MOBI7 双格式电子书（{tmp_out.stat().st_size / 1048576:.2f} MB）",
+                    notes=f"已通过 Calibre 生成 Kindle MOBI 电子书（{tmp_out.stat().st_size / 1048576:.2f} MB）",
                 )
 
         else:  # fmt == "txt"
@@ -2873,6 +3147,8 @@ async def export_book_format(
     finally:
         tmp_out.unlink(missing_ok=True)
         tmp_aux_epub.unlink(missing_ok=True)
+        if tmp_mobi_prep is not None:
+            tmp_mobi_prep.unlink(missing_ok=True)
         tmp_cov.unlink(missing_ok=True)
 
 

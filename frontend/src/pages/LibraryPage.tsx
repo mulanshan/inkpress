@@ -66,7 +66,7 @@ const EXPORT_FORMAT_OPTIONS: Array<{
     id: "pdf",
     title: "轻量化 PDF (.pdf)",
     badge: "高压缩省空间",
-    desc: "智能精简图片或墨水屏级黑白扫描高压缩，保留彩色封面与目录书签",
+    desc: "智能精简图片或自适应去底噪图文压缩，保留彩色封面、插图细节与目录书签",
   },
   {
     id: "mobi",
@@ -89,9 +89,18 @@ function buildClientExportKey(fmt: ExportTargetFormat, maxMb: number | null): st
   return `${fmt}_${maxMb}mb`;
 }
 
+function formatExportChipLabel(targetFormat: string, maxMb: number | null | undefined): string {
+  const fmtUpper = targetFormat.toUpperCase();
+  if (targetFormat === "txt" || maxMb === null || maxMb === undefined) {
+    return fmtUpper;
+  }
+  return `${fmtUpper} ≤${maxMb}MB`;
+}
+
 function triggerBrowserDownload(url: string): void {
   const anchor = document.createElement("a");
   anchor.href = url;
+  anchor.download = "";
   anchor.rel = "noopener";
   anchor.style.display = "none";
   document.body.appendChild(anchor);
@@ -155,6 +164,7 @@ export function LibraryPage() {
   const [exportSetDefault, setExportSetDefault] = useState(false);
   const [exportSubmitting, setExportSubmitting] = useState(false);
   const [exportError, setExportError] = useState("");
+  const [justFinishedKey, setJustFinishedKey] = useState<string>("");
   const [pendingExports, setPendingExports] = useState<PendingExportJob[]>([]);
   const pollingBusyRef = useRef(false);
 
@@ -356,6 +366,7 @@ export function LibraryPage() {
     setExportMaxMb(10);
     setExportSetDefault(false);
     setExportError("");
+    setJustFinishedKey("");
   };
 
   const submitExportDownload = async (e: React.FormEvent) => {
@@ -363,6 +374,7 @@ export function LibraryPage() {
     if (!exportModalBook) return;
     setExportSubmitting(true);
     setExportError("");
+    setJustFinishedKey("");
     const targetBook = exportModalBook;
     try {
       const resp = await apiRequest<BookExportResponse>(`/api/v1/books/${targetBook.id}/export`, {
@@ -375,13 +387,13 @@ export function LibraryPage() {
         }),
       });
       setExportModalBook(resp.item);
-      await qc.invalidateQueries({ queryKey: ["books"] });
+      void qc.invalidateQueries({ queryKey: ["books"] });
 
       if (resp.status === "ready") {
         triggerBrowserDownload(resp.download_url);
+        setJustFinishedKey(resp.export_key);
         const sizeLabel = resp.export?.size_bytes ? `（${formatBytes(resp.export.size_bytes)}）` : "";
         notify(`已准备就绪${sizeLabel}，开始下载`, "success");
-        setExportModalBook(null);
       } else if (resp.status === "converting") {
         setPendingExports((prev) => {
           const filtered = prev.filter(
@@ -431,13 +443,14 @@ export function LibraryPage() {
                   (j) => !(j.bookId === job.bookId && j.exportKey === job.exportKey),
                 ),
               );
-              await qc.invalidateQueries({ queryKey: ["books"] });
-              setExportModalBook((cur) => (cur && cur.id === job.bookId ? null : cur));
+              setExportModalBook((cur) => (cur && cur.id === job.bookId ? res.item : cur));
+              setJustFinishedKey(job.exportKey);
               triggerBrowserDownload(res.download_url);
+              void qc.invalidateQueries({ queryKey: ["books"] });
               const sizeStr = res.export?.size_bytes
                 ? `（${formatBytes(res.export.size_bytes)}）`
                 : "";
-              notify(`《${job.bookTitle}》转换完成${sizeStr}，已开始下载`, "success");
+              notify(`《${job.bookTitle}》转换完成${sizeStr}，可立即下载`, "success");
             } else if (res.status === "failed") {
               setPendingExports((prev) =>
                 prev.filter(
@@ -1039,7 +1052,7 @@ export function LibraryPage() {
                 </div>
 
                 <div
-                  className="px-4 py-3 border-t flex flex-wrap items-center justify-between gap-2 text-xs"
+                  className="px-3.5 py-2.5 border-t flex flex-wrap items-center justify-between gap-1.5 text-xs"
                   style={{ borderColor: "var(--border-hairline)" }}
                 >
                   <div className="flex flex-wrap items-center gap-1.5">
@@ -1066,7 +1079,7 @@ export function LibraryPage() {
                           <button
                             type="button"
                             onClick={() => openBookReader(book)}
-                            className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border cursor-pointer"
+                            className="inline-flex items-center gap-1 px-2 py-1.5 rounded-lg border cursor-pointer"
                             style={{
                               borderColor: "var(--border-hairline)",
                               backgroundColor: "var(--bg-canvas)",
@@ -1090,7 +1103,7 @@ export function LibraryPage() {
                           <button
                             type="button"
                             onClick={() => openExportModal(book)}
-                            className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border cursor-pointer"
+                            className="inline-flex items-center gap-1 px-2 py-1.5 rounded-lg border cursor-pointer"
                             style={{
                               borderColor: isExportingBook
                                 ? "var(--accent)"
@@ -1114,7 +1127,7 @@ export function LibraryPage() {
                     )}
                   </div>
 
-                  <div className="flex items-center gap-1">
+                  <div className="flex items-center gap-0.5 ml-auto">
                     <button
                       type="button"
                       onClick={() => {
@@ -1130,6 +1143,7 @@ export function LibraryPage() {
                     {book.conversion_status === "ready" && (
                       <a
                         href={`/api/v1/books/${book.id}/download`}
+                        download
                         className="p-1.5 rounded-lg hover:opacity-80"
                         style={{ color: "var(--fg-secondary)" }}
                         title={isPdfDownload ? "直接下载当前 PDF" : "直接下载当前 EPUB"}
@@ -1161,6 +1175,10 @@ export function LibraryPage() {
         const selectedKey = buildClientExportKey(exportFormat, exportMaxMb);
         const cachedInfo = latestModalBook.exports?.[selectedKey];
         const isCachedReady = cachedInfo?.status === "ready" && cachedInfo.size_bytes > 0;
+        const cachedDownloadUrl = `/api/v1/books/${latestModalBook.id}/exports/${selectedKey}/download`;
+        const readyExports = Object.values(latestModalBook.exports ?? {}).filter(
+          (item) => item && item.status === "ready" && item.size_bytes > 0,
+        );
         const isJobRunning = pendingExports.some(
           (j) => j.bookId === latestModalBook.id && j.exportKey === selectedKey,
         );
@@ -1172,7 +1190,7 @@ export function LibraryPage() {
 
         return (
           <div
-            className="fixed inset-0 z-40 bg-black/45 flex items-center justify-center p-4 overflow-y-auto"
+            className="fixed inset-0 z-40 bg-black/45 flex items-start sm:items-center justify-center p-3 sm:p-4 overflow-y-auto"
             onClick={(e) => {
               if (e.target === e.currentTarget && !exportSubmitting) {
                 setExportModalBook(null);
@@ -1181,7 +1199,7 @@ export function LibraryPage() {
           >
             <form
               onSubmit={submitExportDownload}
-              className="max-w-lg w-full rounded-2xl border p-6 space-y-5 my-8"
+              className="max-w-lg w-full rounded-2xl border p-5 sm:p-6 space-y-4 sm:space-y-5 my-auto"
               style={{
                 backgroundColor: "var(--bg-surface)",
                 borderColor: "var(--border-hairline)",
@@ -1189,7 +1207,7 @@ export function LibraryPage() {
               }}
             >
               <div className="flex items-start justify-between gap-3">
-                <div className="min-w-0">
+                <div className="min-w-0 flex-1">
                   <p
                     className="text-[11px] uppercase tracking-[0.16em] mb-1"
                     style={{ color: "var(--accent)" }}
@@ -1197,14 +1215,16 @@ export function LibraryPage() {
                     FORMAT CONVERTER &amp; SIZE OPTIMIZER
                   </p>
                   <h3 className="font-editorial text-xl font-semibold">转换其他格式下载</h3>
-                  <p
-                    className="text-xs mt-1 truncate"
+                  <div
+                    className="flex items-center gap-1.5 text-xs mt-1 min-w-0"
                     style={{ color: "var(--fg-secondary)" }}
                     title={latestModalBook.title}
                   >
-                    《{latestModalBook.title}》 · 当前 {curActiveFmt} ·{" "}
-                    {formatBytes(latestModalBook.file_size_bytes)}
-                  </p>
+                    <span className="truncate">《{latestModalBook.title}》</span>
+                    <span className="shrink-0">
+                      · 当前 {curActiveFmt} · {formatBytes(latestModalBook.file_size_bytes)}
+                    </span>
+                  </div>
                 </div>
                 <button
                   type="button"
@@ -1216,6 +1236,51 @@ export function LibraryPage() {
                   <X className="w-4 h-4" />
                 </button>
               </div>
+
+              {readyExports.length > 0 && (
+                <div
+                  className="rounded-xl border px-3 py-2.5 space-y-1.5"
+                  style={{
+                    borderColor: "var(--border-hairline)",
+                    backgroundColor: "var(--bg-canvas)",
+                  }}
+                >
+                  <div className="text-[11px] font-medium" style={{ color: "var(--fg-muted)" }}>
+                    已生成规格（点击直接下载）：
+                  </div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {readyExports.map((exp) => (
+                      <a
+                        key={exp.key}
+                        href={`/api/v1/books/${latestModalBook.id}/exports/${exp.key}/download`}
+                        download
+                        className="inline-flex items-center gap-1 text-[11px] px-2.5 py-1 rounded-lg border hover:opacity-85"
+                        style={{
+                          borderColor:
+                            justFinishedKey === exp.key
+                              ? "var(--accent)"
+                              : "var(--border-hairline)",
+                          backgroundColor:
+                            justFinishedKey === exp.key
+                              ? "var(--accent-soft)"
+                              : "var(--bg-surface)",
+                          color:
+                            justFinishedKey === exp.key
+                              ? "var(--accent)"
+                              : "var(--fg-primary)",
+                          fontWeight: justFinishedKey === exp.key ? 600 : 500,
+                        }}
+                      >
+                        <Download className="w-3 h-3" />
+                        <span>
+                          {formatExportChipLabel(exp.target_format, exp.max_mb)} ·{" "}
+                          {formatBytes(exp.size_bytes)}
+                        </span>
+                      </a>
+                    ))}
+                  </div>
+                </div>
+              )}
 
               <div>
                 <label
@@ -1304,7 +1369,7 @@ export function LibraryPage() {
                         </span>
                       </span>
                     ) : (
-                      "自适应采样调控图像分辨率与墨水屏二值化清晰度，自动将输出体积压入目标上限以内。"
+                      "自适应采样调控图像分辨率、去底噪与图文混合编码，自动将输出体积压入目标上限以内。"
                     )}
                   </p>
                 </div>
@@ -1343,7 +1408,7 @@ export function LibraryPage() {
                   <div>
                     <div className="font-medium">正在后台转换并压缩体积…</div>
                     <div className="mt-0.5" style={{ color: "var(--fg-secondary)" }}>
-                      多页扫描文档约需 10～25 秒，完成后将自动弹出浏览器下载（即使关闭此窗口也会自动下载）。
+                      多页扫描文档约需 15～40 秒，完成后将自动触发下载，并在窗口内保留一键下载按钮。
                     </div>
                   </div>
                 </div>
@@ -1370,6 +1435,7 @@ export function LibraryPage() {
                   {latestModalBook.has_original && (
                     <a
                       href={`/api/v1/books/${latestModalBook.id}/download?variant=original`}
+                      download
                       className="inline-flex items-center gap-1 text-xs underline underline-offset-2 hover:opacity-80"
                       style={{ color: "var(--fg-muted)" }}
                     >
@@ -1394,29 +1460,37 @@ export function LibraryPage() {
                   >
                     关闭
                   </button>
-                  <button
-                    type="submit"
-                    disabled={exportSubmitting || isJobRunning}
-                    className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-medium cursor-pointer disabled:opacity-50"
-                    style={{ backgroundColor: "var(--accent)", color: "var(--accent-fg)" }}
-                  >
-                    {exportSubmitting || isJobRunning ? (
-                      <>
-                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                        <span>正在转换…</span>
-                      </>
-                    ) : isCachedReady && !exportSetDefault ? (
-                      <>
-                        <Download className="w-3.5 h-3.5" />
-                        <span>立即下载 ({formatBytes(cachedInfo.size_bytes)})</span>
-                      </>
-                    ) : (
-                      <>
-                        <Download className="w-3.5 h-3.5" />
-                        <span>转换并下载</span>
-                      </>
-                    )}
-                  </button>
+                  {isCachedReady && !exportSetDefault && !exportSubmitting && !isJobRunning ? (
+                    <a
+                      href={cachedDownloadUrl}
+                      download
+                      onClick={() => notify("开始下载已转换文件", "success")}
+                      className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-medium cursor-pointer hover:opacity-90"
+                      style={{ backgroundColor: "var(--accent)", color: "var(--accent-fg)" }}
+                    >
+                      <Download className="w-3.5 h-3.5" />
+                      <span>立即下载 ({formatBytes(cachedInfo.size_bytes)})</span>
+                    </a>
+                  ) : (
+                    <button
+                      type="submit"
+                      disabled={exportSubmitting || isJobRunning}
+                      className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-medium cursor-pointer disabled:opacity-50"
+                      style={{ backgroundColor: "var(--accent)", color: "var(--accent-fg)" }}
+                    >
+                      {exportSubmitting || isJobRunning ? (
+                        <>
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                          <span>正在转换…</span>
+                        </>
+                      ) : (
+                        <>
+                          <Download className="w-3.5 h-3.5" />
+                          <span>转换并下载</span>
+                        </>
+                      )}
+                    </button>
+                  )}
                 </div>
               </div>
             </form>
