@@ -1132,17 +1132,33 @@ async def test_book_export_other_formats_compress_pdf_promote_and_cleanup(
     orig_pdf = settings.library_data_dir / "originals" / "yanhuang_scan.pdf"
     active_pdf = settings.library_data_dir / "epubs" / "yanhuang_active.pdf"
 
-    img_buf = io.BytesIO()
-    Image.effect_noise((900, 1250), 55.0).convert("RGB").save(img_buf, format="JPEG", quality=92)
+    img = Image.new("RGB", (1000, 1400), (236, 233, 225))
+    px = img.load()
+    assert px is not None
+    for y in range(50, 1350, 24):
+        for x in range(60, 940):
+            if ((x * 13 + y * 7) % 17) < 7:
+                px[x, y] = (28, 28, 28)
+                px[x, y + 1] = (35, 35, 35)
+    for y in range(0, 1400, 2):
+        for x in range(0, 1000, 2):
+            delta = (x * 29 + y * 19) % 26
+            r0, g0, b0 = px[x, y]
+            px[x, y] = (max(0, r0 - delta), max(0, g0 - delta), max(0, b0 - delta))
     doc = pymupdf.open()
-    for _p_idx in range(6):
+    for idx in range(8):
+        page_im = img.copy()
+        page_im.putpixel((10 + idx, 10), (idx * 20, 0, 0))
+        p_buf = io.BytesIO()
+        page_im.save(p_buf, format="JPEG", quality=95)
         pg = doc.new_page(width=540, height=745)
-        pg.insert_image(pg.rect, stream=img_buf.getvalue())
-    doc.set_toc([[1, "创刊号", 1], [1, "第二期", 4]])
+        pg.insert_image(pg.rect, stream=p_buf.getvalue())
+    doc.set_toc([[1, "创刊号", 1], [1, "第二期", 5]])
     doc.save(str(orig_pdf))
     doc.close()
     active_pdf.write_bytes(orig_pdf.read_bytes())
     orig_bytes_len = orig_pdf.stat().st_size
+    assert orig_bytes_len > 1_050_000
 
     factory = get_session_factory()
     async with factory() as session:
@@ -1189,30 +1205,30 @@ async def test_book_export_other_formats_compress_pdf_promote_and_cleanup(
     assert r_txt_scan.status_code == 400
     assert "文字层" in r_txt_scan.json()["detail"]
 
-    # 3. Export scanned PDF -> Compact PDF (<= 10 MB)
+    # 3. Export >1MB scanned PDF -> Compact PDF (<= 1 MB and <= 10 MB)
     r_exp_pdf = await test_client.post(
         f"/api/v1/books/{book_id}/export?inline=true",
         headers=headers,
-        json={"target_format": "pdf", "max_mb": 10},
+        json={"target_format": "pdf", "max_mb": 1},
     )
     assert r_exp_pdf.status_code == 200
     pdf_data = r_exp_pdf.json()
     assert pdf_data["status"] == "ready"
-    assert pdf_data["export_key"] == "pdf_10mb"
+    assert pdf_data["export_key"] == "pdf_1mb"
     # Public API must NEVER expose server filesystem `path` inside item.exports
-    assert "path" not in pdf_data["item"]["exports"]["pdf_10mb"]
+    assert "path" not in pdf_data["item"]["exports"]["pdf_1mb"]
     assert pdf_data["export"]["size_bytes"] < orig_bytes_len
-    assert pdf_data["export"]["size_bytes"] <= 10 * 1024 * 1024
+    assert pdf_data["export"]["size_bytes"] <= 1 * 1024 * 1024
 
     r_dl_pdf = await test_client.get(pdf_data["download_url"], headers=headers)
     assert r_dl_pdf.status_code == 200
     assert r_dl_pdf.headers["content-type"] == "application/pdf"
-    assert "10MB.pdf" in unquote_header(r_dl_pdf.headers.get("content-disposition", ""))
+    assert "1MB.pdf" in unquote_header(r_dl_pdf.headers.get("content-disposition", ""))
     assert r_dl_pdf.content.startswith(b"%PDF")
 
     # Status polling endpoint returns ready
     r_poll = await test_client.get(
-        f"/api/v1/books/{book_id}/exports/pdf_10mb", headers=headers
+        f"/api/v1/books/{book_id}/exports/pdf_1mb", headers=headers
     )
     assert r_poll.status_code == 200
     assert r_poll.json()["status"] == "ready"
